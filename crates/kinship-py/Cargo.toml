@@ -1,0 +1,24 @@
+[package]
+name = "kinship-py"
+description = "PyO3 bindings for kinship"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "_kinship"
+crate-type = ["cdylib"]
+
+[features]
+default = ["abi3"]
+# abi3 wheels cover CPython 3.11+; the free-threaded 3.14t build turns this off.
+abi3 = ["pyo3/abi3-py311"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+kinship-net.workspace = true
+pyo3 = "0.29"

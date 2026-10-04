@@ -1,0 +1,53 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kinship"
+version = "0.0.0"
+description = "SWIM membership and failure detection with Lifeguard, for Python"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0 OR MIT"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
+authors = [{ name = "Nikola Stankovic" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/bytevader/kinship"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "maturin>=1.9,<2"]
+
+[tool.maturin]
+manifest-path = "crates/kinship-py/Cargo.toml"
+python-source = "python"
+module-name = "kinship._kinship"
+# The free-threaded 3.14t wheel is built with --no-default-features (no abi3).
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["python", "tests"]
+# README and design doc hold illustrative snippets, not code to format
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
