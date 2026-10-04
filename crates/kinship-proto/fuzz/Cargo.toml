@@ -1,0 +1,36 @@
+[package]
+name = "kinship-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kinship-proto = { path = ".." }
+
+# Keep this crate out of the main workspace: it needs nightly and only builds on Linux and macOS.
+[workspace]
+
+[[bin]]
+name = "decode_datagram"
+path = "fuzz_targets/decode_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_stream_frame"
+path = "fuzz_targets/decode_stream_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_payload"
+path = "fuzz_targets/decode_payload.rs"
+test = false
+doc = false
+bench = false
