@@ -204,7 +204,9 @@ Every UDP datagram, and every TCP frame after a u32 big-endian length prefix, st
 | 32 | n | body | ciphertext of the inner payload |
 | 32 + n | 16 | tag | Poly1305 tag; absent when plaintext |
 
-The associated data for the AEAD is the 32 header bytes plus the configured cluster label, so a packet from another cluster or a tampered header fails authentication. In plaintext mode an 8-byte BLAKE3 hash of the cluster label replaces key_id and nonce, so clusters still cannot cross-talk by accident. The encrypted overhead is 48 bytes per packet.
+The associated data for the AEAD is the 32 header bytes plus the configured cluster label (at most 255 bytes), so a packet from another cluster or a tampered header fails authentication. In plaintext mode, which exists for tests, the simulator and loopback use, an 8-byte BLAKE3 hash of the cluster label replaces key_id and nonce, giving a 12-byte header and no tag, so clusters still cannot cross-talk by accident. The encrypted overhead is 48 bytes per packet.
+
+The receiver checks, in this order and before any cryptography: the size limit, magic, version, reserved flag bits, that the stream-frame flag matches the channel the bytes arrived on (a datagram cannot be replayed as a stream frame or the reverse), that the encrypted flag matches the node's own mode (an encrypting node never accepts plaintext, so there is no downgrade), and that some installed key has the packet's key_id. Only then does it verify the tag, once per installed key with that id. A failed verification leaves the buffer untouched. The sender takes the nonce from its caller, so the sans-IO crates never draw randomness: production passes 24 bytes from the OS RNG, the simulator passes bytes from its seeded RNG.
 
 XChaCha20-Poly1305 is the default because its 192-bit random nonce is safe to pick at random for the life of a key, which memberlist's 96-bit AES-GCM nonce is not. AES-GCM-SIV stays an open alternative for hardware with AES acceleration and no fast ChaCha.
 
@@ -215,7 +217,14 @@ payload  = count:varint  message*
 message  = type:u8  len:varint  body[len]
 ```
 
-A receiver skips any message whose type it does not know, using len. Within a body, new fields are only ever appended, and a receiver ignores trailing bytes it does not understand. Those two rules give forward compatibility without a schema compiler. Postcard and protobuf were rejected: postcard cannot evolve fields, and prost adds allocation and size for little gain on a dozen fixed messages.
+A receiver skips any message whose type it does not know, using len. Within a body, new fields are only ever appended, and a receiver ignores trailing bytes it does not understand. Those two rules give forward compatibility without a schema compiler.
+
+Encoding rules the decoder enforces, so that every value has exactly one encoding:
+
+- A varint is unsigned LEB128, at most 5 bytes, at most u32::MAX, and minimal (no padding with zero continuation groups). Integers outside varints are fixed-width big-endian.
+- A payload holds at least one message, count is checked against the bytes left before any message is read, and no bytes may follow the last message. A known message type whose body is too short is an error, not a skip.
+- Booleans are exactly 0 or 1, states are 0 (Alive) to 3 (Left), and an Alive record has 1 <= vmin <= vmax.
+- The whole payload is validated in one allocation-free pass, after which iterating it cannot fail. Postcard and protobuf were rejected: postcard cannot evolve fields, and prost adds allocation and size for little gain on a dozen fixed messages.
 
 | Type | Message | Body fields | Carried on |
 | --- | --- | --- | --- |
@@ -226,17 +235,20 @@ A receiver skips any message whose type it does not know, using len. Within a bo
 | 0x05 | Alive | inc u32, node NodeId, addr Addr, meta bytes, vmin u8, vmax u8 | gossip, push-pull |
 | 0x06 | Suspect | inc u32, node NodeId, from NodeId | gossip |
 | 0x07 | Dead | inc u32, node NodeId, from NodeId; from = node means Left | gossip |
-| 0x08 | PushPull | join u8, members: list of Alive-shaped records with state u8 | TCP only |
+| 0x08 | PushPull | join u8, count varint, then count records, each a varint length and a body of state u8 followed by the Alive fields | TCP only |
 | 0x09 to 0x7F | reserved | user broadcasts, compression, future features |  |
 
-NodeId is a UTF-8 name of 1 to 64 bytes, unique within the cluster. Addr is a family byte (4 or 6), the IP, and a u16 port. Strings and byte fields carry a varint length.
+NodeId is a UTF-8 name of 1 to 64 bytes, unique within the cluster. Addr is a family byte (4 or 6), the IP, and a u16 port; IPv6 flow info and scope id are not carried. Strings and byte fields carry a varint length. Push-pull records are length-prefixed so that fields appended to Alive in a later version do not break a reader that skips them.
+
+The `meta` field of Alive is opaque to the protocol. The Python tag API stores a list of string pairs in it as `(klen:varint key vlen:varint value)*`, running to the end of the blob, with non-empty UTF-8 keys that are unique; kinship-proto provides the encoder and a validating decoder in its `tags` module.
 
 ### Sizes and versions
 
-- A datagram is at most udp_max_payload bytes (1,400 by default), which keeps it under a 1,500-byte Ethernet MTU with IPv6, UDP and crypto overhead. The probe message goes first, and broadcasts fill the space left.
-- A TCP frame is at most max_stream_frame bytes (8 MiB by default). Larger push-pull states are refused and counted.
+- A datagram is at most udp_max_payload bytes in total, header and tag included (1,400 by default), which keeps it under a 1,500-byte Ethernet MTU with IPv6 and UDP headers. The probe message goes first, and broadcasts fill the space left; `Message::encoded_len` and `Codec::max_payload_len` let the packer measure without encoding.
+- A TCP frame is a u32 big-endian length followed by one packet of at most max_stream_frame bytes (8 MiB by default, the prefix not counted). Larger push-pull states are refused and counted. The receiving `FrameReader` compares the declared length with the limit as soon as the 4-byte prefix arrives and grows its buffer only as bytes actually arrive, so a peer that announces 8 MiB costs nothing until it sends 8 MiB. A failed frame poisons the reader and the connection is dropped.
+- Metadata is at most max_meta_bytes (512), checked when sealing and again when opening, so a lenient sender cannot push oversized metadata through a strict receiver.
 - Each node advertises the wire versions it speaks (vmin, vmax) in its Alive message. A node sends the highest version every live member speaks, and drops packets with a version above its own vmax.
-- The decoder works on borrowed slices, checks every length against the remaining buffer, never panics, and is fuzzed with cargo-fuzz from the first commit.
+- The decoder works on borrowed slices, checks every length against the remaining buffer, never panics, and is fuzzed with cargo-fuzz from the first commit: three targets under `crates/kinship-proto/fuzz` cover datagrams, stream framing and the inner payload, and the differential check that opening a sealed payload agrees with parsing it directly. Keys are 32 bytes, zeroized on drop and never printed; the first key in the codec's list seals and any key opens, which the keyring task builds on.
 
 ## Transport
 
