@@ -11,4 +11,18 @@ pub struct Metrics {
     pub decode_errors: u64,
     /// Packets whose key id matched but whose tag did not verify, or with an unknown key id.
     pub decrypt_failures: u64,
+    /// Probe rounds started.
+    pub probes_sent: u64,
+    /// Probe rounds that ended without an Ack, direct or indirect.
+    pub probes_failed: u64,
+    /// PingReqs sent to relays.
+    pub indirect_probes: u64,
+    /// Members this node moved to Suspect, on its own probes or on gossip.
+    pub suspicions: u64,
+    /// Rumours about this node that it refuted by raising its incarnation.
+    pub refutations: u64,
+    /// Pings for another name that reached this node's address.
+    pub misdirected: u64,
+    /// Alive messages ignored because a live member already holds the name.
+    pub name_conflicts: u64,
 }
