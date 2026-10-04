@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/kinship-proto/fuzz
-      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo install cargo-fuzz --locked
       - name: Fuzz for 60 seconds from the seed corpus
         working-directory: crates/kinship-proto
         run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=60 -max_len=8192
