@@ -51,6 +51,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release -p kinship-sim --test sim -- --ignored --nocapture
 
+  sim-swim:
+    name: SWIM 1,000 seeds x 50 nodes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
+      - run: cargo test --release -p kinship-sim --test swim -- --ignored --nocapture
+
   msrv:
     runs-on: ubuntu-latest
     steps:

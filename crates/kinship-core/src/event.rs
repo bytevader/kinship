@@ -3,6 +3,8 @@
 use core::fmt;
 use core::net::SocketAddr;
 
+use crate::member::Member;
+
 /// Names one [`Command`], so its [`Event::CommandDone`] can be matched to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
@@ -52,7 +54,8 @@ impl fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-/// Something the application should hear about.
+/// Something the application should hear about. Member events never describe the local node;
+/// [`NameConflict`](Self::NameConflict) may.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
@@ -61,5 +64,25 @@ pub enum Event {
     CommandDone {
         id: CommandId,
         result: Result<(), CommandError>,
+    },
+    /// A node is alive that was unknown, dead or left.
+    MemberJoined(Member),
+    /// A node missed its probes and is suspected.
+    MemberSuspect(Member),
+    /// A suspect node refuted the suspicion and is alive again.
+    MemberRecovered(Member),
+    /// A suspicion expired without a refutation.
+    MemberDead(Member),
+    /// A node left on purpose.
+    MemberLeft(Member),
+    /// A node changed its metadata.
+    MemberUpdated {
+        member: Member,
+        previous_meta: Vec<u8>,
+    },
+    /// A node at `other_addr` claims the name of `member`, which keeps it.
+    NameConflict {
+        member: Member,
+        other_addr: SocketAddr,
     },
 }

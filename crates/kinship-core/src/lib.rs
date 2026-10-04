@@ -9,23 +9,39 @@
 //!
 //! Encryption happens inside the core: payloads in [`Transmit`] are already sealed, and inputs
 //! are the raw bytes off the wire.
+//!
+//! The protocol is SWIM as described in `docs/design.md`: randomized round-robin probes, direct
+//! and indirect pings, suspicion, incarnation numbers, and gossip piggybacked on every packet.
+//! The Lifeguard extensions run at fixed defaults for now: the local health multiplier stays at
+//! zero, Nacks are counted but not acted on, and the suspicion timeout is fixed at its minimum.
 
+mod broadcast;
 mod config;
 mod event;
 mod io;
+mod member;
 mod metrics;
+mod probe;
 mod rng;
+mod suspicion;
+mod table;
 mod time;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{Codec, DecodeError, NodeId, PacketKind, Payload};
+use kinship_proto::{Message, NodeId, PacketKind, Payload};
+
+use crate::broadcast::Outbox;
+use crate::probe::{Probe, Relay};
+use crate::suspicion::Suspicion;
+use crate::table::{Entry, Table};
 
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
 pub use kinship_proto::{Key, Limits, WIRE_VERSION};
+pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;
 pub use time::Instant;
@@ -76,21 +92,30 @@ impl Identity {
 }
 
 /// One cluster member's protocol state machine.
-///
-/// This is the API skeleton: inputs are authenticated and parsed, and commands complete, but no
-/// SWIM logic runs yet, so it sends nothing.
 pub struct Node {
     cfg: Config,
     me: Identity,
-    codec: Codec,
+    /// This node as the cluster sees it; its incarnation only ever rises.
+    local: Entry,
+    table: Table,
+    out: Outbox,
     rng: Rng,
     now: Instant,
     next_command: u64,
-    transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
     /// Inputs are copied here before opening, because the codec decrypts in place.
     recv_buf: Vec<u8>,
     metrics: Metrics,
+    /// Last sequence number used for a Ping.
+    seq: u32,
+    /// When the current probe round ends and the next starts.
+    next_probe: Instant,
+    probe: Option<Probe>,
+    /// PingReqs being relayed, by the sequence number of this node's own Ping.
+    relays: BTreeMap<u32, Relay>,
+    /// Next gossip tick. Ticks with nothing queued are skipped without waking the driver.
+    next_gossip: Instant,
+    suspicions: BTreeMap<String, Suspicion>,
 }
 
 impl Node {
@@ -109,29 +134,99 @@ impl Node {
             field: "security",
             reason: "rejected by the codec",
         })?;
-        Ok(Self {
+        let mut rng = Rng::new(seed);
+        let nonces = rng.fork();
+        // Stagger the first probe and gossip tick so nodes started together do not move in
+        // lockstep.
+        let next_probe = now + jitter(&mut rng, cfg.probe_interval);
+        let next_gossip = now + jitter(&mut rng, cfg.gossip_interval);
+        let local = Entry {
+            member: Member {
+                name: me.name.clone(),
+                addr: me.addr,
+                meta: me.meta.clone(),
+                state: State::Alive,
+                incarnation: 0,
+            },
+            since: now,
+            vmin: 1,
+            vmax: WIRE_VERSION,
+        };
+        let mut node = Self {
             cfg,
             me,
-            codec,
-            rng: Rng::new(seed),
+            local,
+            table: Table::default(),
+            out: Outbox::new(codec, nonces),
+            rng,
             now,
             next_command: 0,
-            transmits: VecDeque::new(),
             events: VecDeque::new(),
             recv_buf: Vec::new(),
             metrics: Metrics::default(),
-        })
+            seq: 0,
+            next_probe,
+            probe: None,
+            relays: BTreeMap::new(),
+            next_gossip,
+            suspicions: BTreeMap::new(),
+        };
+        node.broadcast(node.local_alive());
+        Ok(node)
+    }
+
+    /// Learns a member as Alive at incarnation 0 without contacting it, as a static member
+    /// list would. Its metadata stays empty until it gossips a newer Alive. Does nothing if the
+    /// name is this node's or already known.
+    pub fn add_member(
+        &mut self,
+        now: Instant,
+        name: &str,
+        addr: SocketAddr,
+    ) -> Result<(), ConfigError> {
+        self.advance(now);
+        if NodeId::new(name).is_err() {
+            return Err(ConfigError {
+                field: "name",
+                reason: "must be 1 to 64 bytes",
+            });
+        }
+        if name == self.local.member.name || self.table.get(name).is_some() {
+            return Ok(());
+        }
+        let member = Member {
+            name: name.to_owned(),
+            addr,
+            meta: Vec::new(),
+            state: State::Alive,
+            incarnation: 0,
+        };
+        self.events.push_back(Event::MemberJoined(member.clone()));
+        self.table.insert(Entry {
+            member,
+            since: self.now,
+            vmin: 1,
+            vmax: WIRE_VERSION,
+        });
+        Ok(())
     }
 
     /// A UDP datagram arrived from `from`.
     pub fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]) {
         self.advance(now);
+        // Replies go to the addresses inside the messages, which the AEAD authenticates; the
+        // UDP source address is not.
         let _ = from;
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(buf);
-        let opened = self.codec.open(PacketKind::Datagram, &mut scratch);
-        self.receive(opened);
+        match self.out.codec.open(PacketKind::Datagram, &mut scratch) {
+            Ok(payload) => {
+                self.metrics.packets_received += 1;
+                self.process(&payload);
+            }
+            Err(e) => self.count_error(&e),
+        }
         self.recv_buf = scratch;
     }
 
@@ -143,8 +238,10 @@ impl Node {
             let mut scratch = std::mem::take(&mut self.recv_buf);
             scratch.clear();
             scratch.extend_from_slice(frame);
-            let opened = self.codec.open(PacketKind::Stream, &mut scratch);
-            self.receive(opened);
+            match self.out.codec.open(PacketKind::Stream, &mut scratch) {
+                Ok(_payload) => self.metrics.packets_received += 1,
+                Err(e) => self.count_error(&e),
+            }
             self.recv_buf = scratch;
         }
     }
@@ -152,6 +249,17 @@ impl Node {
     /// The deadline from [`poll_timeout`](Self::poll_timeout) has passed.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.advance(now);
+        let now = self.now;
+        self.relay_timers(now);
+        self.probe_timers(now);
+        self.suspicion_timers(now);
+        if now >= self.next_gossip {
+            self.gossip(now);
+            let interval = self.cfg.gossip_interval;
+            let missed = (now - self.next_gossip).as_nanos() / interval.as_nanos();
+            let ticks = u32::try_from(missed + 1).unwrap_or(u32::MAX);
+            self.next_gossip = self.next_gossip + interval * ticks;
+        }
     }
 
     /// Starts a command; its result arrives later as [`Event::CommandDone`].
@@ -164,7 +272,11 @@ impl Node {
                 Err(CommandError::MetaTooLarge)
             }
             Command::SetMeta(meta) => {
-                self.me.meta = meta;
+                self.me.meta.clone_from(&meta);
+                let local = &mut self.local.member;
+                local.meta = meta;
+                local.incarnation = local.incarnation.saturating_add(1);
+                self.broadcast(self.local_alive());
                 Ok(())
             }
             Command::Join { .. } | Command::Leave => Err(CommandError::Unsupported),
@@ -175,7 +287,7 @@ impl Node {
 
     /// The next thing to send, if any.
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
-        self.transmits.pop_front()
+        self.out.transmits.pop_front()
     }
 
     /// The next event for the application, if any.
@@ -185,7 +297,14 @@ impl Node {
 
     /// When to call [`handle_timeout`](Self::handle_timeout), if ever.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        None
+        let mut t = self.probe_deadline();
+        if let Some(s) = self.suspicion_deadline() {
+            t = t.min(s);
+        }
+        if !self.out.broadcasts.is_empty() {
+            t = t.min(self.next_gossip);
+        }
+        Some(t)
     }
 
     pub fn identity(&self) -> &Identity {
@@ -200,26 +319,75 @@ impl Node {
         &self.metrics
     }
 
+    /// This node as the cluster sees it.
+    pub fn local(&self) -> &Member {
+        &self.local.member
+    }
+
+    /// Alive and suspect members, this node first.
+    pub fn members(&self) -> impl Iterator<Item = &Member> {
+        std::iter::once(&self.local.member).chain(
+            self.table
+                .iter()
+                .map(|e| &e.member)
+                .filter(|m| m.state.is_live()),
+        )
+    }
+
+    /// Every member this node knows, tombstones included, this node first.
+    pub fn all_members(&self) -> impl Iterator<Item = &Member> {
+        std::iter::once(&self.local.member).chain(self.table.iter().map(|e| &e.member))
+    }
+
+    /// One member by name, including Dead and Left tombstones.
+    pub fn member(&self, name: &str) -> Option<&Member> {
+        if name == self.local.member.name {
+            return Some(&self.local.member);
+        }
+        self.table.get(name).map(|e| &e.member)
+    }
+
+    /// Live members, this node included: the `n` in the timeout and retransmit formulas.
+    fn cluster_size(&self) -> usize {
+        self.table.live() + 1
+    }
+
     fn advance(&mut self, now: Instant) {
         // Drivers may hand in the same instant twice but never go backwards; clamp if they do.
         self.now = self.now.max(now);
     }
 
-    fn receive(&mut self, opened: Result<Payload<'_>, DecodeError>) {
-        match opened {
-            Ok(_payload) => self.metrics.packets_received += 1,
-            Err(e) if e.is_auth_failure() => self.metrics.decrypt_failures += 1,
-            Err(_) => self.metrics.decode_errors += 1,
+    fn count_error(&mut self, e: &kinship_proto::DecodeError) {
+        if e.is_auth_failure() {
+            self.metrics.decrypt_failures += 1;
+        } else {
+            self.metrics.decode_errors += 1;
         }
     }
 
-    /// Fresh nonce bytes for sealing a packet.
-    #[allow(dead_code)]
-    fn nonce(&mut self) -> [u8; kinship_proto::NONCE_LEN] {
-        let mut nonce = [0; kinship_proto::NONCE_LEN];
-        self.rng.fill(&mut nonce);
-        nonce
+    /// Handles every message of an authenticated payload, in order.
+    fn process(&mut self, payload: &Payload<'_>) {
+        let now = self.now;
+        for msg in payload.iter() {
+            match msg {
+                Message::Ping(p) => self.on_ping(&p),
+                Message::PingReq(r) => self.on_ping_req(now, &r),
+                Message::Ack { seq } => self.on_ack(seq),
+                Message::Nack { seq } => self.on_nack(seq),
+                Message::Alive(a) => self.on_alive(now, &a),
+                Message::Suspect(s) => self.on_suspect(now, &s),
+                Message::Dead(d) => self.on_dead(now, &d),
+                // Push-pull runs over streams, which carry no protocol yet.
+                Message::PushPull(_) => {}
+            }
+        }
     }
+}
+
+/// A uniform delay in `[0, max)`.
+fn jitter(rng: &mut Rng, max: core::time::Duration) -> core::time::Duration {
+    let nanos = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    core::time::Duration::from_nanos(rng.below(nanos))
 }
 
 impl std::fmt::Debug for Node {
@@ -228,6 +396,8 @@ impl std::fmt::Debug for Node {
             .field("name", &self.me.name)
             .field("addr", &self.me.addr)
             .field("now", &self.now)
+            .field("incarnation", &self.local.member.incarnation)
+            .field("members", &self.table.len())
             .finish_non_exhaustive()
     }
 }
@@ -235,7 +405,7 @@ impl std::fmt::Debug for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kinship_proto::{Message, Ping};
+    use kinship_proto::{Codec, Message, Ping};
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -348,8 +518,330 @@ mod tests {
         );
         assert_eq!(n.poll_event(), None);
         assert_eq!(n.identity().meta(), b"role=db");
+        assert_eq!(n.local().meta, b"role=db");
+        assert_eq!(n.local().incarnation, 1, "set_meta is a self-refutation");
+        // Alone, it has nobody to send to.
         assert_eq!(n.poll_transmit(), None);
-        assert_eq!(n.poll_timeout(), None);
+    }
+
+    fn plaintext() -> Codec {
+        Codec::insecure_plaintext(b"default", Limits::default()).unwrap()
+    }
+
+    fn deliver(n: &mut Node, now: Instant, msgs: &[Message<'_>]) {
+        let mut pkt = Vec::new();
+        plaintext()
+            .seal(PacketKind::Datagram, msgs, &[0; 24], &mut pkt)
+            .unwrap();
+        n.handle_datagram(now, addr(99), &pkt);
+    }
+
+    fn sent(n: &mut Node) -> Vec<(SocketAddr, Vec<u8>)> {
+        std::iter::from_fn(|| n.poll_transmit())
+            .map(|t| match t {
+                Transmit::Datagram { to, mut payload } => {
+                    let inner = plaintext()
+                        .open(PacketKind::Datagram, &mut payload)
+                        .map(|p| format!("{p:?}"))
+                        .unwrap();
+                    (to, inner.into_bytes())
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    fn id(s: &str) -> NodeId<'_> {
+        NodeId::new(s).unwrap()
+    }
+
+    fn alive(node: &str, inc: u32, port: u16) -> Message<'_> {
+        Message::Alive(kinship_proto::Alive {
+            inc,
+            node: id(node),
+            addr: addr(port),
+            meta: b"",
+            vmin: 1,
+            vmax: 1,
+        })
+    }
+
+    fn suspect<'a>(node: &'a str, inc: u32, from: &'a str) -> Message<'a> {
+        Message::Suspect(kinship_proto::Suspect {
+            inc,
+            node: id(node),
+            from: id(from),
+        })
+    }
+
+    fn dead<'a>(node: &'a str, inc: u32, from: &'a str) -> Message<'a> {
+        Message::Dead(kinship_proto::Dead {
+            inc,
+            node: id(node),
+            from: id(from),
+        })
+    }
+
+    fn events(n: &mut Node) -> Vec<Event> {
+        std::iter::from_fn(|| n.poll_event()).collect()
+    }
+
+    fn kinds(n: &mut Node) -> Vec<&'static str> {
+        events(n)
+            .iter()
+            .map(|e| match e {
+                Event::MemberJoined(_) => "joined",
+                Event::MemberSuspect(_) => "suspect",
+                Event::MemberRecovered(_) => "recovered",
+                Event::MemberDead(_) => "dead",
+                Event::MemberLeft(_) => "left",
+                Event::MemberUpdated { .. } => "updated",
+                Event::NameConflict { .. } => "conflict",
+                Event::CommandDone { .. } => "done",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rumours_follow_incarnation_precedence() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        assert_eq!(kinds(&mut n), ["joined"]);
+        let state = |n: &Node| {
+            let m = n.member("b").unwrap();
+            (m.state, m.incarnation)
+        };
+
+        deliver(&mut n, t, &[suspect("b", 0, "c")]);
+        assert_eq!(kinds(&mut n), ["suspect"]);
+        assert_eq!(state(&n), (State::Suspect, 0));
+        // Alive needs a higher incarnation to beat Suspect.
+        deliver(&mut n, t, &[alive("b", 0, 2)]);
+        assert_eq!(state(&n), (State::Suspect, 0));
+        deliver(&mut n, t, &[alive("b", 1, 2)]);
+        assert_eq!(kinds(&mut n), ["recovered"]);
+        assert_eq!(state(&n), (State::Alive, 1));
+        // Stale Suspect and Dead lose.
+        deliver(&mut n, t, &[suspect("b", 0, "c"), dead("b", 0, "c")]);
+        assert_eq!(state(&n), (State::Alive, 1));
+        assert_eq!(kinds(&mut n), Vec::<&str>::new());
+        // Dead wins at the same incarnation, and a tombstone yields only to a newer Alive.
+        deliver(&mut n, t, &[dead("b", 1, "c")]);
+        assert_eq!(kinds(&mut n), ["dead"]);
+        deliver(&mut n, t, &[alive("b", 1, 2), suspect("b", 5, "c")]);
+        assert_eq!(state(&n), (State::Dead, 1));
+        deliver(&mut n, t, &[alive("b", 2, 2)]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        assert_eq!(state(&n), (State::Alive, 2));
+        // Dead from the member itself means it left.
+        deliver(&mut n, t, &[dead("b", 2, "b")]);
+        assert_eq!(kinds(&mut n), ["left"]);
+        assert_eq!(state(&n), (State::Left, 2));
+        // Unknown members are not created from Suspect or Dead.
+        deliver(&mut n, t, &[suspect("x", 0, "c"), dead("y", 0, "c")]);
+        assert!(n.member("x").is_none() && n.member("y").is_none());
+    }
+
+    #[test]
+    fn rumours_about_self_are_refuted() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        deliver(&mut n, t, &[suspect("a", 0, "c")]);
+        assert_eq!(n.local().incarnation, 1);
+        deliver(&mut n, t, &[dead("a", 4, "c")]);
+        assert_eq!(n.local().incarnation, 5);
+        // Stale rumours are ignored.
+        deliver(&mut n, t, &[suspect("a", 3, "c")]);
+        assert_eq!(n.local().incarnation, 5);
+        assert_eq!(n.metrics().refutations, 2);
+        assert_eq!(n.local().state, State::Alive);
+        assert_eq!(kinds(&mut n), Vec::<&str>::new(), "no events about self");
+    }
+
+    #[test]
+    fn a_second_live_node_cannot_take_a_name() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        events(&mut n);
+        deliver(&mut n, t, &[alive("b", 3, 9), alive("a", 3, 9)]);
+        let ev = events(&mut n);
+        assert!(matches!(&ev[0], Event::NameConflict { member, other_addr }
+            if member.name == "b" && *other_addr == addr(9)));
+        assert!(matches!(&ev[1], Event::NameConflict { member, .. } if member.name == "a"));
+        assert_eq!(n.member("b").unwrap().addr, addr(2));
+        assert_eq!(n.local().incarnation, 0);
+    }
+
+    #[test]
+    fn metadata_changes_are_reported() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        events(&mut n);
+        let a = Message::Alive(kinship_proto::Alive {
+            inc: 1,
+            node: id("b"),
+            addr: addr(2),
+            meta: b"zone=x",
+            vmin: 1,
+            vmax: 1,
+        });
+        deliver(&mut n, t, &[a]);
+        let ev = events(&mut n);
+        assert!(
+            matches!(&ev[..], [Event::MemberUpdated { member, previous_meta }]
+            if member.meta == b"zone=x" && previous_meta.is_empty())
+        );
+    }
+
+    /// Runs `n`'s timers until `until`, returning what it sent.
+    fn run_until(n: &mut Node, until: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Some(t) = n.poll_timeout().filter(|&t| t <= until) {
+            n.handle_timeout(t);
+            out.extend(sent(n));
+        }
+        out
+    }
+
+    fn contains(pkts: &[(SocketAddr, Vec<u8>)], to: SocketAddr, needle: &str) -> bool {
+        pkts.iter()
+            .any(|(a, p)| *a == to && String::from_utf8_lossy(p).contains(needle))
+    }
+
+    /// Fires `n`'s timers until `done` holds for an event, returning the packets sent and the
+    /// time of that event.
+    fn run_to_event(
+        n: &mut Node,
+        pkts: &mut Vec<(SocketAddr, Vec<u8>)>,
+        done: impl Fn(&Event) -> bool,
+    ) -> (Instant, Event) {
+        loop {
+            let t = n.poll_timeout().unwrap();
+            n.handle_timeout(t);
+            pkts.extend(sent(n));
+            if let Some(e) = events(n).into_iter().find(|e| done(e)) {
+                return (t, e);
+            }
+        }
+    }
+
+    #[test]
+    fn silent_targets_are_probed_indirectly_then_suspected_then_declared_dead() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t0 = Instant::ZERO;
+        n.add_member(t0, "b", addr(2)).unwrap();
+        n.add_member(t0, "c", addr(3)).unwrap();
+        events(&mut n);
+        let mut pkts = Vec::new();
+        let (suspected_at, ev) =
+            run_to_event(&mut n, &mut pkts, |e| matches!(e, Event::MemberSuspect(_)));
+        let Event::MemberSuspect(m) = ev else {
+            unreachable!()
+        };
+        let (target, relay) = if m.name == "b" {
+            (addr(2), addr(3))
+        } else {
+            (addr(3), addr(2))
+        };
+        // A direct Ping, then a PingReq through the other member, then suspicion.
+        assert!(contains(&pkts, target, "Ping("));
+        assert!(contains(&pkts, relay, "PingReq("), "{pkts:?}");
+        assert!(suspected_at <= t0 + n.config().probe_interval * 2);
+
+        let mut pkts = Vec::new();
+        let name = m.name.clone();
+        let (dead_at, _) = run_to_event(
+            &mut n,
+            &mut pkts,
+            |e| matches!(e, Event::MemberDead(d) if d.name == name),
+        );
+        assert_eq!(
+            dead_at - suspected_at,
+            suspicion::min_timeout(n.config(), 3)
+        );
+        assert!(contains(&pkts, relay, "Suspect("), "suspicion is gossiped");
+        let mut pkts = Vec::new();
+        let end = dead_at + n.config().probe_interval * 2;
+        while let Some(t) = n.poll_timeout().filter(|&t| t <= end) {
+            n.handle_timeout(t);
+            pkts.extend(sent(&mut n));
+        }
+        assert!(contains(&pkts, relay, "Dead("), "death is gossiped");
+
+        // The tombstone is reaped after dead_reclaim.
+        let end = dead_at + n.config().dead_reclaim + n.config().probe_interval;
+        while let Some(t) = n.poll_timeout().filter(|&t| t <= end) {
+            n.handle_timeout(t);
+        }
+        assert!(n.member(&m.name).is_none());
+    }
+
+    #[test]
+    fn acked_probes_raise_no_suspicion() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t0 = Instant::ZERO;
+        n.add_member(t0, "b", addr(2)).unwrap();
+        events(&mut n);
+        let interval = n.config().probe_interval;
+        for round in 1..=5 {
+            let end = t0 + interval * round;
+            while let Some(now) = n.poll_timeout().filter(|&t| t <= end) {
+                n.handle_timeout(now);
+                let out: Vec<Transmit> = std::iter::from_fn(|| n.poll_transmit()).collect();
+                for t in out {
+                    let Transmit::Datagram { mut payload, .. } = t else {
+                        continue;
+                    };
+                    let codec = plaintext();
+                    let p = codec.open(PacketKind::Datagram, &mut payload).unwrap();
+                    let seqs: Vec<u32> = p
+                        .iter()
+                        .filter_map(|m| match m {
+                            Message::Ping(p) => Some(p.seq),
+                            _ => None,
+                        })
+                        .collect();
+                    for seq in seqs {
+                        deliver(&mut n, now, &[Message::Ack { seq }]);
+                    }
+                }
+            }
+        }
+        assert_eq!(n.metrics().probes_failed, 0);
+        assert!(n.metrics().probes_sent >= 4);
+        assert_eq!(events(&mut n), Vec::new());
+    }
+
+    #[test]
+    fn relays_forward_acks_and_send_nacks() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        let req = |seq| {
+            Message::PingReq(kinship_proto::PingReq {
+                seq,
+                target: id("b"),
+                target_addr: addr(2),
+                requester_addr: addr(3),
+                want_nack: true,
+            })
+        };
+        deliver(&mut n, t, &[req(40)]);
+        let pkts = sent(&mut n);
+        assert!(contains(&pkts, addr(2), "Ping("));
+        // Find our own sequence number in the Ping and answer it.
+        let relay_seq = n.seq;
+        deliver(&mut n, t, &[Message::Ack { seq: relay_seq }]);
+        assert!(contains(&sent(&mut n), addr(3), "Ack { seq: 40 }"));
+
+        deliver(&mut n, t, &[req(41)]);
+        sent(&mut n);
+        let timeout = n.config().probe_timeout;
+        let pkts = run_until(&mut n, t + timeout);
+        assert!(contains(&pkts, addr(3), "Nack { seq: 41 }"), "{pkts:?}");
+        assert!(n.relays.is_empty());
     }
 
     #[test]
