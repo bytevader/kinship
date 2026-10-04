@@ -1,0 +1,16 @@
+[package]
+name = "kinship"
+description = "SWIM membership and failure detection with Lifeguard, for Rust and Python"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kinship-net.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kinship-proto",
+    "crates/kinship-core",
+    "crates/kinship-sim",
+    "crates/kinship-net",
+    "crates/kinship-py",
+    "crates/kinship",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bytevader/kinship"
+authors = ["Nikola Stankovic"]
+
+[workspace.dependencies]
+kinship-proto = { path = "crates/kinship-proto", version = "0.0.0" }
+kinship-core = { path = "crates/kinship-core", version = "0.0.0" }
+kinship-sim = { path = "crates/kinship-sim", version = "0.0.0" }
+kinship-net = { path = "crates/kinship-net", version = "0.0.0" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

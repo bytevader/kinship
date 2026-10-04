@@ -1,0 +1,12 @@
+[package]
+name = "kinship-proto"
+description = "kinship wire types, codec and AEAD framing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
