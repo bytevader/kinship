@@ -53,6 +53,8 @@ crates/kinship-core/src/
   lib.rs          Node: the sans-IO entry points
   config.rs       validated Config, presets lan() wan() local()
   time.rs         Instant(u64 nanos) and Duration, no std clock
+  rng.rs          seeded xoshiro256** RNG for every random choice and nonce
+  io.rs           Transmit, StreamEvent, StreamId
   member.rs       Member, State, Incarnation, precedence rules
   table.rs        member table, shuffled probe order
   probe.rs        direct and indirect probe rounds, nacks
@@ -68,7 +70,7 @@ The core's whole surface is five calls in and three out, modelled on quinn-proto
 
 ```rust
 impl Node {
-    pub fn new(cfg: Config, me: Identity, now: Instant, seed: u64) -> Node;
+    pub fn new(cfg: Config, me: Identity, now: Instant, seed: u64) -> Result<Node, ConfigError>;
     pub fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]);
     pub fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>); // Frame(&[u8]) | Closed | Failed
     pub fn handle_timeout(&mut self, now: Instant);

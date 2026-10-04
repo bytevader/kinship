@@ -8,8 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Serialize events, ids and instants, for traces and drivers that export them.
+serde = ["dep:serde"]
+
 [dependencies]
 kinship-proto.workspace = true
+serde = { version = "1", default-features = false, features = ["std", "derive"], optional = true }
 
 [lints]
 workspace = true

@@ -363,7 +363,7 @@ The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `
 ```rust
 use kinship_core::{Command, Config, Event, Identity, Instant, Node, StreamEvent, Transmit};
 
-let mut node = Node::new(cfg, Identity::new("a", my_addr)?, Instant::ZERO, rng_seed);
+let mut node = Node::new(cfg, Identity::new("a", my_addr)?, Instant::ZERO, rng_seed)?;
 let join = node.command(now, Command::Join { seeds: vec![seed_addr] });   // a CommandId
 
 // Feed every input with the current time:
