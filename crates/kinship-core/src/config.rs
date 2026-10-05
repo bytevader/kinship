@@ -34,6 +34,18 @@ pub struct Config {
     pub expected_confirmations: u32,
     pub awareness_max: u32,
     pub dead_reclaim: Duration,
+    /// Lifeguard: stretch probe interval and timeout by the local health multiplier, which
+    /// rises when this node's own probes go unanswered and falls when they succeed.
+    pub local_health: bool,
+    /// Lifeguard: ask PingReq relays for a Nack when the target is silent too, and count each
+    /// relay that sends neither against local health.
+    pub nacks: bool,
+    /// Lifeguard: start each suspicion at `suspicion_max_mult` times the minimum timeout and
+    /// shrink it toward the minimum as independent members confirm it.
+    pub dynamic_suspicion: bool,
+    /// Lifeguard: put a Suspect first in every Ping to a suspected member, so it hears the
+    /// rumour on the next probe and refutes at once.
+    pub buddy_system: bool,
 
     pub gossip_interval: Duration,
     pub gossip_nodes: usize,
@@ -66,6 +78,10 @@ impl Config {
             expected_confirmations: 3,
             awareness_max: 8,
             dead_reclaim: Duration::from_secs(30),
+            local_health: true,
+            nacks: true,
+            dynamic_suspicion: true,
+            buddy_system: true,
             gossip_interval: Duration::from_millis(200),
             gossip_nodes: 3,
             gossip_to_the_dead: Duration::from_secs(30),
@@ -100,6 +116,18 @@ impl Config {
             gossip_interval: Duration::from_millis(200),
             tcp_fallback_ping: false,
             ..Self::lan(security)
+        }
+    }
+
+    /// Turns off all four Lifeguard extensions, leaving plain SWIM with a fixed suspicion
+    /// timeout at the Lifeguard minimum. For experiments and tests that compare the two.
+    pub fn without_lifeguard(self) -> Self {
+        Self {
+            local_health: false,
+            nacks: false,
+            dynamic_suspicion: false,
+            buddy_system: false,
+            ..self
         }
     }
 

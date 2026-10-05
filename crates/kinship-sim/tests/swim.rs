@@ -7,8 +7,9 @@
 //! 1. no live node is declared dead, as long as loss stays within [`LOSS_TOLERANCE`] and no
 //!    partition has started (in a partition a minority side can lose its own members, which
 //!    only push-pull anti-entropy repairs);
-//! 2. every crashed node, and every node across a partition, is declared dead by every live
-//!    node within the analytic bound [`detection_bound`];
+//! 2. every crashed node is declared dead by every live node within the analytic bound
+//!    [`detection_bound`], and every node across a partition, or crashed while one started,
+//!    within [`partition_bound`];
 //! 3. once loss stops at the end of the scenario, every live node reaches the live set of its
 //!    side of any partition, exactly the nodes still running there, within [`settle_bound`],
 //!    false deaths included: push-pull anti-entropy repairs them;
@@ -57,16 +58,32 @@ fn suspicion_timeout(cfg: &Config, n: usize) -> Duration {
     Duration::from_millis((s * 1000.0).ceil() as u64)
 }
 
-/// The latest a failure can go undetected by a live node, in a cluster of `n`.
+/// The latest a crash can go undetected by a live node, in a cluster of `n`.
 ///
 /// Every node probes every live member once per pass of its shuffled round-robin list, and a
 /// pass is `n - 1` probe intervals, so from any moment the next probe of a given member comes
 /// within two passes. That round fails at its end, one more interval. The suspicion then runs
-/// for its timeout, unless a Dead rumour arrives first. Two seconds of slack cover network
-/// latency, paused and slow nodes.
+/// for its timeout, unless a Dead rumour arrives first; every live node's probe of the crashed
+/// member fails within those passes, so the Lifeguard confirmations arrive and the timeout is
+/// the minimum. Two seconds of slack cover network latency, paused and slow nodes.
 fn detection_bound(cfg: &Config, n: usize) -> Duration {
     let rounds = 2 * (n as u32 - 1) + 1;
     cfg.probe_interval * rounds + suspicion_timeout(cfg, n) + secs(2)
+}
+
+/// The latest a node on one side of a partition can take to declare a node on the other side
+/// dead.
+///
+/// On the minority side most relays are out of reach too, so their Nacks go missing and
+/// Lifeguard raises local health to `awareness_max`: every round stretches to
+/// `awareness_max + 1` probe intervals. Few members are left to confirm a suspicion, so it can
+/// run for the maximum timeout.
+fn partition_bound(cfg: &Config, n: usize) -> Duration {
+    let rounds = 2 * (n as u32 - 1) + 1;
+    let stretch = cfg.awareness_max + 1;
+    cfg.probe_interval * rounds * stretch
+        + suspicion_timeout(cfg, n) * cfg.suspicion_max_mult
+        + secs(2)
 }
 
 impl Plan {
@@ -119,13 +136,26 @@ impl Plan {
             (at(&mut rng, 5, 20), side)
         });
 
-        let last = crashes
+        let split_at = partition.as_ref().map(|p| p.0);
+        let detected = crashes
             .iter()
-            .map(|c| c.0)
-            .chain(partition.iter().map(|p| p.0))
+            .map(|c| {
+                let window = c.0 + detection_bound(&config(), nodes);
+                let bound = if split_at.is_some_and(|t| window >= t) {
+                    partition_bound(&config(), nodes)
+                } else {
+                    detection_bound(&config(), nodes)
+                };
+                c.0 + bound
+            })
+            .chain(
+                partition
+                    .iter()
+                    .map(|p| p.0 + partition_bound(&config(), nodes)),
+            )
             .max()
-            .unwrap_or(secs(10));
-        let duration = last + detection_bound(&config(), nodes) + secs(5);
+            .unwrap_or(secs(10) + detection_bound(&config(), nodes));
+        let duration = detected + secs(5);
         Self {
             nodes,
             loss,
@@ -351,7 +381,10 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
     }
 
     // Every failure is detected by every live node within the bound.
-    let bound = detection_bound(&config(), nodes);
+    let (crash_bound, split_bound) = (
+        detection_bound(&config(), nodes),
+        partition_bound(&config(), nodes),
+    );
     for o in (0..nodes).filter(|&o| plan.alive_at(o, end)) {
         for j in (0..nodes).filter(|&j| j != o) {
             let failed = match (plan.crashed_at(j), plan.split(o, j, end)) {
@@ -359,6 +392,13 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
                 (Some(c), None) => c,
                 (None, Some(p)) => p,
                 (None, None) => continue,
+            };
+            // An observer on the minority side of a partition runs at full Lifeguard stretch,
+            // whatever failed, once the partition starts inside the detection window.
+            let bound = if plan.partitioned(failed + crash_bound) {
+                split_bound
+            } else {
+                crash_bound
             };
             match dead_at.get(&(o, j)) {
                 // Declared dead before it failed: a false death, already accounted for.
@@ -484,7 +524,7 @@ fn swim_trace_is_pinned_across_platforms() {
     });
     assert_eq!(
         sim.run().digest(),
-        0xaa2c_4eeb_3a3a_7e31,
+        0x48b9_e186_abd7_c8fe,
         "trace digest changed"
     );
 }

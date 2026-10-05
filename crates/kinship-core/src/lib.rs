@@ -14,9 +14,13 @@
 //! and indirect pings, suspicion, incarnation numbers, and gossip piggybacked on every packet.
 //! Streams carry the rest: joins and periodic anti-entropy as push-pull state exchanges,
 //! reconnects to recently dead members, and a TCP fallback ping when a UDP probe goes unanswered.
-//! The Lifeguard extensions run at fixed defaults for now: the local health multiplier stays at
-//! zero, Nacks are counted but not acted on, and the suspicion timeout is fixed at its minimum.
+//! Lifeguard (Dadgar et al., 2017) runs on top, each extension behind its own [`Config`] flag
+//! so plain SWIM stays testable: the local health multiplier stretches this node's probe
+//! interval and timeout when its own probes fail, missing Nacks from PingReq relays count
+//! against it, suspicion timeouts start long and shrink as independent members confirm them,
+//! and Pings to a suspected member carry the suspicion so it can refute at once.
 
+mod awareness;
 mod broadcast;
 mod config;
 mod event;
@@ -121,6 +125,8 @@ pub struct Node {
     next_gossip: Instant,
     suspicions: BTreeMap<String, Suspicion>,
     sync: Sync,
+    /// Lifeguard's local health multiplier; see [`Node::local_health`].
+    health: u32,
 }
 
 impl Node {
@@ -180,6 +186,7 @@ impl Node {
             next_gossip,
             suspicions: BTreeMap::new(),
             sync,
+            health: 0,
         };
         node.broadcast(node.local_alive());
         Ok(node)
@@ -649,6 +656,28 @@ mod tests {
     }
 
     #[test]
+    fn a_suspicion_at_a_newer_incarnation_restarts_the_timer() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t0 = Instant::ZERO;
+        for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+            n.add_member(t0, name, addr(port)).unwrap();
+        }
+        deliver(&mut n, t0, &[suspect("b", 0, "c")]);
+        let first = n.suspicions["b"].deadline;
+        // b refuted at 1 and was suspected again; its Alive never reached us.
+        let t1 = t0 + n.config().probe_interval;
+        deliver(&mut n, t1, &[suspect("b", 1, "d")]);
+        assert_eq!(n.member("b").unwrap().incarnation, 1);
+        let s = &n.suspicions["b"];
+        assert_eq!(s.deadline, first + (t1 - t0), "a fresh timer");
+        assert_eq!(
+            s.confirmations(),
+            0,
+            "confirmations of the old one do not carry over"
+        );
+    }
+
+    #[test]
     fn rumours_about_self_are_refuted() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
@@ -662,6 +691,7 @@ mod tests {
         assert_eq!(n.metrics().refutations, 2);
         assert_eq!(n.local().state, State::Alive);
         assert_eq!(kinds(&mut n), Vec::<&str>::new(), "no events about self");
+        assert_eq!(n.local_health(), 2, "each refutation raises local health");
     }
 
     #[test]
@@ -763,9 +793,10 @@ mod tests {
             &mut pkts,
             |e| matches!(e, Event::MemberDead(d) if d.name == name),
         );
+        // Nobody else can confirm, so the Lifeguard timeout stays at its maximum.
         assert_eq!(
             dead_at - suspected_at,
-            suspicion::min_timeout(n.config(), 3)
+            suspicion::min_timeout(n.config(), 3) * n.config().suspicion_max_mult
         );
         assert!(contains(&pkts, relay, "Suspect("), "suspicion is gossiped");
         let mut pkts = Vec::new();
@@ -776,8 +807,10 @@ mod tests {
         }
         assert!(contains(&pkts, relay, "Dead("), "death is gossiped");
 
-        // The tombstone is reaped after dead_reclaim.
-        let end = dead_at + n.config().dead_reclaim + n.config().probe_interval;
+        // The tombstone is reaped after dead_reclaim, at the end of a probe round, which the
+        // failed rounds have stretched.
+        assert!(n.local_health() > 0);
+        let end = dead_at + n.config().dead_reclaim + n.probe_interval();
         while let Some(t) = n.poll_timeout().filter(|&t| t <= end) {
             n.handle_timeout(t);
         }
@@ -818,6 +851,145 @@ mod tests {
         assert_eq!(n.metrics().probes_failed, 0);
         assert!(n.metrics().probes_sent >= 4);
         assert_eq!(events(&mut n), Vec::new());
+    }
+
+    /// A node whose probe rounds a test drives one at a time.
+    struct Rounds {
+        n: Node,
+        /// What the round in progress has sent so far, still unanswered.
+        pending: Vec<Transmit>,
+    }
+
+    impl Rounds {
+        fn new(cfg: Config) -> Self {
+            let me = Identity::new("a", addr(1)).unwrap();
+            let mut n = Node::new(cfg, me, Instant::ZERO, 7).unwrap();
+            for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+                n.add_member(Instant::ZERO, name, addr(port)).unwrap();
+            }
+            events(&mut n);
+            let mut r = Self {
+                n,
+                pending: Vec::new(),
+            };
+            // Up to the start of the first round.
+            r.round(|_| None);
+            r
+        }
+
+        /// Runs the round in progress to its end, delivering whatever `reply` returns for each
+        /// message sent during it. The next round starts and its Ping waits in `pending`.
+        fn round(&mut self, reply: impl Fn(&Message<'_>) -> Option<Message<'static>>) {
+            let end = self.n.next_probe;
+            let mut out = std::mem::take(&mut self.pending);
+            let mut now = self.n.now;
+            loop {
+                for t in out.drain(..) {
+                    let Transmit::Datagram { mut payload, .. } = t else {
+                        continue;
+                    };
+                    let codec = plaintext();
+                    let p = codec.open(PacketKind::Datagram, &mut payload).unwrap();
+                    let replies: Vec<Message<'static>> =
+                        p.iter().filter_map(|m| reply(&m)).collect();
+                    if !replies.is_empty() {
+                        deliver(&mut self.n, now, &replies);
+                    }
+                }
+                let Some(t) = self.n.poll_timeout().filter(|&t| t <= end) else {
+                    return;
+                };
+                now = t;
+                self.n.handle_timeout(t);
+                out.extend(std::iter::from_fn(|| self.n.poll_transmit()));
+                if t == end {
+                    self.pending = out;
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_health_follows_probe_outcomes() {
+        let mut r = Rounds::new(Config::local(Security::InsecurePlaintext));
+        // Every relay answers with a Nack: the target is down, not this node.
+        r.round(|m| match m {
+            Message::PingReq(req) => {
+                assert!(req.want_nack);
+                Some(Message::Nack { seq: req.seq })
+            }
+            _ => None,
+        });
+        assert_eq!(r.n.metrics().probes_failed, 1);
+        assert_eq!(r.n.metrics().indirect_probes, 3);
+        assert_eq!(r.n.local_health(), 0);
+        // Silent relays: one point per relay. The suspect from the last round is not asked.
+        r.round(|_| None);
+        assert_eq!(r.n.metrics().probes_failed, 2);
+        assert_eq!(r.n.metrics().missed_nacks, 2);
+        assert_eq!(r.n.local_health(), 2);
+        assert_eq!(
+            r.n.next_probe - r.n.now,
+            r.n.config().probe_interval * 3,
+            "rounds stretch"
+        );
+        // An Ack brings it back down by one.
+        r.round(|m| match m {
+            Message::Ping(p) => Some(Message::Ack { seq: p.seq }),
+            _ => None,
+        });
+        assert_eq!(r.n.metrics().probes_failed, 2);
+        assert_eq!(r.n.local_health(), 1);
+    }
+
+    #[test]
+    fn plain_swim_keeps_health_at_zero_and_asks_for_no_nacks() {
+        let cfg = Config::local(Security::InsecurePlaintext).without_lifeguard();
+        let mut r = Rounds::new(cfg);
+        for _ in 0..3 {
+            r.round(|m| {
+                if let Message::PingReq(req) = m {
+                    assert!(!req.want_nack);
+                }
+                None
+            });
+        }
+        assert_eq!(r.n.metrics().probes_failed, 3);
+        assert_eq!(r.n.local_health(), 0);
+        assert_eq!(r.n.next_probe - r.n.now, r.n.config().probe_interval);
+    }
+
+    #[test]
+    fn pings_to_a_suspect_carry_the_suspicion_first() {
+        for buddy in [true, false] {
+            let mut cfg = Config::local(Security::InsecurePlaintext);
+            cfg.buddy_system = buddy;
+            let mut n = node(Security::InsecurePlaintext);
+            n.cfg = cfg;
+            let t = Instant::ZERO;
+            n.add_member(t, "b", addr(2)).unwrap();
+            deliver(&mut n, t, &[suspect("b", 0, "c")]);
+            assert_eq!(n.member("b").unwrap().state, State::Suspect);
+            let mut pkts = Vec::new();
+            while n.metrics().probes_sent == 0 {
+                let t = n.poll_timeout().unwrap();
+                n.handle_timeout(t);
+                pkts.extend(sent(&mut n));
+            }
+            let ping = pkts
+                .iter()
+                .map(|(_, p)| String::from_utf8_lossy(p).into_owned())
+                .find(|p| p.contains("Ping("))
+                .unwrap();
+            let own = r#"Suspect(Suspect { inc: 0, node: "b", from: "a" })"#;
+            if buddy {
+                let first = ping.find(own).expect(&ping);
+                assert!(first < ping.find("Ping(").unwrap(), "{ping}");
+            } else {
+                assert!(!ping.contains(own), "{ping}");
+            }
+        }
     }
 
     #[test]

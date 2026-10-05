@@ -126,6 +126,8 @@ impl Node {
         let name = s.node.as_str();
         if name == self.local.member.name {
             if s.inc >= self.local.member.incarnation {
+                // Others missed our Acks: likely this node is the slow one.
+                self.health_delta(1);
                 self.refute(s.inc);
             }
             return;
@@ -143,24 +145,27 @@ impl Node {
                     .update(name, State::Suspect, s.inc, now)
                     .member
                     .clone();
-                self.suspicions.insert(
-                    name.to_owned(),
-                    Suspicion::new(&self.cfg, n, now, &self.local.member.name, from),
-                );
+                self.suspicions
+                    .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
                 self.metrics.suspicions += 1;
                 self.events.push_back(Event::MemberSuspect(member));
                 self.broadcast(Gossip::from_suspect(s));
             }
-            State::Suspect if s.inc >= inc => {
-                if s.inc > inc {
-                    // A newer suspicion: same timer, new incarnation.
-                    self.table.update(name, State::Suspect, s.inc, now);
-                }
+            State::Suspect if s.inc > inc => {
+                // The member refuted the old suspicion, even if its Alive has not reached us,
+                // so this is a new one: a fresh timer and fresh confirmations.
+                let n = self.cluster_size();
+                self.table.update(name, State::Suspect, s.inc, now);
+                self.suspicions
+                    .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
+                self.broadcast(Gossip::from_suspect(s));
+            }
+            State::Suspect if s.inc == inc => {
                 let fresh = self
                     .suspicions
                     .get_mut(name)
-                    .is_some_and(|sus| sus.confirm(&self.local.member.name, from));
-                if s.inc > inc || fresh {
+                    .is_some_and(|sus| sus.confirm(from));
+                if fresh {
                     self.broadcast(Gossip::from_suspect(s));
                 }
             }
@@ -172,6 +177,7 @@ impl Node {
         let name = d.node.as_str();
         if name == self.local.member.name {
             if d.inc >= self.local.member.incarnation {
+                self.health_delta(1);
                 self.refute(d.inc);
             }
             return;
