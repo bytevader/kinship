@@ -9,123 +9,29 @@
 //!    only push-pull anti-entropy repairs);
 //! 2. every crashed node, and every node across a partition, is declared dead by every live
 //!    node within the analytic bound [`detection_bound`];
-//! 3. without a partition, every live node ends with the same live set, which is exactly the
-//!    nodes still running;
+//! 3. once loss stops at the end of the scenario, every live node reaches the live set of its
+//!    side of any partition, exactly the nodes still running there, within [`settle_bound`],
+//!    false deaths included: push-pull anti-entropy repairs them;
 //! 4. no node ever sees an incarnation go down, its own or anyone else's.
 //!
 //! A failure prints its seed. Replay one with
 //! `KINSHIP_SEED=<seed> cargo test --release -p kinship-sim --test swim -- --ignored --nocapture`.
 
-use std::cell::RefCell;
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use kinship_core::{
-    Command, CommandId, Config, Event, Identity, Instant, Key, Node, Rng, Security, StreamEvent,
-    StreamId, Transmit,
-};
-use kinship_sim::{
-    Action, Delay, LinkConfig, NodeSpec, Scenario, Sim, SimNode, TraceConfig, addr_of, name_of,
-};
+use common::{Log, Observed, check_all, config, index_of, ms, secs, seeds};
+use kinship_core::{Command, Config, Event, Instant, Rng};
+use kinship_sim::{Action, Delay, LinkConfig, Scenario, Sim, TraceConfig, name_of};
 
 /// Uniform packet loss up to this is within what core SWIM must tolerate without a false death.
 const LOSS_TOLERANCE: f64 = 0.01;
 
 /// Scenarios draw loss up to this. Above the tolerance false deaths are counted, not failures.
 const MAX_LOSS: f64 = 0.05;
-
-fn secs(s: u64) -> Duration {
-    Duration::from_secs(s)
-}
-
-fn ms(m: u64) -> Duration {
-    Duration::from_millis(m)
-}
-
-fn config() -> Config {
-    Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]))
-}
-
-/// One event a node reported, and when.
-#[derive(Debug, Clone)]
-struct Seen {
-    t: Instant,
-    observer: usize,
-    event: Event,
-}
-
-type Log = Rc<RefCell<Vec<Seen>>>;
-
-/// A core node that copies every event into a shared log, stamped with the time of the input
-/// that produced it.
-struct Observed {
-    node: Node,
-    index: usize,
-    now: Instant,
-    log: Log,
-}
-
-impl Observed {
-    fn new(spec: &NodeSpec, log: Log) -> Self {
-        let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
-        let mut node = Node::new(config(), me, spec.now, spec.seed).unwrap();
-        for j in (0..spec.nodes).filter(|&j| j != spec.index) {
-            node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
-        }
-        while node.poll_event().is_some() {}
-        Self {
-            node,
-            index: spec.index,
-            now: spec.now,
-            log,
-        }
-    }
-}
-
-impl SimNode for Observed {
-    type Command = Command;
-    type Event = Event;
-
-    fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]) {
-        self.now = now;
-        self.node.handle_datagram(now, from, buf);
-    }
-
-    fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>) {
-        self.now = now;
-        self.node.handle_stream(now, conn, ev);
-    }
-
-    fn handle_timeout(&mut self, now: Instant) {
-        self.now = now;
-        self.node.handle_timeout(now);
-    }
-
-    fn command(&mut self, now: Instant, cmd: Command) -> CommandId {
-        self.now = now;
-        self.node.command(now, cmd)
-    }
-
-    fn poll_transmit(&mut self) -> Option<Transmit> {
-        self.node.poll_transmit()
-    }
-
-    fn poll_event(&mut self) -> Option<Event> {
-        let event = self.node.poll_event()?;
-        self.log.borrow_mut().push(Seen {
-            t: self.now,
-            observer: self.index,
-            event: event.clone(),
-        });
-        Some(event)
-    }
-
-    fn poll_timeout(&self) -> Option<Instant> {
-        self.node.poll_timeout()
-    }
-}
 
 /// The random faults of one seed.
 #[derive(Debug, Clone)]
@@ -327,10 +233,8 @@ struct Outcome {
     partition_deaths: u64,
     /// Live members declared dead under loss above [`LOSS_TOLERANCE`].
     lossy_deaths: u64,
-}
-
-fn index_of(name: &str) -> usize {
-    name[1..].parse().expect("simulator names are n<index>")
+    /// From the end of the scenario to every live view being right.
+    settled: Option<Duration>,
 }
 
 /// Runs one seed and checks every property, returning the first violation.
@@ -339,16 +243,50 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
     let log: Log = Rc::default();
     let factory_log = log.clone();
     let mut sim = Sim::new(seed, plan.scenario(), move |spec| {
-        Observed::new(spec, factory_log.clone())
+        Observed::new(spec, factory_log.clone(), |_| true)
     });
     let fail = |msg: String| Err(format!("seed {seed}: {msg}\nplan: {plan:?}"));
 
-    // Sample every node's view once a simulated second for incarnations that go down.
+    let end = sim.end();
+    // What each live node must end up holding: the running nodes on its side.
+    let truth = |o: usize| -> BTreeSet<usize> {
+        (0..nodes)
+            .filter(|&j| plan.alive_at(j, end) && plan.split(o, j, end).is_none())
+            .collect()
+    };
+    let diverged = |sim: &Sim<Observed>| -> Option<String> {
+        (0..nodes).filter(|&o| plan.alive_at(o, end)).find_map(|o| {
+            let n = &sim.node(o).expect("alive").node;
+            let view: BTreeSet<usize> = n.members().map(|m| index_of(&m.name)).collect();
+            let want = truth(o);
+            (view != want).then(|| format!("{} holds {view:?}, expected {want:?}", name_of(o)))
+        })
+    };
+
+    // Run the scenario, then let it settle: loss stops, the partition stays, and every live
+    // node must reach the true live set within settle_bound. Meanwhile sample every node's
+    // view once a simulated second for incarnations that go down.
+    let settle_end = end + settle_bound(&config());
+    let mut settled = None;
     let mut seen: Vec<Vec<u32>> = vec![vec![0; nodes]; nodes];
     let mut t = Instant::ZERO;
-    while t < sim.end() {
-        t = (t + secs(1)).min(sim.end());
+    while t < settle_end && settled.is_none() {
+        t = if t < end {
+            (t + secs(1)).min(end)
+        } else {
+            t + secs(1)
+        };
         sim.run_until(t);
+        if t == end {
+            sim.apply(Action::SetLink {
+                from: (0..nodes).into(),
+                to: (0..nodes).into(),
+                link: LinkConfig::lan(),
+            });
+        }
+        if t >= end && diverged(&sim).is_none() {
+            settled = Some(t - end);
+        }
         for (o, row) in seen.iter_mut().enumerate() {
             let Some(n) = sim.node(o) else { continue };
             for m in n.node.all_members() {
@@ -414,7 +352,6 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
 
     // Every failure is detected by every live node within the bound.
     let bound = detection_bound(&config(), nodes);
-    let end = sim.end();
     for o in (0..nodes).filter(|&o| plan.alive_at(o, end)) {
         for j in (0..nodes).filter(|&j| j != o) {
             let failed = match (plan.crashed_at(j), plan.split(o, j, end)) {
@@ -446,71 +383,33 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
         }
     }
 
-    // Every live node converged on the same live set: the running nodes. Runs with a partition
-    // or a false death are left out: a node that wrongly declared a member dead stops probing
-    // it, and only push-pull anti-entropy brings the member back if the refutation missed it.
+    // Every live node converged on the running nodes of its side, partitions and false deaths
+    // included: push-pull anti-entropy repairs what the failure detector got wrong.
     for o in (0..nodes).filter(|&o| plan.alive_at(o, end)) {
         let n = &sim.node(o).expect("alive").node;
         out.suspicions += n.metrics().suspicions;
         out.refutations += n.metrics().refutations;
-        if plan.partition.is_some() || out.lossy_deaths > 0 {
-            continue;
-        }
-        let view: BTreeSet<usize> = n.members().map(|m| index_of(&m.name)).collect();
-        let truth: BTreeSet<usize> = (0..nodes)
-            .filter(|&j| plan.alive_at(j, end) && plan.split(o, j, end).is_none())
-            .collect();
-        if view != truth {
+    }
+    match settled {
+        Some(d) => out.settled = Some(d),
+        None => {
+            let why = diverged(&sim).unwrap_or_default();
             return fail(format!(
-                "{} ended with live set {view:?}, expected {truth:?}",
-                name_of(o)
+                "not converged {:?} after the scenario: {why}",
+                settle_bound(&config())
             ));
         }
     }
     Ok(out)
 }
 
-fn env(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
-}
-
-/// Checks `seeds` in parallel; panics naming the lowest failing seed.
-fn check_all(seeds: std::ops::Range<u64>, nodes: usize) -> Vec<Outcome> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let next = std::sync::atomic::AtomicU64::new(seeds.start);
-    let results = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if seed >= seeds.end {
-                        break;
-                    }
-                    let r = check(seed, nodes);
-                    results.lock().unwrap().push((seed, r));
-                }
-            });
-        }
-    });
-    let mut results = results.into_inner().unwrap();
-    results.sort_by_key(|r| r.0);
-    let failures: Vec<&(u64, Result<Outcome, String>)> =
-        results.iter().filter(|r| r.1.is_err()).collect();
-    if let Some((seed, Err(msg))) = failures.first() {
-        let lines: Vec<&str> = failures
-            .iter()
-            .filter_map(|f| f.1.as_ref().err()?.lines().next())
-            .take(20)
-            .collect();
-        panic!(
-            "{} of {} seeds failed:\n{}\nfirst failing seed: {seed}\n{msg}",
-            failures.len(),
-            results.len(),
-            lines.join("\n")
-        );
-    }
-    results.into_iter().filter_map(|r| r.1.ok()).collect()
+/// How long a run takes to converge once loss stops. A node that wrongly holds a live member
+/// as dead, or the member itself, starts a push-pull with some live member within
+/// `push_pull_interval`; the merge turns the stale death into a suspicion, which reaches the
+/// member within a probe round and gossip, and its refutation spreads. Ten seconds cover those
+/// gossip rounds and a suspicion that was already running.
+fn settle_bound(cfg: &Config) -> Duration {
+    cfg.push_pull_interval + cfg.probe_interval + secs(10)
 }
 
 fn summarize(outcomes: &[Outcome]) -> String {
@@ -518,7 +417,7 @@ fn summarize(outcomes: &[Outcome]) -> String {
     d.sort_unstable();
     let pct = |p: usize| d.get((d.len() * p / 100).min(d.len().saturating_sub(1)));
     format!(
-        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance",
+        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance; settled after the scenario in {}",
         d.len(),
         pct(50),
         pct(99),
@@ -528,12 +427,13 @@ fn summarize(outcomes: &[Outcome]) -> String {
         outcomes.iter().map(|o| o.refutations).sum::<u64>(),
         outcomes.iter().map(|o| o.partition_deaths).sum::<u64>(),
         outcomes.iter().map(|o| o.lossy_deaths).sum::<u64>(),
+        common::percentiles(outcomes.iter().filter_map(|o| o.settled).collect()),
     )
 }
 
 #[test]
 fn swim_properties_hold_on_random_scenarios() {
-    let outcomes = check_all(0..32, 20);
+    let outcomes = check_all(0..32, |seed| check(seed, 20));
     assert!(outcomes.iter().any(|o| !o.detections.is_empty()));
 }
 
@@ -544,13 +444,10 @@ fn swim_properties_hold_on_random_scenarios() {
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn thousand_seeds_fifty_nodes() {
-    let nodes = env("KINSHIP_NODES").unwrap_or(50) as usize;
-    let seeds = match env("KINSHIP_SEED") {
-        Some(seed) => seed..seed + 1,
-        None => 0..env("KINSHIP_SEEDS").unwrap_or(1000),
-    };
+    let nodes = common::env("KINSHIP_NODES").unwrap_or(50) as usize;
+    let seeds = seeds(1000);
     let started = std::time::Instant::now();
-    let outcomes = check_all(seeds.clone(), nodes);
+    let outcomes = check_all(seeds.clone(), |seed| check(seed, nodes));
     println!(
         "{} seeds x {nodes} nodes passed in {:?}: {}",
         seeds.end - seeds.start,
@@ -565,7 +462,9 @@ fn same_seed_gives_identical_swim_traces() {
         let plan = Plan::random(seed, 10);
         let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
         let log: Log = Rc::default();
-        let mut sim = Sim::new(seed, scenario, move |spec| Observed::new(spec, log.clone()));
+        let mut sim = Sim::new(seed, scenario, move |spec| {
+            Observed::new(spec, log.clone(), |_| true)
+        });
         sim.run().digest()
     };
     assert_eq!(run(3), run(3));
@@ -580,10 +479,12 @@ fn swim_trace_is_pinned_across_platforms() {
     let plan = Plan::random(1, 10);
     let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
     let log: Log = Rc::default();
-    let mut sim = Sim::new(1, scenario, move |spec| Observed::new(spec, log.clone()));
+    let mut sim = Sim::new(1, scenario, move |spec| {
+        Observed::new(spec, log.clone(), |_| true)
+    });
     assert_eq!(
         sim.run().digest(),
-        0x00f7_f17b_787f_5795,
+        0xaa2c_4eeb_3a3a_7e31,
         "trace digest changed"
     );
 }

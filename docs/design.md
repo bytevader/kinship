@@ -263,7 +263,7 @@ UDP carries everything small and frequent: probes, acks, nacks and piggybacked g
 | Join | TCP push-pull with join = 1 | on join(), to each seed until one answers |
 | Anti-entropy | TCP push-pull | every push_pull_interval with one random live member |
 | Fallback ping | TCP | when the UDP probe and all indirect probes fail, if tcp_fallback_ping is on |
-| Reconnect | TCP push-pull | every reconnect_interval with one random dead member still in its tombstone window |
+| Reconnect | TCP push-pull | every reconnect_interval with one random dead member still in its tombstone window; members that left are not asked |
 
 ### Join and push-pull
 
@@ -286,7 +286,9 @@ sequenceDiagram
     Note over S,O: Alive 8 beats Dead 7, N is a member everywhere
 ```
 
-join() succeeds once any seed completes an exchange, and fails with JoinError after every seed has failed join_retries times with exponential backoff.
+join() pushes-pulls with every seed at once, skipping the node's own address. It waits for the first attempt with each seed, so it can report how many answered, and succeeds if any did. Seeds that failed are retried with exponential backoff (probe_interval, then doubling) only while no seed has answered, and join() fails with JoinError once every seed has failed join_retries times. Each exchange is bounded by tcp_timeout.
+
+The side that opened the connection writes its state and waits for one frame back; the side that accepted it merges first and then answers with its own state, so the reply already carries any refutation the merge caused, and closes. The accepting side keeps no state per connection. A merge applies each record with the precedence rules, with two differences from gossip, as in memberlist: a peer's Dead record becomes a Suspect, because this node may have heard from the member more recently and a suspicion lets the member refute, and records about unknown members add them only if Alive. That conversion is also what heals a partition: the first reconnect across it tells each side the other declared some of its members dead, those members are suspected, they refute, and the refutations spread to both sides.
 
 ### Connection handling
 
@@ -511,7 +513,7 @@ Keys can be rotated at runtime with add_key, use_key and remove_key, which act o
 | max_meta_bytes | 512 bytes | metadata cap |
 | tcp_timeout | 10 s | bound on each TCP exchange |
 | max_inbound_streams | 64 | concurrent TCP exchanges accepted |
-| join_retries | 3 | attempts per seed, with exponential backoff |
+| join_retries | 3 | attempts per seed, with exponential backoff from probe_interval |
 | event_buffer | 1,024 | events held for Python before the oldest drop |
 | runtime_threads | 1 | tokio worker threads, set once per process |
 
@@ -527,7 +529,7 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | Overloaded or paused local node (GC, CPU starvation, VM steal) | Missed acks and nacks raise LHM, which stretches its own timeouts, so the sick node stops accusing healthy ones | Sim with a node whose clock-driven handlers stall |
 | Blocked asyncio loop | No effect on the protocol thread; events queue up, then drop oldest with EventsLost(n) | 10 s time.sleep in a handler, zero false deaths (week 10 gate) |
 | Process crash or kill -9 | Probes fail, Suspect spreads, Dead after the Lifeguard timeout; about 5 to 10 s on lan() at 100 nodes, to be measured | Sim and chaos, detection latency vs memberlist (week 14 gate) |
-| Graceful shutdown | leave() gossips Dead(self) as Left and waits for it to spread, up to the timeout passed to leave() (5 s by default) | Integration test |
+| Graceful shutdown | leave() gossips Dead(self) as Left and waits until the rumour has been sent retransmit_limit times, up to the timeout passed to leave() (5 s by default). The node then stops probing and never refutes, so its Left cannot be undone. A relay asked to PingReq a member it knows left sends the Left rumour back instead, so a node that missed the gossip learns before it suspects | Sim test over 1,000 seeds: never reported dead; integration test |
 | One-way UDP loss or a UDP-blocking firewall | Nacks show the relays are fine; the TCP fallback ping keeps the member Alive and a metric flags the path | Sim with asymmetric links; chaos with nftables UDP drop |
 | Network partition | Each side marks the other Dead; reconnect_interval push-pulls to recent dead members merge the sides after healing, and refutation restores Alive | Sim partition and heal, convergence time recorded |
 | Partition longer than dead_reclaim | Tombstones are gone, so reconnect cannot find the other side; nodes must rejoin through seeds | Documented; join() with seeds on a timer is the recommended pattern |

@@ -456,7 +456,7 @@ fn drives_the_core_node() {
         Node::new(cfg, me, spec.now, spec.seed).unwrap()
     });
     let json = sim.run().to_json();
-    assert!(json.contains(r#""event":{"CommandDone":{"id":0,"result":{"Ok":null}}}"#));
+    assert!(json.contains(r#""event":{"CommandDone":{"id":0,"result":{"Ok":"Done"}}}"#));
     assert_eq!(sim.node(1).unwrap().identity().meta(), b"zone=a");
 }
 
