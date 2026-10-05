@@ -50,8 +50,18 @@ impl Observed {
     /// A node running [`config`] that starts out knowing the nodes `knows` accepts, as a static
     /// member list would, and logs into `log`.
     pub fn new(spec: &NodeSpec, log: Log, knows: impl Fn(usize) -> bool) -> Self {
+        Self::with_config(spec, config(), log, knows)
+    }
+
+    /// Like [`Observed::new`], running `cfg`.
+    pub fn with_config(
+        spec: &NodeSpec,
+        cfg: Config,
+        log: Log,
+        knows: impl Fn(usize) -> bool,
+    ) -> Self {
         let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
-        let mut node = Node::new(config(), me, spec.now, spec.seed).unwrap();
+        let mut node = Node::new(cfg, me, spec.now, spec.seed).unwrap();
         for j in (0..spec.nodes).filter(|&j| j != spec.index && knows(j)) {
             node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
         }
