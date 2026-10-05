@@ -238,61 +238,76 @@ fn measure(cell: Cell, seeds: std::ops::Range<u64>) -> Vec<Totals> {
         .collect()
 }
 
-fn csv(results: &[(Cell, Vec<Totals>)]) -> String {
-    let mut out = String::from(concat!(
-        "nodes,loss,starved_share,starved_nodes,arm,runs,healthy_false_deaths,",
-        "starved_false_deaths,runs_with_false_death,false_deaths_per_run,",
-        "false_suspicions_per_run,detection_mean_s,detection_p50_s,detection_p99_s,undetected\n",
-    ));
-    for (cell, arms) in results {
-        for (arm, t) in ARMS.iter().zip(arms) {
-            writeln!(
-                out,
-                "{},{},{},{},{},{},{},{},{},{:.4},{:.2},{:.3},{:.3},{:.3},{}",
-                cell.nodes,
-                cell.loss,
-                cell.starved,
-                cell.starved_nodes(),
-                arm.name(),
-                t.runs,
-                t.healthy_deaths,
-                t.starved_deaths,
-                t.runs_with_false_death,
-                t.deaths(),
-                t.per_run(t.false_suspicions),
-                t.detection_mean(),
-                t.detection(50),
-                t.detection(99),
-                t.undetected
-            )
-            .unwrap();
-        }
+const CSV_HEADER: &str = concat!(
+    "nodes,loss,starved_share,starved_nodes,arm,runs,healthy_false_deaths,",
+    "starved_false_deaths,runs_with_false_death,false_deaths_per_run,",
+    "false_suspicions_per_run,detection_mean_s,detection_p50_s,detection_p99_s,undetected\n",
+);
+
+/// The CSV rows of one cell, one per arm, in [`ARMS`] order.
+fn csv_rows(cell: Cell, arms: &[Totals]) -> String {
+    let mut out = String::new();
+    for (arm, t) in ARMS.iter().zip(arms) {
+        writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{},{:.4},{:.2},{:.3},{:.3},{:.3},{}",
+            cell.nodes,
+            cell.loss,
+            cell.starved,
+            cell.starved_nodes(),
+            arm.name(),
+            t.runs,
+            t.healthy_deaths,
+            t.starved_deaths,
+            t.runs_with_false_death,
+            t.deaths(),
+            t.per_run(t.false_suspicions),
+            t.detection_mean(),
+            t.detection(50),
+            t.detection(99),
+            t.undetected
+        )
+        .unwrap();
     }
     out
 }
 
-/// One row per cell, each column Lifeguard / SWIM / SWIM without the TCP fallback.
-fn table(results: &[(Cell, Vec<Totals>)]) -> String {
+/// The key a CSV row belongs to: its nodes, loss and starved share columns.
+fn row_key(row: &str) -> String {
+    row.split(',').take(3).collect::<Vec<_>>().join(",")
+}
+
+fn cell_key(cell: Cell) -> String {
+    format!("{},{},{}", cell.nodes, cell.loss, cell.starved)
+}
+
+/// One markdown row per cell from the CSV, each column Lifeguard / SWIM / SWIM without the TCP
+/// fallback.
+fn table(csv: &str) -> String {
     let mut out = String::from(concat!(
         "| Nodes | Starved | Loss | False deaths per run | Runs with a false death | ",
         "False suspicions per run | Detection p50 (s) | Detection p99 (s) |\n",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ));
-    let three = |f: &dyn Fn(&Totals) -> String, arms: &[Totals]| {
-        arms.iter().map(f).collect::<Vec<_>>().join(" / ")
-    };
-    for (cell, arms) in results {
+    let rows: Vec<Vec<&str>> = csv
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect())
+        .collect();
+    for cell in rows.chunks(ARMS.len()) {
+        let three = |col: usize| cell.iter().map(|r| r[col]).collect::<Vec<_>>().join(" / ");
+        let loss: f64 = cell[0][1].parse().unwrap();
         writeln!(
             out,
             "| {} | {} | {:.0}% | {} | {} | {} | {} | {} |",
-            cell.nodes,
-            cell.starved_nodes(),
-            cell.loss * 100.0,
-            three(&|t| format!("{:.2}", t.deaths()), arms),
-            three(&|t| t.runs_with_false_death.to_string(), arms),
-            three(&|t| format!("{:.0}", t.per_run(t.false_suspicions)), arms),
-            three(&|t| format!("{:.1}", t.detection(50)), arms),
-            three(&|t| format!("{:.1}", t.detection(99)), arms),
+            cell[0][0],
+            cell[0][3],
+            loss * 100.0,
+            three(9),
+            three(8),
+            three(10),
+            three(12),
+            three(13),
         )
         .unwrap();
     }
@@ -319,17 +334,28 @@ fn lifeguard_beats_swim_with_a_starved_node() {
 }
 
 /// The full grid behind `docs/results/lifeguard.md`.
+///
+/// Each cell's rows are appended to `docs/results/lifeguard.csv` as soon as it finishes, and a
+/// rerun skips the cells already there, so an interrupted run resumes. Delete the file to start
+/// over.
 #[test]
-#[ignore = "about an hour in release mode"]
+#[ignore = "about three hours in release mode"]
 fn lifeguard_against_swim_grid() {
     let nodes = match common::env("KINSHIP_NODES") {
         Some(n) => vec![n as usize],
         None => NODES.to_vec(),
     };
     let seeds = seeds(200);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/results");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lifeguard.csv");
+    let mut csv = std::fs::read_to_string(&path).unwrap_or_else(|_| CSV_HEADER.to_owned());
+    let done: BTreeSet<String> = csv.lines().skip(1).map(row_key).collect();
     let started = std::time::Instant::now();
-    let mut results = Vec::new();
     for cell in grid(&nodes) {
+        if done.contains(&cell_key(cell)) {
+            continue;
+        }
         let arms = measure(cell, seeds.clone());
         eprintln!(
             "{cell:?}: false deaths per run {:.2} / {:.2} / {:.2}, {:?}",
@@ -338,10 +364,8 @@ fn lifeguard_against_swim_grid() {
             arms[2].deaths(),
             started.elapsed()
         );
-        results.push((cell, arms));
+        csv.push_str(&csv_rows(cell, &arms));
+        std::fs::write(&path, &csv).unwrap();
     }
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/results");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("lifeguard.csv"), csv(&results)).unwrap();
-    print!("{}", table(&results));
+    print!("{}", table(&csv));
 }
