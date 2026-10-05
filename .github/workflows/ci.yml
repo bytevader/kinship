@@ -8,22 +8,35 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request cancels the run it supersedes; main runs every push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Same version as .pre-commit-config.yaml, so CI and the hook agree.
+      - run: pip install ruff==0.14.0
       - run: ruff check .
       - run: ruff format --check .
       - run: cargo fmt --all --check
@@ -32,65 +45,125 @@ jobs:
   rust:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --exclude kinship-py
 
   sim-scale:
     name: sim 1,000 nodes x 10 minutes
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --release -p kinship-sim --test sim -- --ignored --nocapture
 
   sim-swim:
     name: SWIM 1,000 seeds x 50 nodes
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
       - run: cargo test --release -p kinship-sim --test swim -- --ignored --nocapture
 
   sim-sync:
     name: push-pull, join, leave and metadata, 1,000 seeds each
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
       - run: cargo test --release -p kinship-sim --test sync -- --ignored --nocapture
 
+  audit:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Fails on any RustSec advisory against a dependency in Cargo.lock.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --exclude kinship-py
 
   fuzz:
     name: fuzz smoke (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         target: [decode_datagram, decode_stream_frame, decode_payload]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: crates/kinship-proto/fuzz
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz for 60 seconds from the seed corpus
@@ -100,6 +173,7 @@ jobs:
   wheels:
     name: wheel ${{ matrix.flavor }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -113,12 +187,18 @@ jobs:
             python: "3.14t"
             build_args: "--no-default-features"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ matrix.flavor }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python }}
       - name: Build wheel
@@ -132,7 +212,7 @@ jobs:
           python -m pytest
       - name: Test abi3 wheel on newest CPython
         if: matrix.flavor == 'abi3'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
       - name: Run tests on 3.14
@@ -141,7 +221,7 @@ jobs:
           python -m pip install pytest pytest-asyncio
           python -m pip install --no-index --find-links dist kinship
           python -m pytest
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-${{ matrix.flavor }}-${{ matrix.os }}
           path: dist
