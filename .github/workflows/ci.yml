@@ -61,6 +61,16 @@ jobs:
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
       - run: cargo test --release -p kinship-sim --test swim -- --ignored --nocapture
 
+  sim-sync:
+    name: push-pull, join, leave and metadata, 1,000 seeds each
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
+      - run: cargo test --release -p kinship-sim --test sync -- --ignored --nocapture
+
   msrv:
     runs-on: ubuntu-latest
     steps:

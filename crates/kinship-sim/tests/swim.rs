@@ -16,116 +16,21 @@
 //! A failure prints its seed. Replay one with
 //! `KINSHIP_SEED=<seed> cargo test --release -p kinship-sim --test swim -- --ignored --nocapture`.
 
-use std::cell::RefCell;
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use kinship_core::{
-    Command, CommandId, Config, Event, Identity, Instant, Key, Node, Rng, Security, StreamEvent,
-    StreamId, Transmit,
-};
-use kinship_sim::{
-    Action, Delay, LinkConfig, NodeSpec, Scenario, Sim, SimNode, TraceConfig, addr_of, name_of,
-};
+use common::{Log, Observed, check_all, config, index_of, ms, secs, seeds};
+use kinship_core::{Command, Config, Event, Instant, Rng};
+use kinship_sim::{Action, Delay, LinkConfig, Scenario, Sim, TraceConfig, name_of};
 
 /// Uniform packet loss up to this is within what core SWIM must tolerate without a false death.
 const LOSS_TOLERANCE: f64 = 0.01;
 
 /// Scenarios draw loss up to this. Above the tolerance false deaths are counted, not failures.
 const MAX_LOSS: f64 = 0.05;
-
-fn secs(s: u64) -> Duration {
-    Duration::from_secs(s)
-}
-
-fn ms(m: u64) -> Duration {
-    Duration::from_millis(m)
-}
-
-fn config() -> Config {
-    Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]))
-}
-
-/// One event a node reported, and when.
-#[derive(Debug, Clone)]
-struct Seen {
-    t: Instant,
-    observer: usize,
-    event: Event,
-}
-
-type Log = Rc<RefCell<Vec<Seen>>>;
-
-/// A core node that copies every event into a shared log, stamped with the time of the input
-/// that produced it.
-struct Observed {
-    node: Node,
-    index: usize,
-    now: Instant,
-    log: Log,
-}
-
-impl Observed {
-    fn new(spec: &NodeSpec, log: Log) -> Self {
-        let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
-        let mut node = Node::new(config(), me, spec.now, spec.seed).unwrap();
-        for j in (0..spec.nodes).filter(|&j| j != spec.index) {
-            node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
-        }
-        while node.poll_event().is_some() {}
-        Self {
-            node,
-            index: spec.index,
-            now: spec.now,
-            log,
-        }
-    }
-}
-
-impl SimNode for Observed {
-    type Command = Command;
-    type Event = Event;
-
-    fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]) {
-        self.now = now;
-        self.node.handle_datagram(now, from, buf);
-    }
-
-    fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>) {
-        self.now = now;
-        self.node.handle_stream(now, conn, ev);
-    }
-
-    fn handle_timeout(&mut self, now: Instant) {
-        self.now = now;
-        self.node.handle_timeout(now);
-    }
-
-    fn command(&mut self, now: Instant, cmd: Command) -> CommandId {
-        self.now = now;
-        self.node.command(now, cmd)
-    }
-
-    fn poll_transmit(&mut self) -> Option<Transmit> {
-        self.node.poll_transmit()
-    }
-
-    fn poll_event(&mut self) -> Option<Event> {
-        let event = self.node.poll_event()?;
-        self.log.borrow_mut().push(Seen {
-            t: self.now,
-            observer: self.index,
-            event: event.clone(),
-        });
-        Some(event)
-    }
-
-    fn poll_timeout(&self) -> Option<Instant> {
-        self.node.poll_timeout()
-    }
-}
 
 /// The random faults of one seed.
 #[derive(Debug, Clone)]
@@ -329,17 +234,13 @@ struct Outcome {
     lossy_deaths: u64,
 }
 
-fn index_of(name: &str) -> usize {
-    name[1..].parse().expect("simulator names are n<index>")
-}
-
 /// Runs one seed and checks every property, returning the first violation.
 fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
     let plan = Plan::random(seed, nodes);
     let log: Log = Rc::default();
     let factory_log = log.clone();
     let mut sim = Sim::new(seed, plan.scenario(), move |spec| {
-        Observed::new(spec, factory_log.clone())
+        Observed::new(spec, factory_log.clone(), |_| true)
     });
     let fail = |msg: String| Err(format!("seed {seed}: {msg}\nplan: {plan:?}"));
 
@@ -470,49 +371,6 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
     Ok(out)
 }
 
-fn env(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
-}
-
-/// Checks `seeds` in parallel; panics naming the lowest failing seed.
-fn check_all(seeds: std::ops::Range<u64>, nodes: usize) -> Vec<Outcome> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let next = std::sync::atomic::AtomicU64::new(seeds.start);
-    let results = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if seed >= seeds.end {
-                        break;
-                    }
-                    let r = check(seed, nodes);
-                    results.lock().unwrap().push((seed, r));
-                }
-            });
-        }
-    });
-    let mut results = results.into_inner().unwrap();
-    results.sort_by_key(|r| r.0);
-    let failures: Vec<&(u64, Result<Outcome, String>)> =
-        results.iter().filter(|r| r.1.is_err()).collect();
-    if let Some((seed, Err(msg))) = failures.first() {
-        let lines: Vec<&str> = failures
-            .iter()
-            .filter_map(|f| f.1.as_ref().err()?.lines().next())
-            .take(20)
-            .collect();
-        panic!(
-            "{} of {} seeds failed:\n{}\nfirst failing seed: {seed}\n{msg}",
-            failures.len(),
-            results.len(),
-            lines.join("\n")
-        );
-    }
-    results.into_iter().filter_map(|r| r.1.ok()).collect()
-}
-
 fn summarize(outcomes: &[Outcome]) -> String {
     let mut d: Vec<Duration> = outcomes.iter().flat_map(|o| o.detections.clone()).collect();
     d.sort_unstable();
@@ -533,7 +391,7 @@ fn summarize(outcomes: &[Outcome]) -> String {
 
 #[test]
 fn swim_properties_hold_on_random_scenarios() {
-    let outcomes = check_all(0..32, 20);
+    let outcomes = check_all(0..32, |seed| check(seed, 20));
     assert!(outcomes.iter().any(|o| !o.detections.is_empty()));
 }
 
@@ -544,13 +402,10 @@ fn swim_properties_hold_on_random_scenarios() {
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn thousand_seeds_fifty_nodes() {
-    let nodes = env("KINSHIP_NODES").unwrap_or(50) as usize;
-    let seeds = match env("KINSHIP_SEED") {
-        Some(seed) => seed..seed + 1,
-        None => 0..env("KINSHIP_SEEDS").unwrap_or(1000),
-    };
+    let nodes = common::env("KINSHIP_NODES").unwrap_or(50) as usize;
+    let seeds = seeds(1000);
     let started = std::time::Instant::now();
-    let outcomes = check_all(seeds.clone(), nodes);
+    let outcomes = check_all(seeds.clone(), |seed| check(seed, nodes));
     println!(
         "{} seeds x {nodes} nodes passed in {:?}: {}",
         seeds.end - seeds.start,
@@ -565,7 +420,9 @@ fn same_seed_gives_identical_swim_traces() {
         let plan = Plan::random(seed, 10);
         let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
         let log: Log = Rc::default();
-        let mut sim = Sim::new(seed, scenario, move |spec| Observed::new(spec, log.clone()));
+        let mut sim = Sim::new(seed, scenario, move |spec| {
+            Observed::new(spec, log.clone(), |_| true)
+        });
         sim.run().digest()
     };
     assert_eq!(run(3), run(3));
@@ -580,10 +437,12 @@ fn swim_trace_is_pinned_across_platforms() {
     let plan = Plan::random(1, 10);
     let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
     let log: Log = Rc::default();
-    let mut sim = Sim::new(1, scenario, move |spec| Observed::new(spec, log.clone()));
+    let mut sim = Sim::new(1, scenario, move |spec| {
+        Observed::new(spec, log.clone(), |_| true)
+    });
     assert_eq!(
         sim.run().digest(),
-        0x00f7_f17b_787f_5795,
+        0xaa2c_4eeb_3a3a_7e31,
         "trace digest changed"
     );
 }

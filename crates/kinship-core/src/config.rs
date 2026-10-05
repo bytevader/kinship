@@ -44,7 +44,10 @@ pub struct Config {
     /// Zero disables reconnect attempts to recently dead members.
     pub reconnect_interval: Duration,
     pub rejoin_interval: Duration,
+    /// Bound on each TCP exchange: connect, write and the reply.
     pub tcp_timeout: Duration,
+    /// Attempts per seed in a join. Retries back off from `probe_interval`, doubling each time.
+    pub join_retries: u32,
 }
 
 impl Config {
@@ -71,6 +74,7 @@ impl Config {
             reconnect_interval: Duration::from_secs(30),
             rejoin_interval: Duration::from_secs(60),
             tcp_timeout: Duration::from_secs(10),
+            join_retries: 3,
         }
     }
 
@@ -134,6 +138,9 @@ impl Config {
         }
         if self.tcp_timeout.is_zero() {
             return fail("tcp_timeout", "must be positive");
+        }
+        if self.join_retries == 0 {
+            return fail("join_retries", "must be at least 1");
         }
         if self.codec().is_err() {
             return fail("limits", "too small to hold the packet overhead");

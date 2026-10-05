@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect};
 
 use crate::Node;
-use crate::io::Transmit;
+use crate::io::{StreamId, Transmit};
 use crate::rng::Rng;
 use crate::suspicion::retransmit_limit;
 use crate::time::Instant;
@@ -144,6 +144,11 @@ impl Broadcasts {
         self.queue.is_empty()
     }
 
+    /// Whether a rumour about `node` is still being spread.
+    pub fn contains(&self, node: &str) -> bool {
+        self.queue.iter().any(|q| q.gossip.node() == node)
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -237,6 +242,25 @@ impl Outbox {
             self.broadcasts.sent(&picked, limit);
         }
         self.transmits.push_back(Transmit::Datagram { to, payload });
+        true
+    }
+
+    /// Writes `msgs` to `conn` as one length-prefixed stream frame. Returns false, sending
+    /// nothing, if they do not fit in `max_stream_frame`.
+    pub fn frame(&mut self, conn: StreamId, msgs: &[Message<'_>]) -> bool {
+        let mut nonce = [0; kinship_proto::NONCE_LEN];
+        if self.codec.is_encrypted() {
+            self.nonces.fill(&mut nonce);
+        }
+        let mut frame = Vec::new();
+        if self
+            .codec
+            .seal_stream_frame(msgs, &nonce, &mut frame)
+            .is_err()
+        {
+            return false;
+        }
+        self.transmits.push_back(Transmit::Stream { conn, frame });
         true
     }
 }

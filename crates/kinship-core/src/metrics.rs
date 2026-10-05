@@ -25,4 +25,16 @@ pub struct Metrics {
     pub misdirected: u64,
     /// Alive messages ignored because a live member already holds the name.
     pub name_conflicts: u64,
+    /// Push-pull exchanges this node started that completed: joins, anti-entropy, reconnects.
+    pub push_pulls: u64,
+    /// Push-pull exchanges this node started that failed or timed out.
+    pub push_pull_failures: u64,
+    /// Push-pull exchanges other nodes started that this node answered.
+    pub push_pulls_served: u64,
+    /// Push-pull replies refused because this node's state does not fit in `max_stream_frame`.
+    pub state_too_large: u64,
+    /// Fallback pings sent over TCP after a UDP probe went unanswered.
+    pub tcp_pings: u64,
+    /// Probe rounds saved by a TCP Ack: UDP to that member is failing while TCP works.
+    pub tcp_ping_acks: u64,
 }

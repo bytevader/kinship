@@ -24,12 +24,25 @@ impl CommandId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
-    /// Exchange state with these seeds until one answers.
+    /// Push-pull with every seed, retrying failed ones with backoff until one answers. This
+    /// node's own address is skipped, so a node may list itself among its seeds.
     Join { seeds: Vec<SocketAddr> },
-    /// Announce departure and stop probing.
+    /// Gossip that this node left, and stop probing. Done once the news has been sent as often
+    /// as any rumour is, or at once if no other member is alive.
     Leave,
     /// Replace this node's metadata, at most `max_meta_bytes`.
     SetMeta(Vec<u8>),
+}
+
+/// What a [`Command`] that succeeded produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub enum CommandOutput {
+    /// The command took effect.
+    Done,
+    /// A join finished, and this many seeds answered (zero if every seed was this node).
+    Joined { seeds: usize },
 }
 
 /// Why a [`Command`] failed.
@@ -37,17 +50,20 @@ pub enum Command {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum CommandError {
-    /// The command is not implemented by this version of the core.
-    Unsupported,
     /// Metadata is larger than `max_meta_bytes`.
     MetaTooLarge,
+    /// No seed answered after `join_retries` attempts each.
+    JoinFailed,
+    /// This node has left the cluster.
+    Left,
 }
 
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unsupported => f.write_str("command not supported yet"),
             Self::MetaTooLarge => f.write_str("metadata larger than max_meta_bytes"),
+            Self::JoinFailed => f.write_str("no seed answered"),
+            Self::Left => f.write_str("this node has left the cluster"),
         }
     }
 }
@@ -63,7 +79,7 @@ pub enum Event {
     /// A [`Command`] finished.
     CommandDone {
         id: CommandId,
-        result: Result<(), CommandError>,
+        result: Result<CommandOutput, CommandError>,
     },
     /// A node is alive that was unknown, dead or left.
     MemberJoined(Member),

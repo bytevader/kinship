@@ -197,8 +197,12 @@ impl Node {
         self.broadcast(Gossip::from_dead(d));
     }
 
-    /// Raises this node's incarnation past `seen` and gossips Alive.
+    /// Raises this node's incarnation past `seen` and gossips Alive, unless it has left.
     pub(crate) fn refute(&mut self, seen: u32) {
+        if self.has_left() {
+            // A node that left stays gone: an Alive now would undo its Left everywhere.
+            return;
+        }
         let me = &mut self.local.member;
         // At u32::MAX a rumour can no longer be outbid; the member stays as it is.
         me.incarnation = me.incarnation.max(seen.saturating_add(1));

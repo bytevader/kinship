@@ -4,10 +4,11 @@
 use core::net::SocketAddr;
 use core::time::Duration;
 
-use kinship_proto::{Message, Ping, PingReq, Suspect};
+use kinship_proto::{Dead, Message, Ping, PingReq, Suspect};
 
 use crate::Node;
 use crate::broadcast::id;
+use crate::io::StreamId;
 use crate::member::State;
 use crate::time::Instant;
 
@@ -25,6 +26,8 @@ pub(crate) struct Probe {
     pub acked: bool,
     /// Relays that reported they could not reach the target either.
     pub nacks: u32,
+    /// The TCP fallback ping, closed when the round ends.
+    pub fallback: Option<StreamId>,
 }
 
 /// A PingReq this node is relaying. Its own Ping to the target went out with the sequence
@@ -66,6 +69,9 @@ impl Node {
             return;
         }
         if let Some(p) = self.probe.take() {
+            if let Some(conn) = p.fallback {
+                self.close_stream(conn);
+            }
             if !p.acked {
                 self.metrics.probes_failed += 1;
                 let me = self.local.member.name.clone();
@@ -83,6 +89,9 @@ impl Node {
     }
 
     fn start_probe(&mut self, now: Instant) {
+        if self.has_left() {
+            return;
+        }
         let Some(target) = self.table.next_probe(&mut self.rng) else {
             return;
         };
@@ -110,6 +119,7 @@ impl Node {
             indirect_sent: false,
             acked: false,
             nacks: 0,
+            fallback: None,
         });
     }
 
@@ -139,6 +149,13 @@ impl Node {
             self.out.send(relay, &[req], Some(limit));
             self.metrics.indirect_probes += 1;
         }
+        if self.cfg.tcp_fallback_ping {
+            // The same Ping over TCP: a member whose UDP is filtered still answers here.
+            let conn = self.tcp_ping(target_addr, &target, seq);
+            if let Some(p) = &mut self.probe {
+                p.fallback = Some(conn);
+            }
+        }
     }
 
     /// Answers a Ping addressed to this node.
@@ -153,8 +170,25 @@ impl Node {
         self.out.send(ping.source_addr, &[ack], Some(limit));
     }
 
-    /// Pings the target on the requester's behalf.
+    /// Pings the target on the requester's behalf, unless this node knows the target left.
     pub(crate) fn on_ping_req(&mut self, now: Instant, req: &PingReq<'_>) {
+        let left = self
+            .table
+            .get(req.target.as_str())
+            .filter(|e| e.member.state == State::Left)
+            .map(|e| e.member.incarnation);
+        if let Some(inc) = left {
+            // The requester missed the news and would soon declare the member dead; tell it
+            // instead of probing a node that is gone.
+            let news = Message::Dead(Dead {
+                inc,
+                node: req.target,
+                from: req.target,
+            });
+            let limit = self.retransmit_limit();
+            self.out.send(req.requester_addr, &[news], Some(limit));
+            return;
+        }
         let seq = self.next_seq();
         let ping = Message::Ping(Ping {
             seq,

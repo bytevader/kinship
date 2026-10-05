@@ -12,6 +12,8 @@
 //!
 //! The protocol is SWIM as described in `docs/design.md`: randomized round-robin probes, direct
 //! and indirect pings, suspicion, incarnation numbers, and gossip piggybacked on every packet.
+//! Streams carry the rest: joins and periodic anti-entropy as push-pull state exchanges,
+//! reconnects to recently dead members, and a TCP fallback ping when a UDP probe goes unanswered.
 //! The Lifeguard extensions run at fixed defaults for now: the local health multiplier stays at
 //! zero, Nacks are counted but not acted on, and the suspicion timeout is fixed at its minimum.
 
@@ -24,6 +26,7 @@ mod metrics;
 mod probe;
 mod rng;
 mod suspicion;
+mod sync;
 mod table;
 mod time;
 
@@ -35,10 +38,11 @@ use kinship_proto::{Message, NodeId, PacketKind, Payload};
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
 use crate::suspicion::Suspicion;
+use crate::sync::Sync;
 use crate::table::{Entry, Table};
 
 pub use config::{Config, ConfigError, Security};
-pub use event::{Command, CommandError, CommandId, Event};
+pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
 pub use kinship_proto::{Key, Limits, WIRE_VERSION};
 pub use member::{Member, State};
@@ -116,6 +120,7 @@ pub struct Node {
     /// Next gossip tick. Ticks with nothing queued are skipped without waking the driver.
     next_gossip: Instant,
     suspicions: BTreeMap<String, Suspicion>,
+    sync: Sync,
 }
 
 impl Node {
@@ -140,6 +145,10 @@ impl Node {
         // lockstep.
         let next_probe = now + jitter(&mut rng, cfg.probe_interval);
         let next_gossip = now + jitter(&mut rng, cfg.gossip_interval);
+        let mut first = |interval: core::time::Duration| {
+            (!interval.is_zero()).then(|| now + jitter(&mut rng, interval))
+        };
+        let sync = Sync::new(first(cfg.push_pull_interval), first(cfg.reconnect_interval));
         let local = Entry {
             member: Member {
                 name: me.name.clone(),
@@ -170,6 +179,7 @@ impl Node {
             relays: BTreeMap::new(),
             next_gossip,
             suspicions: BTreeMap::new(),
+            sync,
         };
         node.broadcast(node.local_alive());
         Ok(node)
@@ -217,6 +227,10 @@ impl Node {
         // Replies go to the addresses inside the messages, which the AEAD authenticates; the
         // UDP source address is not.
         let _ = from;
+        if buf.len() > self.cfg.limits.udp_max_payload {
+            self.metrics.decode_errors += 1;
+            return;
+        }
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(buf);
@@ -228,22 +242,17 @@ impl Node {
             Err(e) => self.count_error(&e),
         }
         self.recv_buf = scratch;
+        self.check_leave();
     }
 
     /// Something happened on a TCP connection.
+    ///
+    /// A connection the driver accepted is answered on its first frame, a push-pull with this
+    /// node's state or a Ping with an Ack, and then closed.
     pub fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>) {
         self.advance(now);
-        let _ = conn;
-        if let StreamEvent::Frame(frame) = ev {
-            let mut scratch = std::mem::take(&mut self.recv_buf);
-            scratch.clear();
-            scratch.extend_from_slice(frame);
-            match self.out.codec.open(PacketKind::Stream, &mut scratch) {
-                Ok(_payload) => self.metrics.packets_received += 1,
-                Err(e) => self.count_error(&e),
-            }
-            self.recv_buf = scratch;
-        }
+        self.on_stream(conn, ev);
+        self.check_leave();
     }
 
     /// The deadline from [`poll_timeout`](Self::poll_timeout) has passed.
@@ -253,6 +262,7 @@ impl Node {
         self.relay_timers(now);
         self.probe_timers(now);
         self.suspicion_timers(now);
+        self.sync_timers(now);
         if now >= self.next_gossip {
             self.gossip(now);
             let interval = self.cfg.gossip_interval;
@@ -260,16 +270,19 @@ impl Node {
             let ticks = u32::try_from(missed + 1).unwrap_or(u32::MAX);
             self.next_gossip = self.next_gossip + interval * ticks;
         }
+        self.check_leave();
     }
 
-    /// Starts a command; its result arrives later as [`Event::CommandDone`].
+    /// Starts a command; its result arrives as [`Event::CommandDone`], at once for SetMeta
+    /// and once the network has answered for Join and Leave.
     pub fn command(&mut self, now: Instant, cmd: Command) -> CommandId {
         self.advance(now);
         let id = CommandId::from_raw(self.next_command);
         self.next_command += 1;
-        let result = match cmd {
+        match cmd {
+            Command::SetMeta(_) if self.has_left() => self.finish(id, Err(CommandError::Left)),
             Command::SetMeta(meta) if meta.len() > self.cfg.limits.max_meta_bytes => {
-                Err(CommandError::MetaTooLarge)
+                self.finish(id, Err(CommandError::MetaTooLarge));
             }
             Command::SetMeta(meta) => {
                 self.me.meta.clone_from(&meta);
@@ -277,11 +290,11 @@ impl Node {
                 local.meta = meta;
                 local.incarnation = local.incarnation.saturating_add(1);
                 self.broadcast(self.local_alive());
-                Ok(())
+                self.finish(id, Ok(CommandOutput::Done));
             }
-            Command::Join { .. } | Command::Leave => Err(CommandError::Unsupported),
-        };
-        self.events.push_back(Event::CommandDone { id, result });
+            Command::Join { seeds } => self.join(id, seeds),
+            Command::Leave => self.leave(id),
+        }
         id
     }
 
@@ -299,6 +312,9 @@ impl Node {
     pub fn poll_timeout(&self) -> Option<Instant> {
         let mut t = self.probe_deadline();
         if let Some(s) = self.suspicion_deadline() {
+            t = t.min(s);
+        }
+        if let Some(s) = self.sync_deadline() {
             t = t.min(s);
         }
         if !self.out.broadcasts.is_empty() {
@@ -324,9 +340,10 @@ impl Node {
         &self.local.member
     }
 
-    /// Alive and suspect members, this node first.
+    /// Alive and suspect members, this node first unless it has left.
     pub fn members(&self) -> impl Iterator<Item = &Member> {
-        std::iter::once(&self.local.member).chain(
+        let me = Some(&self.local.member).filter(|m| m.state.is_live());
+        me.into_iter().chain(
             self.table
                 .iter()
                 .map(|e| &e.member)
@@ -377,7 +394,7 @@ impl Node {
                 Message::Alive(a) => self.on_alive(now, &a),
                 Message::Suspect(s) => self.on_suspect(now, &s),
                 Message::Dead(d) => self.on_dead(now, &d),
-                // Push-pull runs over streams, which carry no protocol yet.
+                // Push-pull runs over streams only.
                 Message::PushPull(_) => {}
             }
         }
@@ -495,31 +512,19 @@ mod tests {
         let b = n.command(Instant::ZERO, Command::SetMeta(vec![0; 513]));
         let c = n.command(Instant::ZERO, Command::Leave);
         assert_ne!(a, b);
-        assert_eq!(
-            n.poll_event(),
-            Some(Event::CommandDone {
-                id: a,
-                result: Ok(())
-            })
-        );
-        assert_eq!(
-            n.poll_event(),
-            Some(Event::CommandDone {
-                id: b,
-                result: Err(CommandError::MetaTooLarge)
-            })
-        );
-        assert_eq!(
-            n.poll_event(),
-            Some(Event::CommandDone {
-                id: c,
-                result: Err(CommandError::Unsupported)
-            })
-        );
+        let d = n.command(Instant::ZERO, Command::SetMeta(Vec::new()));
+        let done = |id, result| Some(Event::CommandDone { id, result });
+        assert_eq!(n.poll_event(), done(a, Ok(CommandOutput::Done)));
+        assert_eq!(n.poll_event(), done(b, Err(CommandError::MetaTooLarge)));
+        // Alone, a node leaves at once, and then refuses to change.
+        assert_eq!(n.poll_event(), done(c, Ok(CommandOutput::Done)));
+        assert_eq!(n.poll_event(), done(d, Err(CommandError::Left)));
         assert_eq!(n.poll_event(), None);
         assert_eq!(n.identity().meta(), b"role=db");
         assert_eq!(n.local().meta, b"role=db");
         assert_eq!(n.local().incarnation, 1, "set_meta is a self-refutation");
+        assert_eq!(n.local().state, State::Left);
+        assert_eq!(n.members().count(), 0);
         // Alone, it has nobody to send to.
         assert_eq!(n.poll_transmit(), None);
     }
@@ -841,6 +846,28 @@ mod tests {
         let timeout = n.config().probe_timeout;
         let pkts = run_until(&mut n, t + timeout);
         assert!(contains(&pkts, addr(3), "Nack { seq: 41 }"), "{pkts:?}");
+        assert!(n.relays.is_empty());
+    }
+
+    #[test]
+    fn relays_tell_the_requester_that_a_target_left() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        deliver(&mut n, t, &[dead("b", 3, "b")]);
+        assert_eq!(n.member("b").unwrap().state, State::Left);
+        sent(&mut n);
+        let req = Message::PingReq(kinship_proto::PingReq {
+            seq: 9,
+            target: id("b"),
+            target_addr: addr(2),
+            requester_addr: addr(3),
+            want_nack: true,
+        });
+        deliver(&mut n, t, &[req]);
+        let pkts = sent(&mut n);
+        assert!(contains(&pkts, addr(3), "Dead(Dead { inc: 3"), "{pkts:?}");
+        assert!(!contains(&pkts, addr(2), "Ping("), "{pkts:?}");
         assert!(n.relays.is_empty());
     }
 
