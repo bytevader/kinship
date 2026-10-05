@@ -333,6 +333,9 @@ impl Memberlist {
     /// Stops the node at once, as if its process crashed: nothing is sent, sockets close, and
     /// peers detect the failure. For tests and fault injection.
     pub fn abort(&self) {
+        // Dropping the handle detaches the task; the abort stops it. Taking it also tells Drop
+        // that this stop was deliberate.
+        drop(self.task().take());
         self.abort.abort();
     }
 
