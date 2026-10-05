@@ -9,8 +9,9 @@
 //!    only push-pull anti-entropy repairs);
 //! 2. every crashed node, and every node across a partition, is declared dead by every live
 //!    node within the analytic bound [`detection_bound`];
-//! 3. without a partition, every live node ends with the same live set, which is exactly the
-//!    nodes still running;
+//! 3. once loss stops at the end of the scenario, every live node reaches the live set of its
+//!    side of any partition, exactly the nodes still running there, within [`settle_bound`],
+//!    false deaths included: push-pull anti-entropy repairs them;
 //! 4. no node ever sees an incarnation go down, its own or anyone else's.
 //!
 //! A failure prints its seed. Replay one with
@@ -232,6 +233,8 @@ struct Outcome {
     partition_deaths: u64,
     /// Live members declared dead under loss above [`LOSS_TOLERANCE`].
     lossy_deaths: u64,
+    /// From the end of the scenario to every live view being right.
+    settled: Option<Duration>,
 }
 
 /// Runs one seed and checks every property, returning the first violation.
@@ -244,12 +247,46 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
     });
     let fail = |msg: String| Err(format!("seed {seed}: {msg}\nplan: {plan:?}"));
 
-    // Sample every node's view once a simulated second for incarnations that go down.
+    let end = sim.end();
+    // What each live node must end up holding: the running nodes on its side.
+    let truth = |o: usize| -> BTreeSet<usize> {
+        (0..nodes)
+            .filter(|&j| plan.alive_at(j, end) && plan.split(o, j, end).is_none())
+            .collect()
+    };
+    let diverged = |sim: &Sim<Observed>| -> Option<String> {
+        (0..nodes).filter(|&o| plan.alive_at(o, end)).find_map(|o| {
+            let n = &sim.node(o).expect("alive").node;
+            let view: BTreeSet<usize> = n.members().map(|m| index_of(&m.name)).collect();
+            let want = truth(o);
+            (view != want).then(|| format!("{} holds {view:?}, expected {want:?}", name_of(o)))
+        })
+    };
+
+    // Run the scenario, then let it settle: loss stops, the partition stays, and every live
+    // node must reach the true live set within settle_bound. Meanwhile sample every node's
+    // view once a simulated second for incarnations that go down.
+    let settle_end = end + settle_bound(&config());
+    let mut settled = None;
     let mut seen: Vec<Vec<u32>> = vec![vec![0; nodes]; nodes];
     let mut t = Instant::ZERO;
-    while t < sim.end() {
-        t = (t + secs(1)).min(sim.end());
+    while t < settle_end && settled.is_none() {
+        t = if t < end {
+            (t + secs(1)).min(end)
+        } else {
+            t + secs(1)
+        };
         sim.run_until(t);
+        if t == end {
+            sim.apply(Action::SetLink {
+                from: (0..nodes).into(),
+                to: (0..nodes).into(),
+                link: LinkConfig::lan(),
+            });
+        }
+        if t >= end && diverged(&sim).is_none() {
+            settled = Some(t - end);
+        }
         for (o, row) in seen.iter_mut().enumerate() {
             let Some(n) = sim.node(o) else { continue };
             for m in n.node.all_members() {
@@ -315,7 +352,6 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
 
     // Every failure is detected by every live node within the bound.
     let bound = detection_bound(&config(), nodes);
-    let end = sim.end();
     for o in (0..nodes).filter(|&o| plan.alive_at(o, end)) {
         for j in (0..nodes).filter(|&j| j != o) {
             let failed = match (plan.crashed_at(j), plan.split(o, j, end)) {
@@ -347,28 +383,33 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
         }
     }
 
-    // Every live node converged on the same live set: the running nodes. Runs with a partition
-    // or a false death are left out: a node that wrongly declared a member dead stops probing
-    // it, and only push-pull anti-entropy brings the member back if the refutation missed it.
+    // Every live node converged on the running nodes of its side, partitions and false deaths
+    // included: push-pull anti-entropy repairs what the failure detector got wrong.
     for o in (0..nodes).filter(|&o| plan.alive_at(o, end)) {
         let n = &sim.node(o).expect("alive").node;
         out.suspicions += n.metrics().suspicions;
         out.refutations += n.metrics().refutations;
-        if plan.partition.is_some() || out.lossy_deaths > 0 {
-            continue;
-        }
-        let view: BTreeSet<usize> = n.members().map(|m| index_of(&m.name)).collect();
-        let truth: BTreeSet<usize> = (0..nodes)
-            .filter(|&j| plan.alive_at(j, end) && plan.split(o, j, end).is_none())
-            .collect();
-        if view != truth {
+    }
+    match settled {
+        Some(d) => out.settled = Some(d),
+        None => {
+            let why = diverged(&sim).unwrap_or_default();
             return fail(format!(
-                "{} ended with live set {view:?}, expected {truth:?}",
-                name_of(o)
+                "not converged {:?} after the scenario: {why}",
+                settle_bound(&config())
             ));
         }
     }
     Ok(out)
+}
+
+/// How long a run takes to converge once loss stops. A node that wrongly holds a live member
+/// as dead, or the member itself, starts a push-pull with some live member within
+/// `push_pull_interval`; the merge turns the stale death into a suspicion, which reaches the
+/// member within a probe round and gossip, and its refutation spreads. Ten seconds cover those
+/// gossip rounds and a suspicion that was already running.
+fn settle_bound(cfg: &Config) -> Duration {
+    cfg.push_pull_interval + cfg.probe_interval + secs(10)
 }
 
 fn summarize(outcomes: &[Outcome]) -> String {
@@ -376,7 +417,7 @@ fn summarize(outcomes: &[Outcome]) -> String {
     d.sort_unstable();
     let pct = |p: usize| d.get((d.len() * p / 100).min(d.len().saturating_sub(1)));
     format!(
-        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance",
+        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance; settled after the scenario in {}",
         d.len(),
         pct(50),
         pct(99),
@@ -386,6 +427,7 @@ fn summarize(outcomes: &[Outcome]) -> String {
         outcomes.iter().map(|o| o.refutations).sum::<u64>(),
         outcomes.iter().map(|o| o.partition_deaths).sum::<u64>(),
         outcomes.iter().map(|o| o.lossy_deaths).sum::<u64>(),
+        common::percentiles(outcomes.iter().filter_map(|o| o.settled).collect()),
     )
 }
 
