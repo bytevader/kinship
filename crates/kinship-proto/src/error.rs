@@ -140,3 +140,24 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+/// Text given as a key could not be turned into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KeyError {
+    /// Not standard base64.
+    NotBase64,
+    /// Valid base64, but not 32 bytes.
+    WrongLength,
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotBase64 => f.write_str("key is not valid base64"),
+            Self::WrongLength => f.write_str("key must be 32 bytes"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}

@@ -3,8 +3,8 @@
 use core::net::SocketAddr;
 
 use kinship_proto::{
-    Alive, Codec, DecodeError, EncodeError, FrameReader, Key, Limits, Message, NodeId, PacketKind,
-    Payload, Ping, PushPull, Record, Records, State, Suspect, kind,
+    Alive, Codec, DecodeError, EncodeError, FrameReader, Key, KeyError, Limits, Message, NodeId,
+    PacketKind, Payload, Ping, PushPull, Record, Records, State, Suspect, kind,
 };
 
 const NONCE: [u8; 24] = [7; 24];
@@ -313,6 +313,29 @@ fn key_debug_never_prints_key_bytes() {
     assert!(s.starts_with("Key("));
     assert_eq!(Key::from_slice(&[0; 31]), None);
     assert!(Key::from_slice(&[0; 32]).is_some());
+}
+
+#[test]
+fn keys_parse_from_base64() {
+    let want = Key::from_bytes(core::array::from_fn(|i| i as u8));
+    let text = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    assert_eq!(Key::from_base64(text), Ok(want.clone()));
+    assert_eq!(Key::from_base64(&format!(" {text}\n")), Ok(want.clone()));
+    assert_eq!(Key::from_base64(text.trim_end_matches('=')), Ok(want));
+
+    let short = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    let long = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert_eq!(Key::from_base64(short), Err(KeyError::WrongLength));
+    assert_eq!(Key::from_base64(long), Err(KeyError::WrongLength));
+    assert_eq!(Key::from_base64(""), Err(KeyError::WrongLength));
+    for bad in [
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8===",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh-=",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9=",
+        "A",
+    ] {
+        assert_eq!(Key::from_base64(bad), Err(KeyError::NotBase64), "{bad}");
+    }
 }
 
 #[test]

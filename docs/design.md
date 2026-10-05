@@ -329,7 +329,9 @@ flowchart LR
 ### The runtime thread
 
 - kinship builds one tokio runtime per process on first use, with one worker thread by default (runtime_threads to change it), and registers it with pyo3-async-runtimes so that future_into_py resolves on it.
-- Each Memberlist spawns one actor task. Its loop is a tokio::select over the UDP socket, accepted TCP frames, the command channel, and a sleep until node.poll_timeout(). After each wake it drains poll_transmit and poll_event.
+- Each Memberlist spawns one actor task. Its loop is a tokio::select over the UDP socket, accepted TCP frames, the command channel, and a sleep until node.poll_timeout(). After each input it drains poll_transmit and poll_event.
+- Whatever woke it, the actor reads every datagram and stream frame already waiting before it lets a due timer fire. The Lifeguard sim showed that a node reading its Acks after its own probe timer falsely suspects healthy peers; `crates/kinship-net/tests/flood.rs` floods a frozen actor to hold it to this.
+- The Rust `Cluster` runs its actor on the caller's tokio runtime; the kinship-owned runtime thread above is what kinship-py starts.
 - TCP exchanges run as separate tasks and hand complete frames to the actor over a channel, so one slow peer never blocks probes.
 - The actor publishes a new immutable Snapshot through ArcSwap after every membership change. Snapshot reads never wait on the actor.
 

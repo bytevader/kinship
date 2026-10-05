@@ -48,7 +48,7 @@ use crate::table::{Entry, Table};
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
-pub use kinship_proto::{Key, Limits, WIRE_VERSION};
+pub use kinship_proto::{Key, KeyError, Limits, WIRE_VERSION};
 pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;

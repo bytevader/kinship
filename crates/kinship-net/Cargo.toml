@@ -10,6 +10,15 @@ authors.workspace = true
 
 [dependencies]
 kinship-core.workspace = true
+kinship-proto.workspace = true
+arc-swap = "1.7"
+getrandom = "0.3"
+socket2 = "0.6"
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
