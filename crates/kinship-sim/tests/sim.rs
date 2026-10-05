@@ -297,6 +297,38 @@ fn slow_node_spaces_out_its_inputs() {
 }
 
 #[test]
+fn starved_node_reads_packets_late_but_keeps_its_timers() {
+    let timeouts = |sim: &Sim<EchoNode>, node: usize| {
+        sim.trace()
+            .records
+            .iter()
+            .filter(|r| matches!(r, Record::Timeout { node: n, .. } if *n == node))
+            .count()
+    };
+    let scenario = Scenario::new(2)
+        .duration(secs(5))
+        .link(LinkConfig::ideal())
+        .starved_node(1, Delay::Fixed(ms(300)));
+    let sim = run(5, scenario, fast_echo());
+    // Node 0's pings were answered only after node 1's receive path caught up.
+    let rtts: Vec<u64> = event_values(&sim)
+        .iter()
+        .filter_map(|e| e["rtt"].as_u64())
+        .collect();
+    assert!(!rtts.is_empty());
+    assert!(
+        rtts.iter().all(|&r| r >= ms(300).as_nanos() as u64),
+        "{rtts:?}"
+    );
+    // Its timers fired as often as the healthy node's.
+    let (fast, starved) = (timeouts(&sim, 0), timeouts(&sim, 1));
+    assert!(
+        starved > 40 && starved.abs_diff(fast) <= 2,
+        "{fast} vs {starved}"
+    );
+}
+
+#[test]
 fn crashed_node_is_silent_until_restarted() {
     let scenario = Scenario::new(3)
         .duration(secs(6))

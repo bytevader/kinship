@@ -89,6 +89,12 @@ struct Slot<N: SimNode> {
     backlog: VecDeque<Input<N::Command>>,
     wake_pending: bool,
     cost: Option<Delay>,
+    /// Extra time each received packet waits before the node sees it; see [`Action::Starve`].
+    starve: Option<Delay>,
+    /// When the starved receive path hands over its last queued packet; packets stay in order.
+    rx_free: Instant,
+    /// Raised on every crash, so packets a dead instance had queued never reach its successor.
+    life: u64,
     next_inbound: u64,
 }
 
@@ -178,9 +184,23 @@ enum Input<C> {
 }
 
 enum Due<C> {
-    Input { node: usize, input: Input<C> },
-    Timer { node: usize, generation: u64 },
-    Wake { node: usize },
+    Input {
+        node: usize,
+        input: Input<C>,
+    },
+    /// A packet a starved node's receive path is done with, for the instance `life`.
+    Received {
+        node: usize,
+        life: u64,
+        input: Input<C>,
+    },
+    Timer {
+        node: usize,
+        generation: u64,
+    },
+    Wake {
+        node: usize,
+    },
     Action(Action<C>),
 }
 
@@ -300,12 +320,20 @@ impl<N: SimNode> Sim<N> {
                 backlog: VecDeque::new(),
                 wake_pending: false,
                 cost: None,
+                starve: None,
+                rx_free: Instant::ZERO,
+                life: 0,
                 next_inbound: 0,
             })
             .collect();
         for (node, cost) in scenario.slow {
             if let Some(slot) = nodes.get_mut(node) {
                 slot.cost = Some(cost);
+            }
+        }
+        for (node, delay) in scenario.starved {
+            if let Some(slot) = nodes.get_mut(node) {
+                slot.starve = Some(delay);
             }
         }
         let trace = Trace {
@@ -446,6 +474,11 @@ impl<N: SimNode> Sim<N> {
                     slot.cost = cost;
                 }
             }
+            Action::Starve { node, delay } => {
+                if let Some(slot) = self.nodes.get_mut(node) {
+                    slot.starve = delay;
+                }
+            }
             Action::Crash(node) => self.crash(node),
             Action::Restart(node) => self.restart(node),
             Action::Command { node, cmd } => self.input(node, Input::Command(cmd)),
@@ -454,7 +487,14 @@ impl<N: SimNode> Sim<N> {
 
     fn dispatch(&mut self, due: Due<N::Command>) {
         match due {
-            Due::Input { node, input } => self.input(node, input),
+            Due::Input { node, input } => self.receive(node, input),
+            Due::Received { node, life, input } => {
+                if self.nodes[node].life == life {
+                    self.input(node, input);
+                } else if let Input::Datagram { packet, .. } = input {
+                    self.rec.drop_packet(self.now, packet, DropReason::NodeDown);
+                }
+            }
             Due::Timer { node, generation } => {
                 if self.nodes[node].timer_gen == generation {
                     self.input(node, Input::Timeout);
@@ -463,6 +503,22 @@ impl<N: SimNode> Sim<N> {
             Due::Wake { node } => self.wake(node),
             Due::Action(action) => self.apply(action),
         }
+    }
+
+    /// A packet or stream event arrived for `node`. A starved node's receive path holds it for
+    /// a while first, in arrival order.
+    fn receive(&mut self, node: usize, input: Input<N::Command>) {
+        let Some(slot) = self.nodes.get_mut(node) else {
+            return;
+        };
+        let Some(delay) = &slot.starve else {
+            self.input(node, input);
+            return;
+        };
+        let at = (self.now + delay.sample(&mut self.rng)).max(slot.rx_free);
+        slot.rx_free = at;
+        let life = slot.life;
+        self.queue.push(at, Due::Received { node, life, input });
     }
 
     /// Hands `input` to the node now, or queues it while the node is paused or busy.
@@ -923,6 +979,8 @@ impl<N: SimNode> Sim<N> {
         slot.timer = None;
         slot.timer_gen += 1;
         slot.busy_until = self.now;
+        slot.life += 1;
+        slot.rx_free = self.now;
         // The crashed node's connections fail at the other end.
         let mut affected = Vec::new();
         for (&conn, c) in &mut self.conns.map {

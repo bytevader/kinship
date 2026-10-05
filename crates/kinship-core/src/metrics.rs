@@ -17,6 +17,8 @@ pub struct Metrics {
     pub probes_failed: u64,
     /// PingReqs sent to relays.
     pub indirect_probes: u64,
+    /// Relays of failed probe rounds that sent no Nack in time; each raised local health.
+    pub missed_nacks: u64,
     /// Members this node moved to Suspect, on its own probes or on gossip.
     pub suspicions: u64,
     /// Rumours about this node that it refuted by raising its incarnation.

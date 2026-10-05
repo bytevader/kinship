@@ -111,7 +111,7 @@ Incarnation is a u32 per member. A node starts at 0, or at the value it learns a
 | --- | --- | --- |
 | Alive(i) | any | i > stored inc, or the member is unknown |
 | Suspect(i) | Alive(j) | i ≥ j |
-| Suspect(i) | Suspect(j) | i > j; i = j only adds a confirmation |
+| Suspect(i) | Suspect(j) | i > j, as a new suspicion with a fresh timer, since the member refuted j; i = j only adds a confirmation |
 | Dead(i) or Left(i) | Alive or Suspect(j) | i ≥ j |
 | any | Dead or Left(j) | only Alive(i) with i > j |
 
@@ -138,7 +138,7 @@ sequenceDiagram
             alt B answers C
                 B-->>C: Ack(seq')
                 C-->>A: Ack(seq)
-            else no answer by 80% of timeout
+            else no answer by 80% of min(timeout, interval - timeout)
                 C-->>A: Nack(seq)
             end
         and TCP fallback
@@ -147,19 +147,19 @@ sequenceDiagram
         alt any Ack arrives before the round ends
             Note over A: B stays Alive
         else no Ack
-            Note over A: mark B Suspect and gossip it, LHM + 1 per missing Nack
+            Note over A: mark B Suspect and gossip it, LHM + 1 per missing Nack (+ 1 if no relay)
         end
     end
 ```
 
-A Nack tells the prober that the relay is reachable but the target is not. Missing Nacks mean the prober itself is probably the one in trouble, so they raise its LHM and slow it down instead of letting it accuse others.
+A Nack tells the prober that the relay is reachable but the target is not. Missing Nacks mean the prober itself is probably the one in trouble, so they raise its LHM and slow it down instead of letting it accuse others. When every relay sends a Nack the target is the one at fault and the LHM does not move. The relay times its Nack from the unscaled configuration, so it lands inside the shortest indirect phase any healthy requester runs, probe_interval - probe_timeout.
 
 ### Lifeguard
 
 kinship ships all three Lifeguard mechanisms from day one, because they decide whether the week 10 false-positive gate passes.
 
-- **Local health multiplier (LHM).** A score from 0 to awareness_max (8). It rises on a failed probe, a missing Nack, or a refutation of a rumour about ourselves. It falls on each successful probe. Probe interval and probe timeout are both multiplied by LHM + 1.
-- **Dynamic suspicion timeout.** A suspicion starts at the maximum timeout and shrinks as independent members confirm it. With n members, C confirmations and K expected confirmations (default 3):
+- **Local health multiplier (LHM).** A score from 0 to awareness_max (8). A failed probe round raises it by one per relay that sent no Nack, or by one if no relay was asked; a refutation of a rumour about ourselves raises it by one. It falls by one on each successful probe, direct, indirect or over TCP. Probe interval and probe timeout are both multiplied by LHM + 1. These are memberlist's rules: the paper also adds one for the failed round itself, which would slow a healthy node down for detecting a real failure.
+- **Dynamic suspicion timeout.** A suspicion starts at the maximum timeout and shrinks as independent members confirm it. A confirmation is a Suspect from a member that has not reported this suspicion yet, this node included when its own probe fails. With n members, C confirmations and K expected confirmations (expected_confirmations, default 3, capped at n - 2 because only that many members could confirm; with K = 0 the timeout is T_min):
 
 ```latex
 \begin{aligned}
@@ -169,7 +169,9 @@ T(C) &= \max\left(T_{min},\; T_{max} - (T_{max} - T_{min}) \frac{\log(C+1)}{\log
 \end{aligned}
 ```
 
-- **Buddy system.** When a node probes a member it currently suspects, the Suspect message rides first in that Ping's piggyback, so the suspected member learns about it on the next contact and can refute at once.
+- **Buddy system.** When a node probes a member it currently suspects, a Suspect from the prober goes in the Ping's packet ahead of the Ping itself, so the suspected member applies it first and its Ack already carries the refutation.
+
+Each mechanism has its own flag (local_health, nacks, dynamic_suspicion, buddy_system), all on by default; `Config::without_lifeguard()` turns all four off for plain SWIM. Sim results comparing the two are in `docs/results/lifeguard.md`. One consequence to know: on the minority side of a partition most relays are unreachable, so the LHM climbs to its ceiling and that side detects the other more slowly, up to awareness_max + 1 times the probe interval per round. The majority side is unaffected.
 
 The suspicion and refutation path end to end:
 
@@ -491,6 +493,10 @@ Keys can be rotated at runtime with add_key, use_key and remove_key, which act o
 | suspicion_max_mult | 6 | maximum timeout as a multiple of the minimum |
 | expected_confirmations | 3 | K in the Lifeguard timeout formula |
 | awareness_max | 8 | ceiling of the local health multiplier |
+| local_health | True | Lifeguard LHM: stretch probe interval and timeout when this node's own probes fail |
+| nacks | True | Lifeguard: ask relays for Nacks and count missing ones against local health |
+| dynamic_suspicion | True | Lifeguard: suspicion timeout starts at the maximum and shrinks with confirmations |
+| buddy_system | True | Lifeguard: Pings to a suspected member carry the suspicion first |
 | dead_reclaim | 30 s | how long Dead and Left tombstones are kept |
 
 ### Gossip and sync

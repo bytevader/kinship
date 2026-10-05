@@ -1,8 +1,12 @@
 //! Suspicion timers, and the integer-only logarithms that size timeouts and retransmits.
 //!
-//! The timeout is fixed at the Lifeguard minimum, `suspicion_mult x max(1, log10 n) x
-//! probe_interval`. Confirmations from independent suspecters are already counted, so the
-//! dynamic Lifeguard timeout can shrink from them without changing what is tracked.
+//! With `dynamic_suspicion` a suspicion follows the Lifeguard formula from `docs/design.md`:
+//! it starts at `T_max = suspicion_max_mult x T_min` and shrinks with each independent
+//! confirmation `C` to `T_max - (T_max - T_min) x log(C + 1) / log(K + 1)`, reaching
+//! `T_min = suspicion_mult x max(1, log10 n) x probe_interval` at `K` confirmations. `K` is
+//! `expected_confirmations`, capped at `n - 2`, the members that could confirm at all. A slow
+//! member gets the long timeout to refute in, while a real failure that many members see is
+//! declared at the minimum. Without it the timeout is fixed at `T_min`, as in plain SWIM.
 //!
 //! Logarithms are computed in fixed point from integer operations only. `f64::log10` goes to
 //! the platform's libm, whose last bit may differ between systems, and a timeout that differs
@@ -22,34 +26,70 @@ use crate::time::Instant;
 #[derive(Debug, Clone)]
 pub(crate) struct Suspicion {
     pub deadline: Instant,
-    /// Distinct members other than this node that reported the suspicion.
-    confirmations: Vec<String>,
+    start: Instant,
+    min: Duration,
+    max: Duration,
+    /// Confirmations that bring the timeout down to `min`; 0 if it starts there.
+    k: u32,
+    /// Distinct members that reported the suspicion, the first reporter included; this node
+    /// counts too when its own probe of the member fails.
+    reporters: Vec<String>,
 }
 
 impl Suspicion {
     /// A suspicion first reported by `from` in a cluster of `n` live members.
-    pub fn new(cfg: &Config, n: usize, now: Instant, me: &str, from: &str) -> Self {
-        let mut s = Self {
-            deadline: now + min_timeout(cfg, n),
-            confirmations: Vec::new(),
+    pub fn new(cfg: &Config, n: usize, now: Instant, from: &str) -> Self {
+        let min = min_timeout(cfg, n);
+        let k = if cfg.dynamic_suspicion {
+            let others = u32::try_from(n.saturating_sub(2)).unwrap_or(u32::MAX);
+            cfg.expected_confirmations.min(others)
+        } else {
+            0
         };
-        s.confirm(me, from);
-        s
+        let max = if k == 0 {
+            min
+        } else {
+            min.saturating_mul(cfg.suspicion_max_mult)
+        };
+        Self {
+            deadline: now + max,
+            start: now,
+            min,
+            max,
+            k,
+            reporters: vec![from.to_owned()],
+        }
     }
 
-    /// Records that `from` also suspects the member. True if `from` is a new, independent
-    /// confirmation.
-    pub fn confirm(&mut self, me: &str, from: &str) -> bool {
-        if from == me || self.confirmations.iter().any(|c| c == from) {
+    /// Records that `from` also suspects the member, shortening the timeout. True if `from` is
+    /// a new, independent confirmation.
+    pub fn confirm(&mut self, from: &str) -> bool {
+        if self.reporters.iter().any(|c| c == from) {
             return false;
         }
-        self.confirmations.push(from.to_owned());
+        self.reporters.push(from.to_owned());
+        self.deadline = self.start + self.timeout();
         true
     }
 
-    #[cfg(test)]
-    pub fn confirmations(&self) -> usize {
-        self.confirmations.len()
+    /// Independent confirmations after the first report.
+    pub fn confirmations(&self) -> u32 {
+        u32::try_from(self.reporters.len() - 1).unwrap_or(u32::MAX)
+    }
+
+    /// `max(T_min, T_max - (T_max - T_min) x log(C + 1) / log(K + 1))`.
+    fn timeout(&self) -> Duration {
+        let c = self.confirmations();
+        if c >= self.k {
+            return self.min;
+        }
+        let num = u128::from(log2_q32(u64::from(c) + 1)) << 32;
+        let frac = num / u128::from(log2_q32(u64::from(self.k) + 1));
+        let span = (self.max - self.min).as_nanos();
+        let cut = u64::try_from((span * frac) >> 32).unwrap_or(u64::MAX);
+        self.max
+            .saturating_sub(Duration::from_nanos(cut))
+            .max(self.min)
     }
 }
 
@@ -191,15 +231,58 @@ mod tests {
     }
 
     #[test]
-    fn confirmations_are_distinct_and_exclude_self() {
+    fn confirmations_are_distinct() {
         let cfg = Config::lan(Security::InsecurePlaintext);
-        let mut s = Suspicion::new(&cfg, 5, Instant::ZERO, "me", "a");
-        assert_eq!(s.confirmations(), 1);
-        assert!(!s.confirm("me", "a"));
-        assert!(!s.confirm("me", "me"));
-        assert!(s.confirm("me", "b"));
-        assert_eq!(s.confirmations(), 2);
-        let s = Suspicion::new(&cfg, 5, Instant::ZERO, "me", "me");
+        let mut s = Suspicion::new(&cfg, 5, Instant::ZERO, "a");
         assert_eq!(s.confirmations(), 0);
+        assert!(!s.confirm("a"));
+        assert!(
+            s.confirm("me"),
+            "this node's own failed probe is independent"
+        );
+        assert!(!s.confirm("me"));
+        assert!(s.confirm("b"));
+        assert_eq!(s.confirmations(), 2);
+    }
+
+    #[test]
+    fn dynamic_timeout_shrinks_from_max_to_min_with_confirmations() {
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let n = 100;
+        let (min, max) = (min_timeout(&cfg, n), min_timeout(&cfg, n) * 6);
+        let mut s = Suspicion::new(&cfg, n, Instant::ZERO, "a");
+        assert_eq!(s.deadline, Instant::ZERO + max);
+        let mut last = max;
+        for (c, from) in ["b", "c", "d"].into_iter().enumerate() {
+            s.confirm(from);
+            let t = s.deadline - Instant::ZERO;
+            // The design formula in floating point, to within a microsecond.
+            let k = 3f64;
+            let want = max.as_secs_f64()
+                - (max - min).as_secs_f64() * ((c + 2) as f64).ln() / (k + 1.0).ln();
+            let want = want.max(min.as_secs_f64());
+            assert!((t.as_secs_f64() - want).abs() < 1e-6, "C={}: {t:?}", c + 1);
+            assert!(t < last);
+            last = t;
+        }
+        assert_eq!(last, min, "K = 3 confirmations reach the minimum");
+        s.confirm("e");
+        assert_eq!(s.deadline - Instant::ZERO, min);
+    }
+
+    #[test]
+    fn small_clusters_and_plain_swim_start_at_the_minimum() {
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        // With 3 live members only one other could confirm, so K is capped at 1.
+        let mut s = Suspicion::new(&cfg, 3, Instant::ZERO, "a");
+        assert_eq!(s.deadline - Instant::ZERO, min_timeout(&cfg, 3) * 6);
+        s.confirm("b");
+        assert_eq!(s.deadline - Instant::ZERO, min_timeout(&cfg, 3));
+        // Two members: nobody else can confirm.
+        let s = Suspicion::new(&cfg, 2, Instant::ZERO, "a");
+        assert_eq!(s.deadline - Instant::ZERO, min_timeout(&cfg, 2));
+        let cfg = cfg.without_lifeguard();
+        let s = Suspicion::new(&cfg, 100, Instant::ZERO, "a");
+        assert_eq!(s.deadline - Instant::ZERO, min_timeout(&cfg, 100));
     }
 }

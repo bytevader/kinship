@@ -254,6 +254,11 @@ pub enum Action<C> {
     /// Make every input on `node` cost `cost` of processing time, so inputs queue behind each
     /// other as on a starved CPU. `None` makes the node fast again.
     Slow { node: usize, cost: Option<Delay> },
+    /// Hold every packet and stream event `node` receives for `delay` before the node sees it,
+    /// in arrival order, while its timers still fire on time: a starved receive path, as in the
+    /// Lifeguard paper's slow-node experiments, where Acks are read only after the probe timed
+    /// out. `None` makes the node fast again.
+    Starve { node: usize, delay: Option<Delay> },
     /// Kill the node: it loses all state, and its connections fail.
     Crash(usize),
     /// Start a fresh instance of the node, with a new seed. A running node is crashed first.
@@ -272,6 +277,7 @@ impl<C> Action<C> {
             Action::ResetLinks => "reset_links".to_owned(),
             Action::Pause { node, duration } => format!("pause {node} for {duration:?}"),
             Action::Slow { node, cost } => format!("slow {node} {cost:?}"),
+            Action::Starve { node, delay } => format!("starve {node} {delay:?}"),
             Action::Crash(node) => format!("crash {node}"),
             Action::Restart(node) => format!("restart {node}"),
             Action::Command { node, .. } => format!("command {node}"),
@@ -308,6 +314,7 @@ pub struct Scenario<C = ()> {
     pub(crate) link: LinkConfig,
     pub(crate) links: Vec<LinkRule>,
     pub(crate) slow: Vec<(usize, Delay)>,
+    pub(crate) starved: Vec<(usize, Delay)>,
     pub(crate) connect_timeout: Duration,
     pub(crate) max_stream_frame: usize,
     pub(crate) trace: TraceConfig,
@@ -323,6 +330,7 @@ impl<C> Scenario<C> {
             link: LinkConfig::lan(),
             links: Vec::new(),
             slow: Vec::new(),
+            starved: Vec::new(),
             connect_timeout: Duration::from_secs(3),
             max_stream_frame: kinship_core::Limits::DEFAULT_MAX_STREAM_FRAME,
             trace: TraceConfig::default(),
@@ -381,6 +389,12 @@ impl<C> Scenario<C> {
     /// Make `node` slow from the start; see [`Action::Slow`].
     pub fn slow_node(mut self, node: usize, cost: Delay) -> Self {
         self.slow.push((node, cost));
+        self
+    }
+
+    /// Starve `node` from the start; see [`Action::Starve`].
+    pub fn starved_node(mut self, node: usize, delay: Delay) -> Self {
+        self.starved.push((node, delay));
         self
     }
 

@@ -1,5 +1,10 @@
 //! Probe rounds: a direct Ping, then PingReq through `indirect_checks` relays, then suspicion.
 //! Also the relay side of PingReq, and answering Pings.
+//!
+//! Each round's outcome feeds Lifeguard's local health: an Ack lowers the score, a failed round
+//! raises it by one per relay that stayed silent (or by one if no relay was asked or Nacks are
+//! off). When every relay sends a Nack the round still fails, but the fault is the target's, so
+//! the score does not move.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -24,6 +29,8 @@ pub(crate) struct Probe {
     pub indirect_at: Instant,
     pub indirect_sent: bool,
     pub acked: bool,
+    /// PingReqs sent, one per relay.
+    pub relays: u32,
     /// Relays that reported they could not reach the target either.
     pub nacks: u32,
     /// The TCP fallback ping, closed when the round ends.
@@ -42,14 +49,14 @@ pub(crate) struct Relay {
 }
 
 impl Node {
-    /// Time between probe rounds. Lifeguard will scale this by the local health multiplier.
+    /// Time between probe rounds, stretched by the local health multiplier.
     pub(crate) fn probe_interval(&self) -> Duration {
-        self.cfg.probe_interval
+        self.scale_by_health(self.cfg.probe_interval)
     }
 
-    /// How long to wait for a direct Ack. Lifeguard will scale this too.
+    /// How long to wait for a direct Ack, stretched by the local health multiplier.
     pub(crate) fn probe_timeout(&self) -> Duration {
-        self.cfg.probe_timeout
+        self.scale_by_health(self.cfg.probe_timeout)
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -72,8 +79,17 @@ impl Node {
             if let Some(conn) = p.fallback {
                 self.close_stream(conn);
             }
-            if !p.acked {
+            if p.acked {
+                self.health_delta(-1);
+            } else {
                 self.metrics.probes_failed += 1;
+                if self.cfg.nacks && p.relays > 0 {
+                    let missed = p.relays.saturating_sub(p.nacks);
+                    self.metrics.missed_nacks += u64::from(missed);
+                    self.health_delta(i64::from(missed));
+                } else {
+                    self.health_delta(1);
+                }
                 let me = self.local.member.name.clone();
                 let suspect = Suspect {
                     inc: p.inc,
@@ -95,20 +111,34 @@ impl Node {
         let Some(target) = self.table.next_probe(&mut self.rng) else {
             return;
         };
-        let (name, addr, inc) = (
+        let (name, addr, inc, suspected) = (
             target.member.name.clone(),
             target.member.addr,
             target.member.incarnation,
+            target.member.state == State::Suspect,
         );
         let seq = self.next_seq();
+        let me = id(&self.local.member.name);
         let ping = Message::Ping(Ping {
             seq,
             target: id(&name),
-            source: id(&self.local.member.name),
+            source: me,
             source_addr: self.local.member.addr,
         });
+        // The buddy system: a suspected target reads the rumour before the Ping, so its Ack
+        // already carries the refutation.
+        let buddy = Message::Suspect(Suspect {
+            inc,
+            node: id(&name),
+            from: me,
+        });
+        let head = if suspected && self.cfg.buddy_system {
+            &[buddy, ping][..]
+        } else {
+            &[ping][..]
+        };
         let limit = self.retransmit_limit();
-        self.out.send(addr, &[ping], Some(limit));
+        self.out.send(addr, head, Some(limit));
         self.metrics.probes_sent += 1;
         self.probe = Some(Probe {
             seq,
@@ -118,6 +148,7 @@ impl Node {
             indirect_at: now + self.probe_timeout(),
             indirect_sent: false,
             acked: false,
+            relays: 0,
             nacks: 0,
             fallback: None,
         });
@@ -142,12 +173,16 @@ impl Node {
             target: id(&target),
             target_addr,
             requester_addr: self.local.member.addr,
-            want_nack: true,
+            want_nack: self.cfg.nacks,
         });
         let limit = self.retransmit_limit();
+        let asked = u32::try_from(relays.len()).unwrap_or(u32::MAX);
         for relay in relays {
             self.out.send(relay, &[req], Some(limit));
             self.metrics.indirect_probes += 1;
+        }
+        if let Some(p) = &mut self.probe {
+            p.relays = asked;
         }
         if self.cfg.tcp_fallback_ping {
             // The same Ping over TCP: a member whose UDP is filtered still answers here.
@@ -198,13 +233,16 @@ impl Node {
         });
         let limit = self.retransmit_limit();
         self.out.send(req.target_addr, &[ping], Some(limit));
-        let timeout = self.probe_timeout();
+        // The requester's indirect phase lasts at least probe_interval - probe_timeout; the
+        // Nack must land inside it, whatever this node's own health, or it counts as missing.
+        let (interval, timeout) = (self.cfg.probe_interval, self.cfg.probe_timeout);
+        let window = timeout.min(interval.saturating_sub(timeout));
         self.relays.insert(
             seq,
             Relay {
                 seq: req.seq,
                 requester: req.requester_addr,
-                nack_at: req.want_nack.then(|| now + timeout * 4 / 5),
+                nack_at: req.want_nack.then(|| now + window * 4 / 5),
                 expires: now + timeout,
             },
         );
