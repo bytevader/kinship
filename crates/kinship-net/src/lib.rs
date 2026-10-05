@@ -28,7 +28,8 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 pub use events::{Event, Events};
 pub use kinship_core::{
-    CommandError, Config, ConfigError, Key, Limits, Member, Metrics, Security, State, WIRE_VERSION,
+    CommandError, Config, ConfigError, Identity, Key, KeyError, Limits, Member, Metrics, Security,
+    State, WIRE_VERSION,
 };
 pub use transport::{TokioTransport, Transport, default_advertise};
 
@@ -72,7 +73,8 @@ impl Settings {
         }
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Checks the fields the core does not; [`Memberlist::start`] calls it too.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_inbound_streams == 0 {
             return Err(ConfigError {
                 field: "max_inbound_streams",

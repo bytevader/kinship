@@ -19,7 +19,7 @@
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305};
 use zeroize::Zeroize;
 
-use crate::error::{ConfigError, DecodeError, EncodeError};
+use crate::error::{ConfigError, DecodeError, EncodeError, KeyError};
 use crate::limits::Limits;
 use crate::message::{Message, Payload, put_payload};
 use crate::wire::{Count, Sink};
@@ -70,6 +70,57 @@ impl Key {
     /// Returns `None` unless `bytes` is exactly 32 bytes long.
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
         Some(Self(bytes.try_into().ok()?))
+    }
+
+    /// A key written as standard base64, with or without `=` padding, as `kinship keygen`
+    /// prints it. Surrounding whitespace is ignored.
+    pub fn from_base64(text: &str) -> Result<Self, KeyError> {
+        let text = text.trim();
+        let digits = text.trim_end_matches('=');
+        if text.len() - digits.len() > 2 {
+            return Err(KeyError::NotBase64);
+        }
+        let mut key = [0u8; 32];
+        let mut len = 0;
+        let mut acc = 0u32;
+        let mut bits = 0;
+        let mut result = Ok(());
+        for c in digits.bytes() {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => {
+                    result = Err(KeyError::NotBase64);
+                    break;
+                }
+            };
+            acc = (acc << 6) | u32::from(v);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                if len == key.len() {
+                    result = Err(KeyError::WrongLength);
+                    break;
+                }
+                key[len] = (acc >> bits) as u8;
+                len += 1;
+                acc &= (1 << bits) - 1;
+            }
+        }
+        // Leftover bits must be the zero padding of the last group.
+        if result.is_ok() && (bits >= 6 || acc != 0) {
+            result = Err(KeyError::NotBase64);
+        }
+        if result.is_ok() && len != key.len() {
+            result = Err(KeyError::WrongLength);
+        }
+        let out = result.map(|()| Self(key));
+        key.zeroize();
+        acc.zeroize();
+        out
     }
 
     /// First 4 bytes of BLAKE3(key), big-endian. Sent in the clear to pick the right key.

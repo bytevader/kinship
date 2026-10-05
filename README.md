@@ -356,6 +356,13 @@ async fn main() -> anyhow::Result<()> {
 
 The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`.
 
+The `kinship-agent` example joins a cluster from seeds on the command line and logs every event until Ctrl-C, when it leaves:
+
+```bash
+cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7946
+cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 127.0.0.1:7946
+```
+
 ## kinship-core: sans-IO SWIM
 
 `kinship-core` is the whole protocol with no sockets, clocks, threads or randomness of its own. You feed it bytes and the time, and it tells you what to send and when to wake it. Use it to run SWIM on your own runtime, an embedded event loop or a simulator.

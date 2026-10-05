@@ -46,7 +46,7 @@ async fn serve_join<T: Transport>(b: &T) {
             .iter()
             .any(|m| matches!(m, Message::PushPull(p) if p.join))
     );
-    let record = Record {
+    let records = [Record {
         state: State::Alive,
         alive: Alive {
             inc: 0,
@@ -56,10 +56,10 @@ async fn serve_join<T: Transport>(b: &T) {
             vmin: 1,
             vmax: 1,
         },
-    };
+    }];
     let reply = Message::PushPull(PushPull {
         join: false,
-        records: Records::Slice(&[record]),
+        records: Records::Slice(&records),
     });
     let mut out = Vec::new();
     codec()
@@ -156,5 +156,5 @@ async fn a_flooded_actor_reads_acks_before_its_probe_timer_over_udp() {
     let a = TokioTransport::bind(loopback).await.unwrap();
     let b = TokioTransport::bind(loopback).await.unwrap();
     // Small enough to fit a default socket buffer on every OS, so nothing is lost to the kernel.
-    flood(a, b, 150, 4).await;
+    flood(a, b, 100, 4).await;
 }

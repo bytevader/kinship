@@ -19,7 +19,7 @@ mod stream;
 pub mod tags;
 mod wire;
 
-pub use error::{ConfigError, DecodeError, EncodeError};
+pub use error::{ConfigError, DecodeError, EncodeError, KeyError};
 pub use limits::Limits;
 pub use message::{
     Alive, Dead, Message, Messages, NodeId, Payload, Ping, PingReq, PushPull, Record, RecordIter,
