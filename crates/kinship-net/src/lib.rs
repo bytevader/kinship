@@ -48,7 +48,8 @@ pub struct Settings {
     pub advertise: Option<SocketAddr>,
     /// Initial metadata, at most `max_meta_bytes`.
     pub meta: Vec<u8>,
-    /// Joined on start, and rejoined every `rejoin_interval` while the node has no live members.
+    /// Joined on start, and every `rejoin_interval` each one that is not a live member is
+    /// push-pulled with again.
     pub seeds: Vec<SocketAddr>,
     /// Inbound TCP connections served at once; a new one beyond this drops the oldest.
     pub max_inbound_streams: usize,

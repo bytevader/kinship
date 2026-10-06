@@ -232,7 +232,8 @@ impl Config {
         with_push_pull_interval => push_pull_interval: Duration;
         /// Period of push-pulls with recently dead members; zero disables them.
         with_reconnect_interval => reconnect_interval: Duration;
-        /// Period of rejoin attempts through the seeds while no other member is alive; zero
+        /// Period of push-pulls with each seed that is not a live member, which finds the
+        /// cluster again after a node was cut off or a partition outlasted the tombstones; zero
         /// disables them.
         with_rejoin_interval => rejoin_interval: Duration;
         /// Bound on each TCP connect, write and read.

@@ -59,7 +59,8 @@ impl Cluster {
     /// own address.
     ///
     /// A bad field fails before any socket opens. A startup join that reaches no seed only
-    /// logs a warning: the node starts alone and retries the seeds every `rejoin_interval`.
+    /// logs a warning: the node starts alone and retries the seeds every `rejoin_interval`,
+    /// as it does for any seed that is not a live member.
     pub async fn start(cfg: Config) -> Result<Self, Error> {
         let (settings, bind) = cfg.build()?;
         let transport = TokioTransport::bind(bind).await?;

@@ -8,7 +8,7 @@
 //! local health only limits the damage. After every input it drains the node's transmits and
 //! events, so replies leave at once even in the middle of a burst.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -170,8 +170,11 @@ enum Pending {
         did: &'static str,
         key: KeyId,
     },
-    /// A background rejoin started by the actor itself.
-    Rejoin,
+    /// A background rejoin started by the actor itself, while the node had no live member or
+    /// not.
+    Rejoin {
+        alone: bool,
+    },
 }
 
 /// A connection task the actor can write to and stop.
@@ -358,8 +361,9 @@ impl<T: Transport> Actor<T> {
         }
     }
 
-    /// While the node knows no other live member, push-pulls with the seeds every
-    /// `rejoin_interval`, so a node that started alone or was cut off finds the cluster again.
+    /// Every `rejoin_interval`, push-pulls with each configured seed that is not a live member.
+    /// A node that started alone or was cut off finds the cluster again, and a seed on the far
+    /// side of a partition that outlasted the tombstones merges the two sides.
     fn rejoin(&mut self, now: Instant) {
         let Some(at) = self.next_rejoin.filter(|&t| t <= now) else {
             return;
@@ -367,14 +371,29 @@ impl<T: Transport> Actor<T> {
         let interval = self.opts.rejoin_interval;
         let missed = (now - at).as_nanos() / interval.as_nanos();
         self.next_rejoin = Some(at + interval * u32::try_from(missed + 1).unwrap_or(u32::MAX));
-        let alone = self.node.members().nth(1).is_none();
-        if self.rejoining || !alone || self.node.local().state == State::Left {
+        if self.rejoining || self.node.local().state == State::Left {
             return;
         }
-        tracing::debug!("no live members; rejoining through the seeds");
-        let seeds = self.opts.seeds.clone();
+        // This node is one of its own live members, so its own address is never a target.
+        let live: HashSet<SocketAddr> = self.node.members().map(|m| m.addr).collect();
+        let seeds: Vec<SocketAddr> = self
+            .opts
+            .seeds
+            .iter()
+            .copied()
+            .filter(|s| !live.contains(s))
+            .collect();
+        if seeds.is_empty() {
+            return;
+        }
+        let alone = live.len() == 1;
+        tracing::debug!(
+            seeds = seeds.len(),
+            alone,
+            "rejoining seeds that are not live members"
+        );
         let id = self.node.command(now, Command::Join { seeds });
-        self.pending.insert(id, Pending::Rejoin);
+        self.pending.insert(id, Pending::Rejoin { alone });
         self.rejoining = true;
         self.flush(false);
     }
@@ -503,10 +522,11 @@ impl<T: Transport> Actor<T> {
                 }
                 let _ = reply.send(result.map(drop).map_err(Error::from));
             }
-            Pending::Rejoin => {
+            Pending::Rejoin { alone } => {
                 self.rejoining = false;
                 match result {
-                    Ok(_) => tracing::info!("rejoined the cluster through the seeds"),
+                    Ok(_) if alone => tracing::info!("rejoined the cluster through the seeds"),
+                    Ok(_) => tracing::debug!("push-pulled with seeds that were not live members"),
                     Err(e) => tracing::debug!(error = %e, "rejoin failed; trying again later"),
                 }
             }
