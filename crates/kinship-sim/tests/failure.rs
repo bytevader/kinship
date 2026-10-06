@@ -10,6 +10,9 @@
 //! 3. A node whose clock jumps forward, alone or after a suspend, absorbs the jump: a probe
 //!    round the jump cut short raises its local health and suspects a healthy target, which
 //!    refutes, and no node is ever declared dead.
+//! 4. A partition that outlasts `dead_reclaim` leaves no tombstones to reconnect to: after the
+//!    heal the two sides stay apart, and one `join()` through a seed on the other side merges
+//!    them again.
 //!
 //! Each property has a quick test over a few seeds and an ignored sweep over 1,000 that CI runs
 //! with `cargo test --release -p kinship-sim --test failure -- --ignored --nocapture`.
@@ -649,6 +652,154 @@ fn a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds() {
     println!(
         "clock jump: {} seeds x 50 nodes, no false deaths; {cut} jumps cut a probe round short \
          and the target refuted; everyone Alive again within {}",
+        seeds.end - seeds.start,
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. A partition outlasts the tombstones.
+
+/// The longest a node on one side of a partition can take to declare a node on the other side
+/// dead, as in the SWIM sweep: the minority side's missing Nacks stretch its rounds to
+/// `awareness_max + 1` probe intervals, and few members are left to confirm a suspicion.
+fn partition_bound(cfg: &Config, n: usize) -> Duration {
+    let rounds = 2 * (n as u32 - 1) + 1;
+    cfg.probe_interval * rounds * (cfg.awareness_max + 1) + longest_suspicion(cfg, n) + secs(2)
+}
+
+fn long_partition(seed: u64, nodes: usize) -> Result<Measured, String> {
+    let cfg = config();
+    let mut rng = Rng::new(seed ^ 0x4c4f_4e47);
+    // No loss, so nobody loses a member of its own side: the split is the partition's alone.
+    let (link, _) = random_link(&mut rng, 0.0);
+    let all: Vec<usize> = (0..nodes).collect();
+    let size = 1 + rng.index(nodes / 2);
+    let side: BTreeSet<usize> = pick(&mut rng, &all, size).into_iter().collect();
+    let other: Vec<usize> = all.iter().copied().filter(|n| !side.contains(n)).collect();
+    let across = |o: usize| -> Vec<usize> {
+        if side.contains(&o) {
+            other.clone()
+        } else {
+            side.iter().copied().collect()
+        }
+    };
+    // Some node joins through a seed on the other side, as a timer calling join() would.
+    let joiner = rng.index(nodes);
+    let seed_node = pick(&mut rng, &across(joiner), 1)[0];
+    let start = ms(5_000 + rng.below(5_000));
+    // Every node has declared the other side dead and reaped the tombstones by then.
+    let forget_bound = partition_bound(&cfg, nodes)
+        + cfg.dead_reclaim
+        + cfg.probe_interval * (cfg.awareness_max + 1);
+    let apart = cfg.reconnect_interval.max(cfg.push_pull_interval) * 2;
+    // The join's two ends gossip what they learned, but the members their side already knew
+    // are news only to the far side, which hears of them from the seed's own gossip and
+    // otherwise from push-pull with a member that has. That can take a few rounds of
+    // anti-entropy.
+    let bound = dissemination_bound(&cfg, nodes) + cfg.push_pull_interval * 3;
+    let scenario = Scenario::new(nodes)
+        .duration(start + forget_bound + apart + bound + secs(1))
+        .link(link)
+        .trace(TraceConfig::OFF)
+        .at(
+            start,
+            Action::Partition {
+                a: side.iter().copied().collect::<Vec<_>>().into(),
+                b: other.clone().into(),
+            },
+        );
+    let (mut sim, log) = sim(seed, scenario, |spec, log| {
+        Observed::new(spec, log, |_| true)
+    });
+    let fail = |msg: String| {
+        Err(format!(
+            "seed {seed}: {msg}\nside {side:?} split at {start:?}, {} joins via {}",
+            name_of(joiner),
+            name_of(seed_node)
+        ))
+    };
+    let forgot = |sim: &Sim<Observed>| {
+        all.iter().all(|&o| {
+            across(o)
+                .iter()
+                .all(|&x| view(sim, o, &name_of(x)).is_none())
+        })
+    };
+
+    let split = Instant::ZERO + start;
+    sim.run_until(split);
+    if run_until_true(&mut sim, secs(1), split + forget_bound, forgot).is_none() {
+        return fail(format!(
+            "the other side's tombstones not all reaped {forget_bound:?} after the split"
+        ));
+    }
+    sim.apply(Action::Heal);
+    let healed = sim.now();
+    // Reconnects only go to tombstones, so nothing finds the other side on its own.
+    sim.run_until(healed + apart);
+    if !forgot(&sim) {
+        return fail(format!(
+            "the sides met within {apart:?} of the heal without a join"
+        ));
+    }
+    sim.apply(Action::Command {
+        node: joiner,
+        cmd: Command::Join {
+            seeds: vec![addr_of(seed_node)],
+        },
+    });
+    let joined = sim.now();
+    let everyone: BTreeSet<usize> = all.iter().copied().collect();
+    let merged = run_until_true(&mut sim, ms(250), joined + bound, |sim| {
+        all.iter().all(|&o| live_set(sim, o) == everyone)
+    });
+    let Some(at) = merged else {
+        let bad: Vec<String> = all
+            .iter()
+            .filter_map(|&o| {
+                let missing: Vec<usize> =
+                    everyone.difference(&live_set(&sim, o)).copied().collect();
+                (!missing.is_empty()).then(|| format!("{} misses {missing:?}", name_of(o)))
+            })
+            .take(5)
+            .collect();
+        return fail(format!(
+            "not merged {bound:?} after the join: {}",
+            bad.join("; ")
+        ));
+    };
+    for s in log.borrow().iter() {
+        if let Event::MemberDead(m) = &s.event {
+            if side.contains(&s.observer) == side.contains(&index_of(&m.name)) {
+                return fail(format!(
+                    "{} declared {}, on its own side, dead at {:?}",
+                    name_of(s.observer),
+                    m.name,
+                    s.t
+                ));
+            }
+        }
+    }
+    Ok(Measured {
+        took: vec![at - joined],
+        ..Measured::default()
+    })
+}
+
+#[test]
+fn a_partition_longer_than_dead_reclaim_needs_a_join() {
+    check_all(0..4, |seed| long_partition(seed, 20));
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_partition_longer_than_dead_reclaim_needs_a_join_thousand_seeds() {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| long_partition(seed, 50));
+    println!(
+        "long partition: {} seeds x 50 nodes, the sides stayed apart after the heal until one \
+         join merged them: {}",
         seeds.end - seeds.start,
         percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
     );
