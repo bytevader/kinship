@@ -1,0 +1,23 @@
+[package]
+name = "kinship-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kinship-core = { path = "..", features = ["serde"] }
+serde_json = "1"
+
+# Keep this crate out of the main workspace: it needs nightly and only builds on Linux and macOS.
+[workspace]
+
+[[bin]]
+name = "node_input"
+path = "fuzz_targets/node_input.rs"
+test = false
+doc = false
+bench = false
