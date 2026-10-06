@@ -64,6 +64,9 @@ pub(crate) enum Request {
     Close {
         reply: oneshot::Sender<()>,
     },
+    /// Makes the actor panic; see `Memberlist::panic_actor`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    Panic,
 }
 
 /// A change to the node's keys.
@@ -430,6 +433,8 @@ impl<T: Transport> Actor<T> {
                 (cmd, Pending::Keyring { reply, did, key })
             }
             Request::Close { .. } => unreachable!("handled by the loop"),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Request::Panic => panic!("actor panic injected by a test"),
         };
         let keyring = matches!(pending, Pending::Keyring { .. });
         // Registered before the flush, which may already carry the result.

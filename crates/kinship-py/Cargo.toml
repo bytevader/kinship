@@ -20,7 +20,8 @@ abi3 = ["pyo3/abi3-py311"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-kinship-net.workspace = true
+# test-hooks adds a private `Node._panic_actor`, which the pytest suite uses and the stubs omit.
+kinship-net = { workspace = true, features = ["test-hooks"] }
 kinship-proto.workspace = true
 pyo3 = "0.29"
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
