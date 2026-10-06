@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use kinship_core::{
-    Command, CommandError, CommandId, CommandOutput, Instant, Member, Node, State, StreamEvent,
-    StreamId, Transmit,
+    Command, CommandError, CommandId, CommandOutput, Instant, Key, KeyId, Member, Node, State,
+    StreamEvent, StreamId, Transmit,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
@@ -57,15 +57,48 @@ pub(crate) enum Request {
         meta: Vec<u8>,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Keyring {
+        change: KeyChange,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// A change to the node's keys.
+#[derive(Debug)]
+pub(crate) enum KeyChange {
+    Install(Key),
+    Use(Key),
+    Remove(Key),
+}
+
+impl KeyChange {
+    fn command(self) -> (Command, &'static str, KeyId) {
+        match self {
+            Self::Install(k) => {
+                let id = k.key_id();
+                (Command::InstallKey(k), "installed", id)
+            }
+            Self::Use(k) => {
+                let id = k.key_id();
+                (Command::UseKey(k), "now encrypting with", id)
+            }
+            Self::Remove(k) => {
+                let id = k.key_id();
+                (Command::RemoveKey(k), "removed", id)
+            }
+        }
+    }
 }
 
 /// What the handles read without a round trip to the actor.
 #[derive(Debug)]
 pub(crate) struct Shared {
     pub snapshot: ArcSwap<Snapshot>,
+    /// Ids of the installed keys, the one in use first; updated before a keyring call returns.
+    pub key_ids: ArcSwap<Vec<KeyId>>,
     pub stats: Mutex<Stats>,
     pub hub: Hub,
 }
@@ -128,6 +161,12 @@ fn far_future() -> TokioInstant {
 enum Pending {
     Join(oneshot::Sender<Result<usize, Error>>),
     Done(oneshot::Sender<Result<(), Error>>),
+    /// A key change, logged by id once it has succeeded.
+    Keyring {
+        reply: oneshot::Sender<Result<(), Error>>,
+        did: &'static str,
+        key: KeyId,
+    },
     /// A background rejoin started by the actor itself.
     Rejoin,
 }
@@ -386,11 +425,20 @@ impl<T: Transport> Actor<T> {
             Request::Join { seeds, reply } => (Command::Join { seeds }, Pending::Join(reply)),
             Request::Leave { reply } => (Command::Leave, Pending::Done(reply)),
             Request::SetMeta { meta, reply } => (Command::SetMeta(meta), Pending::Done(reply)),
+            Request::Keyring { change, reply } => {
+                let (cmd, did, key) = change.command();
+                (cmd, Pending::Keyring { reply, did, key })
+            }
             Request::Close { .. } => unreachable!("handled by the loop"),
         };
+        let keyring = matches!(pending, Pending::Keyring { .. });
         // Registered before the flush, which may already carry the result.
         let id = self.node.command(now, cmd);
         self.pending.insert(id, pending);
+        if keyring {
+            // Before the flush answers the caller, so key_ids() is current when the call returns.
+            self.shared.key_ids.store(Arc::new(self.node.key_ids()));
+        }
         self.flush(false);
     }
 
@@ -441,6 +489,13 @@ impl<T: Transport> Actor<T> {
                 let _ = reply.send(r);
             }
             Pending::Done(reply) => {
+                let _ = reply.send(result.map(drop).map_err(Error::from));
+            }
+            Pending::Keyring { reply, did, key } => {
+                match &result {
+                    Ok(_) => tracing::info!(%key, "keyring: {did} key"),
+                    Err(e) => tracing::warn!(%key, error = %e, "keyring: change refused"),
+                }
                 let _ = reply.send(result.map(drop).map_err(Error::from));
             }
             Pending::Rejoin => {

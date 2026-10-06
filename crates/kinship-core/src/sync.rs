@@ -409,6 +409,10 @@ impl Node {
             from: me.name.clone(),
         };
         self.broadcast(gossip);
+        // Tell the first few members now instead of at the next gossip tick, so that a caller
+        // whose leave times out and who closes the node at once has still been heard; they pass
+        // it on.
+        self.gossip(self.now);
         if let Some(p) = self.probe.take() {
             if let Some(conn) = p.fallback {
                 self.close_stream(conn);

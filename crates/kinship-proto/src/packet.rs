@@ -19,7 +19,7 @@
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305};
 use zeroize::Zeroize;
 
-use crate::error::{ConfigError, DecodeError, EncodeError, KeyError};
+use crate::error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 use crate::limits::Limits;
 use crate::message::{Message, Payload, put_payload};
 use crate::wire::{Count, Sink};
@@ -129,6 +129,37 @@ impl Key {
         let b = hash.as_bytes();
         u32::from_be_bytes([b[0], b[1], b[2], b[3]])
     }
+
+    /// [`id`](Self::id) as a [`KeyId`], which prints as 8 hex characters.
+    pub fn key_id(&self) -> KeyId {
+        KeyId(self.id())
+    }
+}
+
+/// The public id of a [`Key`]: safe to log, and printed as 8 hex characters.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyId(u32);
+
+impl KeyId {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for KeyId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
+}
+
+impl core::fmt::Debug for KeyId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "KeyId({:08x})", self.0)
+    }
 }
 
 impl Drop for Key {
@@ -214,10 +245,53 @@ impl Codec {
     }
 
     /// Ids of the installed keys, sealing key first. Empty in plaintext mode.
-    pub fn key_ids(&self) -> Vec<u32> {
+    pub fn key_ids(&self) -> Vec<KeyId> {
         match &self.security {
             Security::Plaintext => Vec::new(),
-            Security::Encrypted(keys) => keys.iter().map(Key::id).collect(),
+            Security::Encrypted(keys) => keys.iter().map(Key::key_id).collect(),
+        }
+    }
+
+    /// Adds `key` to the keys that open packets, after the existing ones. Does nothing if it is
+    /// already installed.
+    pub fn install_key(&mut self, key: Key) -> Result<(), KeyringError> {
+        let keys = self.keys_mut()?;
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+        Ok(())
+    }
+
+    /// Makes the installed `key` the one that seals; the others keep their order and still open.
+    pub fn use_key(&mut self, key: &Key) -> Result<(), KeyringError> {
+        let keys = self.keys_mut()?;
+        let at = keys
+            .iter()
+            .position(|k| k == key)
+            .ok_or(KeyringError::NotInstalled)?;
+        keys[..=at].rotate_right(1);
+        Ok(())
+    }
+
+    /// Drops `key`. Refuses the only key and the sealing key; a key that is not installed is
+    /// already gone, so that succeeds.
+    pub fn remove_key(&mut self, key: &Key) -> Result<(), KeyringError> {
+        let keys = self.keys_mut()?;
+        match keys.iter().position(|k| k == key) {
+            None => Ok(()),
+            Some(_) if keys.len() == 1 => Err(KeyringError::LastKey),
+            Some(0) => Err(KeyringError::InUse),
+            Some(at) => {
+                keys.remove(at);
+                Ok(())
+            }
+        }
+    }
+
+    fn keys_mut(&mut self) -> Result<&mut Vec<Key>, KeyringError> {
+        match &mut self.security {
+            Security::Plaintext => Err(KeyringError::Plaintext),
+            Security::Encrypted(keys) => Ok(keys),
         }
     }
 

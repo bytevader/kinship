@@ -161,3 +161,30 @@ impl fmt::Display for KeyError {
 }
 
 impl std::error::Error for KeyError {}
+
+/// A runtime change to a codec's keys was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KeyringError {
+    /// The codec runs in plaintext mode and has no keys to change.
+    Plaintext,
+    /// The key is not installed.
+    NotInstalled,
+    /// The key is the one that encrypts.
+    InUse,
+    /// The key is the only one installed.
+    LastKey,
+}
+
+impl fmt::Display for KeyringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plaintext => f.write_str("a plaintext node has no keys"),
+            Self::NotInstalled => f.write_str("key is not installed"),
+            Self::InUse => f.write_str("key is the one in use"),
+            Self::LastKey => f.write_str("key is the last one installed"),
+        }
+    }
+}
+
+impl std::error::Error for KeyringError {}

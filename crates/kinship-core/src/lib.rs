@@ -37,7 +37,7 @@ mod time;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{Message, NodeId, PacketKind, Payload};
+use kinship_proto::{KeyringError, Message, NodeId, PacketKind, Payload};
 
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
@@ -48,7 +48,7 @@ use crate::table::{Entry, Table};
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
-pub use kinship_proto::{Key, KeyError, Limits, WIRE_VERSION};
+pub use kinship_proto::{Key, KeyError, KeyId, Limits, WIRE_VERSION};
 pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;
@@ -299,10 +299,41 @@ impl Node {
                 self.broadcast(self.local_alive());
                 self.finish(id, Ok(CommandOutput::Done));
             }
+            Command::InstallKey(key) => {
+                let r = self.out.codec.install_key(key);
+                self.finish_keyring(id, r);
+            }
+            Command::UseKey(key) => {
+                let r = self.out.codec.use_key(&key);
+                self.finish_keyring(id, r);
+            }
+            Command::RemoveKey(key) => {
+                let r = self.out.codec.remove_key(&key);
+                self.finish_keyring(id, r);
+            }
             Command::Join { seeds } => self.join(id, seeds),
             Command::Leave => self.leave(id),
         }
         id
+    }
+
+    /// Ids of the keys this node can decrypt with, the one it encrypts with first. Empty when
+    /// the node runs without encryption.
+    pub fn key_ids(&self) -> Vec<KeyId> {
+        self.out.codec.key_ids()
+    }
+
+    fn finish_keyring(&mut self, id: CommandId, result: Result<(), KeyringError>) {
+        let result = match result {
+            Ok(()) => Ok(CommandOutput::Done),
+            Err(KeyringError::Plaintext) => Err(CommandError::NotEncrypted),
+            Err(KeyringError::NotInstalled) => Err(CommandError::KeyNotInstalled),
+            Err(KeyringError::InUse) => Err(CommandError::KeyInUse),
+            Err(KeyringError::LastKey) => Err(CommandError::LastKey),
+            // Refusals added later fail the command without a name of their own yet.
+            Err(_) => Err(CommandError::NotEncrypted),
+        };
+        self.finish(id, result);
     }
 
     /// The next thing to send, if any.
