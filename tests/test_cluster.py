@@ -160,13 +160,18 @@ async def test_concurrent_updates_are_never_lost() -> None:
 
 async def test_leave_timing_out_logs_and_does_not_raise(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.WARNING, logger="kinship")
-    async with cluster_of(3) as (a, _, c):
+    async with cluster_of(2) as (a, _b):
         events = a.events()
-        await c.leave(timeout=0.001)
-        assert any("timed out" in r.getMessage() for r in caplog.records)
-        await next_matching(events, kinship.MemberLeft, c.local.name)
-        await c.leave(timeout=1.0)  # leaving twice is fine
-        await c.close()
+        # So many retransmissions that the leave cannot finish spreading in 0.2 s.
+        slow = local(seeds=[a.local.addr], retransmit_mult=100)
+        async with kinship.Cluster(slow) as c:
+            await wait_until(lambda: c.local.name in names(a))
+            await c.leave(timeout=0.2)
+            assert any("timed out" in r.getMessage() for r in caplog.records)
+            await next_matching(events, kinship.MemberLeft, c.local.name)
+            await c.leave(timeout=1.0)  # leaving twice is fine
+        # The exit left and closed without raising.
+        assert names(a) == {a.local.name, _b.local.name}
 
 
 async def test_aexit_leaves_on_cancellation() -> None:

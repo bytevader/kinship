@@ -1,8 +1,10 @@
 import os
+import socket
 import sys
 import threading
 import time
 import warnings
+from collections.abc import Callable
 
 import pytest
 
@@ -72,8 +74,11 @@ def test_blocking_close_leaves_first_and_timeouts_raise() -> None:
         events = a.events(timeout=0.2)
         b = blocking.Cluster(local(seeds=[a.local.addr])).start(timeout=WAIT)
         wait_until_sync(lambda: b.local.name in names(a))
-        with pytest.raises(TimeoutError):
-            b.join([a.local.addr], timeout=0.0)
+        # A seed that accepts the connection and never answers keeps join() waiting.
+        with socket.create_server(("127.0.0.1", 0)) as silent:
+            seed = f"127.0.0.1:{silent.getsockname()[1]}"
+            with pytest.raises(TimeoutError):
+                b.join([seed], timeout=0.3)
         b.close()
         deadline = time.monotonic() + WAIT
         for event in events:
@@ -99,43 +104,72 @@ def test_blocking_keyring_and_events_end_on_close() -> None:
     assert list(events) == []
 
 
+def in_forked_child(steps: list[tuple[str, Callable[[], object]]]) -> tuple[int, list[str]]:
+    """Runs `steps` in a forked child and returns its exit code and the steps it finished.
+
+    Each step passes by raising nothing; the child exits 0 only if every step passed.
+    """
+    read, write = os.pipe()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads running
+        pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        code = 1
+        try:
+            os.close(read)
+            for name, step in steps:
+                step()
+                os.write(write, f"{name}\n".encode())
+            code = 0
+        except BaseException as e:
+            os.write(write, f"error in next step: {e!r}\n".encode())
+        finally:
+            os._exit(code)
+    os.close(write)
+    deadline = time.monotonic() + WAIT
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if time.monotonic() > deadline:
+            os.kill(pid, 9)
+            pytest.fail("the forked child hung")
+        time.sleep(0.05)
+    with os.fdopen(read) as out:
+        finished = out.read().splitlines()
+    return os.waitstatus_to_exitcode(status), finished
+
+
+def raises_closed(call: Callable[[], object]) -> Callable[[], None]:
+    def step() -> None:
+        with pytest.raises(kinship.KinshipClosed):
+            call()
+
+    return step
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no fork")
 def test_a_forked_child_raises_instead_of_hanging() -> None:
     with blocking.Cluster(local()) as parent:
         stream = parent.events()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads running
-            pid = os.fork()
-        if pid == 0:  # pragma: no cover - runs in the child
-            code = 0
-            try:
-                calls = (
-                    parent.members,
-                    lambda: parent.update_meta(x="y", timeout=1.0),
-                    lambda: next(stream),
-                )
-                for call in calls:
-                    try:
-                        call()
-                        code = 1
-                    except kinship.KinshipClosed:
-                        pass
-                # A cluster created after the fork works.
-                with blocking.Cluster(local()) as child:
-                    if child.local.name not in names(child):
-                        code = 2
-            except BaseException:
-                code = 3
-            finally:
-                os._exit(code)
-        deadline = time.monotonic() + WAIT
-        while True:
-            done, status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                break
-            if time.monotonic() > deadline:
-                os.kill(pid, 9)
-                pytest.fail("the forked child hung")
-            time.sleep(0.05)
-        assert os.waitstatus_to_exitcode(status) == 0
+        steps = [
+            ("members", raises_closed(parent.members)),
+            ("update_meta", raises_closed(lambda: parent.update_meta(x="y", timeout=1.0))),
+            ("events", raises_closed(lambda: next(stream))),
+        ]
+        code, finished = in_forked_child(steps)
+        assert (code, finished) == (0, [name for name, _ in steps])
         assert parent.local.name in names(parent), "the parent is unaffected"
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="fork without exec is only safe on Linux, not macOS"
+)
+def test_a_forked_child_can_start_its_own_cluster() -> None:
+    def start_one() -> None:
+        with blocking.Cluster(local()) as child:
+            assert child.local.name in names(child)
+
+    with blocking.Cluster(local()):
+        code, finished = in_forked_child([("start", start_one)])
+        assert (code, finished) == (0, ["start"])

@@ -70,25 +70,74 @@ impl TokioTransport {
             return Ok(Self { udp, tcp, addr });
         }
         let mut last = None;
-        for _ in 0..BIND_ATTEMPTS {
-            // Under load Windows sometimes refuses even a bind to port 0 with access denied.
-            let udp = match udp_socket(addr) {
-                Ok(udp) => udp,
-                Err(e) if is_conflict(&e) => {
-                    last = Some(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Sockets on ports the other protocol could not take stay open until the bind succeeds,
+        // so the OS never offers the same port twice. Windows hands out ports in sequence and
+        // excludes whole blocks of 100 per protocol, so retrying with one protocol alone can
+        // walk through a single excluded block for every attempt.
+        let mut held = (Vec::new(), Vec::new());
+        for attempt in 0..BIND_ATTEMPTS {
+            // Alternate which protocol picks the port: each avoids its own excluded ranges.
+            let bound = if attempt % 2 == 0 {
+                Self::bind_pair(addr, udp_socket, tcp_listener, &mut held.0)
+            } else {
+                Self::bind_pair(addr, tcp_listener, udp_socket, &mut held.1)
+                    .map(|r| r.map(|(tcp, udp, addr)| (udp, tcp, addr)))
             };
-            let addr = SocketAddr::new(addr.ip(), udp.local_addr()?.port());
-            match tcp_listener(addr) {
-                Ok(tcp) => return Ok(Self { udp, tcp, addr }),
-                // Windows reports ports in an excluded range as access denied.
-                Err(e) if is_conflict(&e) => last = Some(e),
+            match bound {
+                Ok(Ok((udp, tcp, addr))) => return Ok(Self { udp, tcp, addr }),
+                // Windows reports ports in an excluded range as access denied, and under load
+                // sometimes refuses even a bind to port 0 that way.
+                Ok(Err(e)) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AddrInUse)))
+    }
+
+    /// Binds `first` to an OS-picked port, then `second` to the same port. The outer error is
+    /// fatal; the inner one is a port conflict worth retrying. A `first` socket whose port
+    /// `second` could not take is kept in `held`.
+    #[allow(clippy::type_complexity)]
+    fn bind_pair<A, B>(
+        addr: SocketAddr,
+        first: fn(SocketAddr) -> io::Result<A>,
+        second: fn(SocketAddr) -> io::Result<B>,
+        held: &mut Vec<A>,
+    ) -> io::Result<Result<(A, B, SocketAddr), io::Error>>
+    where
+        A: LocalAddr,
+    {
+        let a = match first(addr) {
+            Ok(a) => a,
+            Err(e) if is_conflict(&e) => return Ok(Err(e)),
+            Err(e) => return Err(e),
+        };
+        let addr = SocketAddr::new(addr.ip(), a.port()?);
+        match second(addr) {
+            Ok(b) => Ok(Ok((a, b, addr))),
+            Err(e) if is_conflict(&e) => {
+                held.push(a);
+                Ok(Err(e))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The port a freshly bound socket got.
+trait LocalAddr {
+    fn port(&self) -> io::Result<u16>;
+}
+
+impl LocalAddr for UdpSocket {
+    fn port(&self) -> io::Result<u16> {
+        Ok(self.local_addr()?.port())
+    }
+}
+
+impl LocalAddr for TcpListener {
+    fn port(&self) -> io::Result<u16> {
+        Ok(self.local_addr()?.port())
     }
 }
 
