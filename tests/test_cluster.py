@@ -244,3 +244,39 @@ async def test_calls_before_start_explain_themselves() -> None:
     assert "not started" in repr(cluster)
     with pytest.raises(TypeError):
         kinship.Cluster({"bind": "127.0.0.1:0"})  # type: ignore[arg-type]
+
+
+async def test_two_live_nodes_with_one_name_both_see_the_conflict() -> None:
+    """A second node that takes a live member's name at another address never takes it over:
+    both claimants report NameConflict with the other's address, matched as the README does."""
+    async with kinship.Cluster(local(name="box")) as a:
+        a_events = a.events()
+        async with kinship.Cluster(local(name="box")) as b:
+            b_events = b.events()
+            assert await b.join([a.local.addr]) == 1
+            seen = {}
+            for cluster, events in ((a, a_events), (b, b_events)):
+                event = await next_matching(events, kinship.NameConflict)
+                match event:
+                    case kinship.NameConflict(member=m, other_addr=addr):
+                        assert m.name == "box" and m.addr == cluster.local.addr
+                        seen[cluster.local.addr] = addr
+                    case _:
+                        pytest.fail("match_args do not match the README example")
+            assert seen == {a.local.addr: b.local.addr, b.local.addr: a.local.addr}
+            # Neither applied the other's Alive: each still holds the name at its own address.
+            assert a.member("box") == a.local and b.member("box") == b.local
+            assert names(a) == {"box"}
+
+
+async def test_an_actor_panic_ends_the_event_iterator_with_kinship_closed() -> None:
+    a = await kinship.Cluster(local()).start()
+    events = a.events()
+    a._node._panic_actor()  # type: ignore[union-attr,attr-defined]  # private hook, not in the stubs
+    with pytest.raises(kinship.KinshipClosed):
+        await next_event(events)
+    with pytest.raises(kinship.KinshipClosed):
+        await next_event(a.events())
+    with pytest.raises(kinship.KinshipClosed):
+        await a.set_meta({"k": "v"})
+    await a.close()  # closing a failed cluster does not raise
