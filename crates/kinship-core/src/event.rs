@@ -3,6 +3,8 @@
 use core::fmt;
 use core::net::SocketAddr;
 
+use kinship_proto::Key;
+
 use crate::member::Member;
 
 /// Names one [`Command`], so its [`Event::CommandDone`] can be matched to it.
@@ -32,6 +34,14 @@ pub enum Command {
     Leave,
     /// Replace this node's metadata, at most `max_meta_bytes`.
     SetMeta(Vec<u8>),
+    /// Let this node decrypt with `key`, as well as the keys it has. Does nothing if it is
+    /// already installed. Acts on this node only.
+    InstallKey(Key),
+    /// Encrypt with the installed `key` from now on; every installed key still decrypts.
+    UseKey(Key),
+    /// Forget `key`. Refused for the key in use and for the last key; does nothing if it is not
+    /// installed.
+    RemoveKey(Key),
 }
 
 /// What a [`Command`] that succeeded produced.
@@ -56,6 +66,14 @@ pub enum CommandError {
     JoinFailed,
     /// This node has left the cluster.
     Left,
+    /// A key command on a node that runs without encryption.
+    NotEncrypted,
+    /// [`Command::UseKey`] for a key that is not installed.
+    KeyNotInstalled,
+    /// [`Command::RemoveKey`] for the key this node encrypts with.
+    KeyInUse,
+    /// [`Command::RemoveKey`] for the only installed key.
+    LastKey,
 }
 
 impl fmt::Display for CommandError {
@@ -64,6 +82,10 @@ impl fmt::Display for CommandError {
             Self::MetaTooLarge => f.write_str("metadata larger than max_meta_bytes"),
             Self::JoinFailed => f.write_str("no seed answered"),
             Self::Left => f.write_str("this node has left the cluster"),
+            Self::NotEncrypted => f.write_str("this node runs without encryption and has no keys"),
+            Self::KeyNotInstalled => f.write_str("key is not installed"),
+            Self::KeyInUse => f.write_str("key is the one in use"),
+            Self::LastKey => f.write_str("key is the last one installed"),
         }
     }
 }
