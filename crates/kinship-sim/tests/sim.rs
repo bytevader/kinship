@@ -329,6 +329,48 @@ fn starved_node_reads_packets_late_but_keeps_its_timers() {
 }
 
 #[test]
+fn a_clock_jump_brings_timers_due_at_once_until_a_restart() {
+    let tcp = Action::Command {
+        node: 1,
+        cmd: EchoCommand::TcpPing { to: 0 },
+    };
+    let scenario = Scenario::new(2)
+        .duration(secs(5))
+        .link(LinkConfig::ideal())
+        .at(
+            secs(1),
+            Action::ClockJump {
+                node: 1,
+                by: secs(2),
+            },
+        )
+        .at(secs(2), tcp)
+        .at(secs(3), Action::Restart(1));
+    let sim = run(5, scenario, fast_echo());
+    let sends = |from: usize, during: std::ops::Range<Instant>| {
+        sim.trace()
+            .records
+            .iter()
+            .filter(|r| matches!(**r, Record::Send { t, from: f, .. } if f == from && during.contains(&t)))
+            .count()
+    };
+    // Two seconds of 100 ms pings fall due the moment the clock jumps.
+    assert!(sends(1, at(secs(1))..at(ms(1001))) >= 20);
+    // Then it pings and answers at the usual pace, and a restarted node is back on the shared
+    // clock: no burst.
+    let second = at(ms(1500))..at(ms(2500));
+    assert!(sends(1, second.clone()).abs_diff(sends(0, second)) <= 3);
+    assert!(sends(1, at(secs(3))..at(ms(3100))) <= 3);
+    // Both ends of every exchange agree on the time: on an ideal link nothing takes any.
+    let rtts: Vec<u64> = event_values(&sim)
+        .iter()
+        .filter_map(|e| e["rtt"].as_u64())
+        .collect();
+    assert!(rtts.len() > 50 && rtts.iter().all(|&r| r == 0), "{rtts:?}");
+    assert!(event_values(&sim).iter().any(|e| e["type"] == "tcp_echoed"));
+}
+
+#[test]
 fn crashed_node_is_silent_until_restarted() {
     let scenario = Scenario::new(3)
         .duration(secs(6))

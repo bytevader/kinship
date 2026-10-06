@@ -259,6 +259,11 @@ pub enum Action<C> {
     /// Lifeguard paper's slow-node experiments, where Acks are read only after the probe timed
     /// out. `None` makes the node fast again.
     Starve { node: usize, delay: Option<Delay> },
+    /// Move `node`'s clock forward by `by`, as a suspend or a VM migration can: from now on the
+    /// node sees every instant `by` later than the rest of the cluster, so its timers fall due
+    /// at once and fire before any packet still in flight reaches it. Jumps add up; a restart
+    /// starts the node on the shared clock again.
+    ClockJump { node: usize, by: Duration },
     /// Kill the node: it loses all state, and its connections fail.
     Crash(usize),
     /// Start a fresh instance of the node, with a new seed. A running node is crashed first.
@@ -278,6 +283,7 @@ impl<C> Action<C> {
             Action::Pause { node, duration } => format!("pause {node} for {duration:?}"),
             Action::Slow { node, cost } => format!("slow {node} {cost:?}"),
             Action::Starve { node, delay } => format!("starve {node} {delay:?}"),
+            Action::ClockJump { node, by } => format!("clock_jump {node} by {by:?}"),
             Action::Crash(node) => format!("crash {node}"),
             Action::Restart(node) => format!("restart {node}"),
             Action::Command { node, .. } => format!("command {node}"),
