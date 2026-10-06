@@ -28,12 +28,12 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 pub use events::{Event, Events};
 pub use kinship_core::{
-    CommandError, Config, ConfigError, Identity, Key, KeyError, Limits, Member, Metrics, Security,
-    State, WIRE_VERSION,
+    CommandError, Config, ConfigError, Identity, Key, KeyError, KeyId, Limits, Member, Metrics,
+    Security, State, WIRE_VERSION,
 };
 pub use transport::{TokioTransport, Transport, default_advertise};
 
-use crate::actor::{Actor, Clock, Request, Shared, Snapshot};
+use crate::actor::{Actor, Clock, KeyChange, Request, Shared, Snapshot};
 use crate::events::Hub;
 
 /// Everything a node needs that the transport does not decide.
@@ -118,6 +118,14 @@ pub enum Error {
     Timeout,
     /// The node was closed, or its actor stopped.
     Closed,
+    /// A keyring call on a node that runs without encryption.
+    NotEncrypted,
+    /// `use` of a key that is not installed.
+    KeyNotInstalled,
+    /// `remove` of the key the node encrypts with.
+    KeyInUse,
+    /// `remove` of the only installed key.
+    LastKey,
 }
 
 impl fmt::Display for Error {
@@ -130,6 +138,10 @@ impl fmt::Display for Error {
             Self::Left => f.write_str("this node has left the cluster"),
             Self::Timeout => f.write_str("timed out"),
             Self::Closed => f.write_str("the node is closed"),
+            Self::NotEncrypted => f.write_str("this node runs without encryption and has no keys"),
+            Self::KeyNotInstalled => f.write_str("key is not installed"),
+            Self::KeyInUse => f.write_str("key is the one in use"),
+            Self::LastKey => f.write_str("key is the last one installed"),
         }
     }
 }
@@ -162,6 +174,10 @@ impl From<CommandError> for Error {
             CommandError::MetaTooLarge => Self::MetaTooLarge,
             CommandError::JoinFailed => Self::JoinFailed,
             CommandError::Left => Self::Left,
+            CommandError::NotEncrypted => Self::NotEncrypted,
+            CommandError::KeyNotInstalled => Self::KeyNotInstalled,
+            CommandError::KeyInUse => Self::KeyInUse,
+            CommandError::LastKey => Self::LastKey,
             _ => Self::Closed,
         }
     }
@@ -222,6 +238,7 @@ impl Memberlist {
         tracing::info!(name = node.local().name, addr = %advertise, bind = %local_addr, "node started");
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(Snapshot::of(&node)),
+            key_ids: ArcSwap::from_pointee(node.key_ids()),
             stats: Mutex::default(),
             hub: Hub::new(settings.event_buffer),
         });
@@ -285,6 +302,14 @@ impl Memberlist {
     /// Protocol counters and the local health score.
     pub fn stats(&self) -> Stats {
         self.shared.stats().clone()
+    }
+
+    /// Changes this node's keys at runtime. See [`Keyring`].
+    pub fn keyring(&self) -> Keyring {
+        Keyring {
+            requests: self.requests.clone(),
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Push-pulls with every seed, retrying failed ones with backoff until one answers, and
@@ -359,6 +384,71 @@ impl Memberlist {
 
     fn task(&self) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
         self.task.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Runtime key rotation for one node, from [`Memberlist::keyring`].
+///
+/// Every call acts on this node only. To rotate a cluster, run each step on every node and wait
+/// for it to finish everywhere before starting the next:
+///
+/// 1. [`install`](Self::install) the new key, so every node can read it;
+/// 2. [`use_key`](Self::use_key) it, so every node sends with it;
+/// 3. [`remove`](Self::remove) the old key.
+///
+/// A node that falls a step behind looks dead to its peers until it catches up, and they count
+/// what they dropped as `decrypt_failures` in [`Stats`]. A node that runs without encryption
+/// refuses every call with [`Error::NotEncrypted`]. Key ids are safe to log; key bytes never are.
+///
+/// A handle is cheap to clone and keeps working only while the node runs: calls on a closed node
+/// fail with [`Error::Closed`].
+#[derive(Clone)]
+pub struct Keyring {
+    requests: mpsc::Sender<Request>,
+    shared: Arc<Shared>,
+}
+
+impl Keyring {
+    /// Adds `key` to the keys this node can decrypt with. Does nothing if it is installed.
+    pub async fn install(&self, key: Key) -> Result<(), Error> {
+        self.change(KeyChange::Install(key)).await
+    }
+
+    /// Makes the installed `key` the one this node encrypts with. Every installed key still
+    /// decrypts. Fails with [`Error::KeyNotInstalled`] for a key that was never installed.
+    ///
+    /// Named `use_key` because `use` is a Rust keyword; Python spells it `use`.
+    pub async fn use_key(&self, key: Key) -> Result<(), Error> {
+        self.change(KeyChange::Use(key)).await
+    }
+
+    /// Drops `key`. Fails with [`Error::KeyInUse`] for the key this node encrypts with and
+    /// [`Error::LastKey`] for the only one; a key that is not installed is already gone.
+    pub async fn remove(&self, key: Key) -> Result<(), Error> {
+        self.change(KeyChange::Remove(key)).await
+    }
+
+    /// The ids of the installed keys, the one this node encrypts with first. Empty when the node
+    /// runs without encryption. Never waits on the actor.
+    pub fn key_ids(&self) -> Vec<KeyId> {
+        self.shared.key_ids.load().as_ref().clone()
+    }
+
+    async fn change(&self, change: KeyChange) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.requests
+            .send(Request::Keyring { change, reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.unwrap_or(Err(Error::Closed))
+    }
+}
+
+impl fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Keyring")
+            .field("key_ids", &self.key_ids())
+            .finish()
     }
 }
 

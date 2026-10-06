@@ -71,7 +71,15 @@ impl TokioTransport {
         }
         let mut last = None;
         for _ in 0..BIND_ATTEMPTS {
-            let udp = udp_socket(addr)?;
+            // Under load Windows sometimes refuses even a bind to port 0 with access denied.
+            let udp = match udp_socket(addr) {
+                Ok(udp) => udp,
+                Err(e) if is_conflict(&e) => {
+                    last = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let addr = SocketAddr::new(addr.ip(), udp.local_addr()?.port());
             match tcp_listener(addr) {
                 Ok(tcp) => return Ok(Self { udp, tcp, addr }),

@@ -37,8 +37,8 @@ pub use config::{Config, DEFAULT_PORT};
 /// The protocol half of [`Config`], from `kinship-core`.
 pub use kinship_net::Config as CoreConfig;
 pub use kinship_net::{
-    ConfigError, Error, Event, Events, Key, KeyError, Member, Metrics, State, Stats,
-    TokioTransport, Transport, WIRE_VERSION, mem,
+    ConfigError, Error, Event, Events, Key, KeyError, KeyId, Keyring, Member, Metrics, State,
+    Stats, TokioTransport, Transport, WIRE_VERSION, mem,
 };
 
 use kinship_net::Memberlist;
@@ -117,6 +117,13 @@ impl Cluster {
     /// Protocol counters and the local health score.
     pub fn stats(&self) -> Stats {
         self.inner.stats()
+    }
+
+    /// Changes this node's keys at runtime: `install`, `use_key`, `remove` and `key_ids`. Each
+    /// step acts on this node only, so run it on every node before starting the next; see
+    /// [`Keyring`].
+    pub fn keyring(&self) -> Keyring {
+        self.inner.keyring()
     }
 
     /// Tells the cluster this node is leaving and waits, up to `timeout`, for the news to
