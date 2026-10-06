@@ -1,0 +1,27 @@
+[package]
+name = "kinship-chaos"
+description = "Chaos runs and detection latency for kinship on real sockets, in Linux network namespaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+kinship = { path = "../../crates/kinship" }
+serde_json = "1"
+tokio = { version = "1.47", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[[bin]]
+name = "chaos"
+path = "src/main.rs"
+
+[[bin]]
+name = "chaos-node"
+path = "src/bin/chaos-node.rs"
+
+[lints]
+workspace = true

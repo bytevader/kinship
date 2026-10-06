@@ -319,6 +319,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinship-chaos"
+version = "0.0.0"
+dependencies = [
+ "kinship",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kinship-core"
 version = "0.0.0"
 dependencies = [
