@@ -14,6 +14,7 @@ uv sync                                       # creates .venv with maturin, pyte
 uv run maturin develop                        # builds and installs the extension (abi3)
 uv run maturin develop --no-default-features  # same, without abi3 (needed on free-threaded 3.14t)
 uv run pytest
+uv run maturin develop --features test-hooks  # adds the private panic hook tests/test_panic.py needs
 uv run ruff check . && uv run ruff format --check .
 
 pre-commit run --all-files                    # ruff, ruff format, cargo fmt, clippy

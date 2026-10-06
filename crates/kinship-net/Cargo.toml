@@ -9,7 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# Not part of the API: `Memberlist::panic_actor`, which kinship-py's tests reach from Python.
+# Not part of the API: `Memberlist::panic_actor`, which kinship-py's test-hooks feature
+# exposes to its tests.
 test-hooks = []
 
 [dependencies]

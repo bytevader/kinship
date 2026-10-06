@@ -267,16 +267,3 @@ async def test_two_live_nodes_with_one_name_both_see_the_conflict() -> None:
             # Neither applied the other's Alive: each still holds the name at its own address.
             assert a.member("box") == a.local and b.member("box") == b.local
             assert names(a) == {"box"}
-
-
-async def test_an_actor_panic_ends_the_event_iterator_with_kinship_closed() -> None:
-    a = await kinship.Cluster(local()).start()
-    events = a.events()
-    a._node._panic_actor()  # type: ignore[union-attr,attr-defined]  # private hook, not in the stubs
-    with pytest.raises(kinship.KinshipClosed):
-        await next_event(events)
-    with pytest.raises(kinship.KinshipClosed):
-        await next_event(a.events())
-    with pytest.raises(kinship.KinshipClosed):
-        await a.set_meta({"k": "v"})
-    await a.close()  # closing a failed cluster does not raise

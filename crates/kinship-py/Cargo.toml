@@ -18,10 +18,12 @@ default = ["abi3"]
 # abi3 wheels cover CPython 3.11+; the free-threaded 3.14t build turns this off.
 abi3 = ["pyo3/abi3-py311"]
 extension-module = ["pyo3/extension-module"]
+# Not for release wheels: adds a private `Node._panic_actor` for tests/test_panic.py. CI
+# builds a second wheel with it to run that test; the stubs and README leave it out.
+test-hooks = ["kinship-net/test-hooks"]
 
 [dependencies]
-# test-hooks adds a private `Node._panic_actor`, which the pytest suite uses and the stubs omit.
-kinship-net = { workspace = true, features = ["test-hooks"] }
+kinship-net.workspace = true
 kinship-proto.workspace = true
 pyo3 = "0.29"
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }

@@ -568,7 +568,8 @@ impl Node {
     }
 
     /// Not part of the API, and absent from the stubs: makes the node's actor panic, for the
-    /// tests of how a failed node reports itself.
+    /// tests of how a failed node reports itself. Only in builds with `test-hooks`.
+    #[cfg(feature = "test-hooks")]
     #[pyo3(name = "_panic_actor")]
     fn panic_actor(&self, py: Python<'_>) -> PyResult<()> {
         self.get(py)?.ml.panic_actor();
