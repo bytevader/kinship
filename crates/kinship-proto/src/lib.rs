@@ -19,14 +19,14 @@ mod stream;
 pub mod tags;
 mod wire;
 
-pub use error::{ConfigError, DecodeError, EncodeError, KeyError};
+pub use error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 pub use limits::Limits;
 pub use message::{
     Alive, Dead, Message, Messages, NodeId, Payload, Ping, PingReq, PushPull, Record, RecordIter,
     Records, State, Suspect, kind,
 };
 pub use packet::{
-    Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, Key, MAGIC, MAX_LABEL_LEN, NONCE_LEN,
+    Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, Key, KeyId, MAGIC, MAX_LABEL_LEN, NONCE_LEN,
     PLAINTEXT_HEADER_LEN, PacketKind, TAG_LEN, WIRE_VERSION,
 };
 pub use stream::FrameReader;
