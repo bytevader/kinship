@@ -1,0 +1,10 @@
+# The core reads no clock at all: every instant comes from its driver as `now`, which drivers
+# take from a monotonic clock. A wall clock here would let an NTP step or a suspend move timers.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "the core reads no clock; use the `now` the driver passes in" },
+    { path = "std::time::SystemTime", reason = "wall-clock time can jump; use the `now` the driver passes in" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "the core reads no clock; use the `now` the driver passes in" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time can jump; use the `now` the driver passes in" },
+]
