@@ -8,6 +8,7 @@ members = [
     "crates/kinship-net",
     "crates/kinship-py",
     "crates/kinship",
+    "tools/chaos",
 ]
 
 [workspace.package]

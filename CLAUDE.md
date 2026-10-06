@@ -18,6 +18,8 @@ uv run maturin develop --features test-hooks  # adds the private panic hook test
 uv run ruff check . && uv run ruff format --check .
 
 pre-commit run --all-files                    # ruff, ruff format, cargo fmt, clippy
+
+target/release/chaos run --nodes 5            # Linux only, root through sudo -n or CHAOS_SUDO; see tools/chaos/README.md
 ```
 
 ## Layout
@@ -29,6 +31,8 @@ pre-commit run --all-files                    # ruff, ruff format, cargo fmt, cl
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`
 - `crates/kinship`: public Rust facade
 - `python/kinship`: Python package, `tests/`: pytest
+- `tools/chaos`: chaos harness on real sockets in Linux network namespaces (tc netem, nftables), and the detection-latency bench
+- `tools/memberlist-bench`: Go node running hashicorp/memberlist for that bench
 
 ## Rules
 
