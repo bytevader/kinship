@@ -21,4 +21,8 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 kinship-net.workspace = true
+kinship-proto.workspace = true
 pyo3 = "0.29"
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1.41"

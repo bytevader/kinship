@@ -163,7 +163,7 @@ Pick a preset and override fields by name. Presets differ only in timing.
 | `Config.local()` | Tests, demos, the visualizer | probes every 200 ms, loopback only, plaintext allowed, no TCP fallback ping |
 
 ```python
-cfg = kinship.Config.wan(keys=[key], probe_interval=3.0)
+cfg = kinship.Config.wan(keys=[key], probe_interval=4.0)
 cfg2 = cfg.replace(name="edge-12")    # configs are frozen
 ```
 
