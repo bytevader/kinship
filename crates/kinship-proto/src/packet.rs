@@ -123,6 +123,32 @@ impl Key {
         out
     }
 
+    /// The key as padded standard base64, the form [`from_base64`](Self::from_base64) reads and
+    /// `kinship keygen` prints. The text is the secret itself: never log it.
+    pub fn to_base64(&self) -> String {
+        const DIGITS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(44);
+        for chunk in self.0.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let mut group = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(DIGITS[(group >> 18) as usize & 63] as char);
+                } else {
+                    out.push('=');
+                }
+                group <<= 6;
+            }
+            group.zeroize();
+        }
+        out
+    }
+
     /// First 4 bytes of BLAKE3(key), big-endian. Sent in the clear to pick the right key.
     pub fn id(&self) -> u32 {
         let hash = blake3::hash(&self.0);

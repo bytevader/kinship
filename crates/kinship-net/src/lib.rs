@@ -183,6 +183,37 @@ impl From<CommandError> for Error {
     }
 }
 
+/// A new random key: 32 bytes from the operating system's secure random source.
+///
+/// Give the same key to every node. Print it with [`Key::to_base64`] to hand it out, as
+/// `python -m kinship keygen` does; never derive a key from a passphrase or a seeded RNG.
+pub fn generate_key() -> io::Result<Key> {
+    let mut bytes = [0u8; Key::LEN];
+    let drawn = getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()));
+    let key = drawn.map(|()| Key::from_bytes(bytes));
+    zeroize::Zeroize::zeroize(&mut bytes);
+    key
+}
+
+/// A node name for when none is configured: the host name plus 6 random hex characters, within
+/// the 64-byte limit. Set a stable name instead if the node should keep its identity across
+/// restarts.
+pub fn default_name() -> String {
+    let host = ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "kinship".to_owned());
+    let mut end = host.len().min(57);
+    while !host.is_char_boundary(end) {
+        end -= 1;
+    }
+    let suffix = getrandom::u32().unwrap_or_default() & 0xff_ffff;
+    format!("{}-{suffix:06x}", &host[..end])
+}
+
 /// Requests queued for the actor before senders wait.
 const REQUEST_QUEUE: usize = 256;
 
@@ -479,5 +510,20 @@ mod tests {
     #[test]
     fn exposes_wire_version() {
         assert_eq!(WIRE_VERSION, 1);
+    }
+
+    #[test]
+    fn default_names_are_valid_and_distinct() {
+        let a = default_name();
+        assert!(!a.is_empty() && a.len() <= 64, "{a}");
+        assert_ne!(a, default_name());
+    }
+
+    #[test]
+    fn generated_keys_are_random_and_round_trip() {
+        let a = generate_key().unwrap();
+        let b = generate_key().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(Key::from_base64(&a.to_base64()), Ok(a));
     }
 }

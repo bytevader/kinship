@@ -553,8 +553,9 @@ impl<T: Transport> Actor<T> {
 }
 
 impl<T: Transport> Drop for Actor<T> {
-    /// Runs on close, on abort and on a panic alike, so subscribers always see the end.
+    /// Runs on close, on abort and on a panic alike, so subscribers always see the end, and
+    /// learn whether it came from a panic.
     fn drop(&mut self) {
-        self.shared.hub.close();
+        self.shared.hub.close(std::thread::panicking());
     }
 }

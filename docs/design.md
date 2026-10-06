@@ -328,7 +328,7 @@ flowchart LR
 
 ### The runtime thread
 
-- kinship builds one tokio runtime per process on first use, with one worker thread by default (runtime_threads to change it), and registers it with pyo3-async-runtimes so that future_into_py resolves on it.
+- kinship builds one tokio runtime per process on first use, with one worker thread by default (runtime_threads from the first config to start a node; later values are ignored with a warning), and registers it with pyo3-async-runtimes as a generic runtime, so that future_into_py resolves on it. Its threads are named kinship-io.
 - Each Memberlist spawns one actor task. Its loop is a tokio::select over the UDP socket, accepted TCP frames, the command channel, and a sleep until node.poll_timeout(). After each input it drains poll_transmit and poll_event.
 - Whatever woke it, the actor reads every datagram and stream frame already waiting before it lets a due timer fire. The Lifeguard sim showed that a node reading its Acks after its own probe timer falsely suspects healthy peers; `crates/kinship-net/tests/flood.rs` floods a frozen actor to hold it to this.
 - The Rust `Cluster` runs its actor on the caller's tokio runtime; the kinship-owned runtime thread above is what kinship-py starts.
@@ -414,7 +414,7 @@ async def main() -> None:
 - The pyclasses are frozen and Send + Sync, with no reliance on the GIL, so the same code is correct on free-threaded CPython 3.13t and later.
 - shutdown() stops the actor and closes sockets. A Memberlist garbage-collected without shutdown stops its actor from Drop and logs a warning.
 - A panic inside the actor is caught. Pending calls and the next call raise KinshipClosed, and the events iterator ends with that error.
-- The runtime does not survive os.fork. kinship records the creating PID and raises in a child process instead of hanging.
+- The runtime does not survive os.fork. kinship records the creating PID and raises KinshipClosed in a child process instead of hanging; a cluster the child creates after the fork gets a runtime of its own.
 - Logs go through tracing. By default they print to stderr from Rust. The opt-in bridge to Python logging drains a ring buffer from an asyncio task, so a log line never makes the protocol thread wait for the GIL.
 
 ## Metadata broadcast
@@ -483,7 +483,7 @@ Users pick a preset and override a few fields; the timing defaults start from me
 
 Keys can be rotated at runtime with the commands InstallKey, UseKey and RemoveKey (`cluster.keyring.install / use / remove`, `use_key` in Rust), which act on the local node only, as in Serf. Installing a key already installed does nothing; using a key that is not installed, removing the key in use or the last key, and any of these on a plaintext node, are refused; removing a key that is not installed is a no-op. Key ids print as 8 hex characters and key bytes are never logged. Rotation across a cluster is: install the new key everywhere, switch the primary everywhere, then remove the old key. Leave a gap between steps for packets already in flight to land: a node that removes a key while a peer still has packets sealed with it on the wire counts them as decrypt_failures.
 
-Key generation is not part of the keyring, which only takes keys it is given, and no generator exists yet. A key is 32 bytes from the operating system's secure random source (the `getrandom` crate, as for the node seed), never from a passphrase or a seeded RNG. kinship-proto draws no randomness, so the generator is a free function `generate_key()` in kinship-net, re-exported by the kinship crate, and `python -m kinship keygen` prints it as base64. Both are part of the Python package task.
+Key generation is not part of the keyring, which only takes keys it is given. A key is 32 bytes from the operating system's secure random source (the `getrandom` crate, as for the node seed), never from a passphrase or a seeded RNG. kinship-proto draws no randomness, so the generator is a free function `generate_key()` in kinship-net, re-exported by the kinship crate, and `python -m kinship keygen` prints it as base64 with `Key::to_base64`.
 
 ### Failure detection
 
