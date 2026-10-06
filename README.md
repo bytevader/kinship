@@ -354,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`.
+The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`.
 
 The `kinship-agent` example joins a cluster from seeds on the command line and logs every event until Ctrl-C, when it leaves:
 
