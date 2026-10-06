@@ -38,7 +38,7 @@ pub use config::{Config, DEFAULT_PORT};
 pub use kinship_net::Config as CoreConfig;
 pub use kinship_net::{
     ConfigError, Error, Event, Events, Key, KeyError, KeyId, Keyring, Member, Metrics, State,
-    Stats, TokioTransport, Transport, WIRE_VERSION, mem,
+    Stats, TokioTransport, Transport, WIRE_VERSION, generate_key, mem,
 };
 
 use kinship_net::Memberlist;

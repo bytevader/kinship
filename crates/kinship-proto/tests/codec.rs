@@ -321,7 +321,15 @@ fn keys_parse_from_base64() {
     let text = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
     assert_eq!(Key::from_base64(text), Ok(want.clone()));
     assert_eq!(Key::from_base64(&format!(" {text}\n")), Ok(want.clone()));
-    assert_eq!(Key::from_base64(text.trim_end_matches('=')), Ok(want));
+    assert_eq!(
+        Key::from_base64(text.trim_end_matches('=')),
+        Ok(want.clone())
+    );
+    assert_eq!(want.to_base64(), text);
+    for fill in [0x00, 0xff, 0x5a] {
+        let key = Key::from_bytes([fill; 32]);
+        assert_eq!(Key::from_base64(&key.to_base64()), Ok(key));
+    }
 
     let short = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     let long = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

@@ -79,6 +79,7 @@ pub(crate) struct Hub {
 struct HubState {
     subs: Vec<Weak<Sub>>,
     closed: bool,
+    failed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +93,8 @@ struct Queue {
     events: VecDeque<Event>,
     lost: u64,
     closed: bool,
+    /// The node stopped because its actor failed, not because it was closed.
+    failed: bool,
 }
 
 impl Hub {
@@ -108,7 +111,9 @@ impl Hub {
         let sub = Arc::new(Sub::default());
         let mut hub = lock(&self.inner);
         if hub.closed {
-            lock(&sub.queue).closed = true;
+            let mut q = lock(&sub.queue);
+            q.closed = true;
+            q.failed = hub.failed;
         } else {
             hub.subs.push(Arc::downgrade(&sub));
         }
@@ -141,11 +146,16 @@ impl Hub {
     }
 
     /// Ends every subscription once its queued events are read, including later ones.
-    pub fn close(&self) {
+    /// `failed` says the node stopped on an error rather than being closed.
+    pub fn close(&self, failed: bool) {
         let mut hub = lock(&self.inner);
         hub.closed = true;
+        hub.failed = failed;
         for sub in hub.subs.drain(..).filter_map(|w| w.upgrade()) {
-            lock(&sub.queue).closed = true;
+            let mut q = lock(&sub.queue);
+            q.closed = true;
+            q.failed = failed;
+            drop(q);
             sub.notify.notify_one();
         }
     }
@@ -186,6 +196,12 @@ impl Events {
     pub fn is_closed(&self) -> bool {
         let q = lock(&self.sub.queue);
         q.closed && q.lost == 0 && q.events.is_empty()
+    }
+
+    /// True if the node stopped because its actor failed rather than because it was closed.
+    /// Once [`recv`](Self::recv) has returned `None`, this tells a clean end from an error.
+    pub fn failed(&self) -> bool {
+        lock(&self.sub.queue).failed
     }
 
     fn next(&self) -> Next {
@@ -240,11 +256,25 @@ mod tests {
         assert_eq!(b.try_recv(), Some(joined(2)));
         assert_eq!(b.try_recv(), None);
         assert!(!b.is_closed());
-        hub.close();
+        hub.close(false);
         hub.publish(&[joined(3)]);
         assert_eq!(a.recv().await, None);
         assert!(b.is_closed());
+        assert!(!a.failed() && !b.failed());
         assert_eq!(hub.subscribe().recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_marks_current_and_later_subscriptions() {
+        let hub = Hub::new(4);
+        let mut early = hub.subscribe();
+        hub.publish(&[joined(0)]);
+        hub.close(true);
+        assert_eq!(early.recv().await, Some(joined(0)));
+        assert_eq!(early.recv().await, None);
+        assert!(early.failed());
+        let late = hub.subscribe();
+        assert!(late.is_closed() && late.failed());
     }
 
     #[tokio::test]

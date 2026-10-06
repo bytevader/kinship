@@ -264,7 +264,7 @@ impl Config {
             });
         };
         core.validate()?;
-        let name = self.name.unwrap_or_else(default_name);
+        let name = self.name.unwrap_or_else(kinship_net::default_name);
         // Checks the name the same way the node will, before any socket opens.
         kinship_net::Identity::new(name.as_str(), self.bind)?;
         let settings = Settings {
@@ -291,23 +291,6 @@ impl Default for Config {
     fn default() -> Self {
         Self::lan()
     }
-}
-
-/// The host name plus 6 random hex characters, within the 64-byte name limit.
-fn default_name() -> String {
-    let host = ["HOSTNAME", "COMPUTERNAME"]
-        .iter()
-        .find_map(|v| std::env::var(v).ok())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|h| h.trim().to_owned())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "kinship".to_owned());
-    let mut end = host.len().min(57);
-    while !host.is_char_boundary(end) {
-        end -= 1;
-    }
-    let suffix = getrandom::u32().unwrap_or_default() & 0xff_ffff;
-    format!("{}-{suffix:06x}", &host[..end])
 }
 
 #[cfg(test)]
@@ -366,12 +349,5 @@ mod tests {
         let plain = cfg.without_lifeguard();
         let core = plain.core();
         assert!(!core.local_health && !core.nacks && !core.dynamic_suspicion && !core.buddy_system);
-    }
-
-    #[test]
-    fn default_names_are_valid_and_distinct() {
-        let a = default_name();
-        assert!(!a.is_empty() && a.len() <= 64, "{a}");
-        assert_ne!(a, default_name());
     }
 }
