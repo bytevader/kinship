@@ -483,6 +483,8 @@ Users pick a preset and override a few fields; the timing defaults start from me
 
 Keys can be rotated at runtime with the commands InstallKey, UseKey and RemoveKey (`cluster.keyring.install / use / remove`, `use_key` in Rust), which act on the local node only, as in Serf. Installing a key already installed does nothing; using a key that is not installed, removing the key in use or the last key, and any of these on a plaintext node, are refused; removing a key that is not installed is a no-op. Key ids print as 8 hex characters and key bytes are never logged. Rotation across a cluster is: install the new key everywhere, switch the primary everywhere, then remove the old key. Leave a gap between steps for packets already in flight to land: a node that removes a key while a peer still has packets sealed with it on the wire counts them as decrypt_failures.
 
+Key generation is not part of the keyring, which only takes keys it is given, and no generator exists yet. A key is 32 bytes from the operating system's secure random source (the `getrandom` crate, as for the node seed), never from a passphrase or a seeded RNG. kinship-proto draws no randomness, so the generator is a free function `generate_key()` in kinship-net, re-exported by the kinship crate, and `python -m kinship keygen` prints it as base64. Both are part of the Python package task.
+
 ### Failure detection
 
 | Field | Default | Meaning |
