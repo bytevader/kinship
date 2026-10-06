@@ -60,7 +60,18 @@ impl Observed {
         log: Log,
         knows: impl Fn(usize) -> bool,
     ) -> Self {
-        let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
+        Self::with_name(spec, &spec.name, cfg, log, knows)
+    }
+
+    /// Like [`Observed::with_config`], but calling itself `name` at the spec's address.
+    pub fn with_name(
+        spec: &NodeSpec,
+        name: &str,
+        cfg: Config,
+        log: Log,
+        knows: impl Fn(usize) -> bool,
+    ) -> Self {
+        let me = Identity::new(name, spec.addr).unwrap();
         let mut node = Node::new(cfg, me, spec.now, spec.seed).unwrap();
         for j in (0..spec.nodes).filter(|&j| j != spec.index && knows(j)) {
             node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
