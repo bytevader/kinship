@@ -1,0 +1,65 @@
+name: Detection latency
+
+# kill -9 detection latency at 100 nodes, kinship against hashicorp/memberlist, under the same
+# topology and netem. Too long for every pull request, so it runs weekly and on demand; the
+# results in docs/results/detection.md come from the same command.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Runs per implementation
+        default: "20"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  memberlist:
+    name: kill -9 detection, kinship against memberlist, 100 nodes
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: tools/memberlist-bench/go.mod
+          cache-dependency-path: tools/memberlist-bench/go.sum
+      - name: Install nftables and the netem qdisc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables
+          sudo modprobe sch_netem || {
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          }
+      - name: Build the memberlist node
+        working-directory: tools/memberlist-bench
+        run: go build -o "$RUNNER_TEMP/memberlist-node" .
+      - run: cargo build --release -p kinship-chaos
+      - name: Run the comparison
+        env:
+          RUNS: ${{ inputs.runs || '20' }}
+        run: |
+          target/release/chaos bench --nodes 100 --runs "$RUNS" --seed 14 \
+            --memberlist-bin "$RUNNER_TEMP/memberlist-node" --csv detection.csv --logs chaos-logs \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: detection
+          path: |
+            detection.csv
+            chaos-logs
