@@ -566,6 +566,15 @@ impl Node {
         let ids = self.get(py)?.ml.keyring().key_ids();
         Ok(ids.iter().map(ToString::to_string).collect())
     }
+
+    /// Not part of the API, and absent from the stubs: makes the node's actor panic, for the
+    /// tests of how a failed node reports itself. Only in builds with `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[pyo3(name = "_panic_actor")]
+    fn panic_actor(&self, py: Python<'_>) -> PyResult<()> {
+        self.get(py)?.ml.panic_actor();
+        Ok(())
+    }
 }
 
 /// One subscription to a node's events.

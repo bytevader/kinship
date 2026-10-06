@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Not part of the API: `Memberlist::panic_actor`, which kinship-py's test-hooks feature
+# exposes to its tests.
+test-hooks = []
+
 [dependencies]
 kinship-core.workspace = true
 kinship-proto.workspace = true

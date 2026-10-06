@@ -248,6 +248,39 @@ async fn a_node_alone_rejoins_its_seeds_in_the_background() {
 }
 
 #[tokio::test]
+async fn a_seed_that_is_not_a_member_is_rejoined() {
+    let net = MemNetwork::new();
+    let addr = |port| SocketAddr::from(([10, 0, 0, port], 7946));
+    let fast = |i: usize| {
+        config(i)
+            .with_rejoin_interval(Duration::from_millis(300))
+            .with_join_retries(1)
+    };
+    let b = Cluster::start_with(fast(1), net.bind(addr(2)).unwrap());
+    let b = bounded("start b", b).await.unwrap();
+    // c's seeds are a, which does not exist yet, and b: its startup join reaches only b.
+    let c = fast(2).with_seeds([addr(1), addr(2)]);
+    let c = Cluster::start_with(c, net.bind(addr(3)).unwrap());
+    let c = bounded("start c", c).await.unwrap();
+    let pair = ["n1".to_owned(), "n2".to_owned()];
+    wait_until("c joins b", || {
+        sees_alive(&b, &pair) && sees_alive(&c, &pair)
+    })
+    .await;
+
+    // a has no seeds of its own, and c is not alone: only c's rejoin of a missing seed can
+    // bring a in.
+    let a = Cluster::start_with(fast(0), net.bind(addr(1)).unwrap());
+    let a = bounded("start a", a).await.unwrap();
+    let names = ["n0".to_owned(), "n1".to_owned(), "n2".to_owned()];
+    wait_until("c rejoins its seed a", || {
+        [&a, &b, &c].iter().all(|n| sees_alive(n, &names))
+    })
+    .await;
+    close_all(&[a, b, c]).await;
+}
+
+#[tokio::test]
 async fn calls_after_close_fail_and_event_streams_end() {
     let node = bounded("start", Cluster::start(config(0))).await.unwrap();
     let mut events = node.events();

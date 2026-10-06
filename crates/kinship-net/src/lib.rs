@@ -48,7 +48,8 @@ pub struct Settings {
     pub advertise: Option<SocketAddr>,
     /// Initial metadata, at most `max_meta_bytes`.
     pub meta: Vec<u8>,
-    /// Joined on start, and rejoined every `rejoin_interval` while the node has no live members.
+    /// Joined on start, and every `rejoin_interval` each one that is not a live member is
+    /// push-pulled with again.
     pub seeds: Vec<SocketAddr>,
     /// Inbound TCP connections served at once; a new one beyond this drops the oldest.
     pub max_inbound_streams: usize,
@@ -395,6 +396,14 @@ impl Memberlist {
         self.abort.abort();
     }
 
+    /// Makes the actor panic once it reaches this request, as a bug in it would. Not part of the
+    /// API: it exists for the tests of how a failed node reports itself.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn panic_actor(&self) {
+        let _ = self.requests.try_send(Request::Panic);
+    }
+
     /// True once the node has stopped, by [`close`](Self::close), [`abort`](Self::abort) or a
     /// panic in its actor.
     pub fn is_closed(&self) -> bool {
@@ -517,6 +526,48 @@ mod tests {
         let a = default_name();
         assert!(!a.is_empty() && a.len() <= 64, "{a}");
         assert_ne!(a, default_name());
+    }
+
+    #[tokio::test]
+    async fn an_actor_panic_fails_pending_and_later_calls_and_marks_events_failed() {
+        const WAIT: Duration = Duration::from_secs(10);
+        let addr = |port: u8| SocketAddr::from(([10, 0, 0, port], 7946));
+        let net = mem::MemNetwork::new();
+        // A seed that never accepts, so a join with it waits for an answer.
+        let _silent = net.bind(addr(9)).unwrap();
+        let cfg = Config::local(Security::InsecurePlaintext);
+        let transport = net.bind(addr(1)).unwrap();
+        let ml = Memberlist::start(Settings::new(cfg, "a"), transport)
+            .await
+            .unwrap();
+        let mut events = ml.events();
+        let join = ml.join([addr(9)]);
+        tokio::pin!(join);
+        // One poll queues the join ahead of the panic.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut join)
+                .await
+                .is_err()
+        );
+
+        ml.panic_actor();
+        let pending = tokio::time::timeout(WAIT, join).await.unwrap();
+        assert!(matches!(pending, Err(Error::Closed)), "{pending:?}");
+        assert_eq!(
+            tokio::time::timeout(WAIT, events.recv()).await.unwrap(),
+            None
+        );
+        assert!(events.failed());
+        assert!(ml.is_closed());
+        let later = ml.set_meta(b"x".to_vec()).await;
+        assert!(matches!(later, Err(Error::Closed)), "{later:?}");
+        let later = ml.keyring().install(Key::from_bytes([1; 32])).await;
+        assert!(matches!(later, Err(Error::Closed)), "{later:?}");
+        assert!(
+            ml.events().failed(),
+            "a later subscription sees the failure too"
+        );
+        ml.close().await;
     }
 
     #[test]

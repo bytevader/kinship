@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["crates/kinship-proto/fuzz"]
+exclude = ["crates/kinship-proto/fuzz", "crates/kinship-core/fuzz"]
 members = [
     "crates/kinship-proto",
     "crates/kinship-core",

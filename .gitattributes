@@ -1,1 +1,2 @@
 crates/kinship-proto/fuzz/corpus/** -text
+crates/kinship-core/fuzz/corpus/** -text

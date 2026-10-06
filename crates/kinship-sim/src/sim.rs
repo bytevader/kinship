@@ -96,6 +96,8 @@ struct Slot<N: SimNode> {
     /// Raised on every crash, so packets a dead instance had queued never reach its successor.
     life: u64,
     next_inbound: u64,
+    /// How far this node's clock runs ahead of the shared one; see [`Action::ClockJump`].
+    clock: Duration,
 }
 
 struct Net {
@@ -324,6 +326,7 @@ impl<N: SimNode> Sim<N> {
                 rx_free: Instant::ZERO,
                 life: 0,
                 next_inbound: 0,
+                clock: Duration::ZERO,
             })
             .collect();
         for (node, cost) in scenario.slow {
@@ -479,6 +482,13 @@ impl<N: SimNode> Sim<N> {
                     slot.starve = delay;
                 }
             }
+            Action::ClockJump { node, by } => {
+                if let Some(slot) = self.nodes.get_mut(node) {
+                    slot.clock = slot.clock.saturating_add(by);
+                    // Its deadlines come earlier on the shared clock; reschedule the timer.
+                    self.drain(node);
+                }
+            }
             Action::Crash(node) => self.crash(node),
             Action::Restart(node) => self.restart(node),
             Action::Command { node, cmd } => self.input(node, Input::Command(cmd)),
@@ -567,6 +577,7 @@ impl<N: SimNode> Sim<N> {
 
     fn process(&mut self, node: usize, input: Input<N::Command>) {
         let now = self.now;
+        let local = now + self.nodes[node].clock;
         match input {
             Input::Datagram {
                 from,
@@ -582,25 +593,25 @@ impl<N: SimNode> Sim<N> {
                     packet,
                     to: node,
                 });
-                n.handle_datagram(now, from, &payload);
+                n.handle_datagram(local, from, &payload);
             }
             Input::Timeout => {
                 let Some(n) = self.nodes[node].node.as_mut() else {
                     return;
                 };
-                if n.poll_timeout().is_none_or(|d| d > now) {
+                if n.poll_timeout().is_none_or(|d| d > local) {
                     return;
                 }
                 self.rec.stats.timeouts += 1;
                 self.rec
                     .push(self.rec.cfg.timers, || Record::Timeout { t: now, node });
-                n.handle_timeout(now);
+                n.handle_timeout(local);
             }
             Input::Command(cmd) => {
                 let Some(n) = self.nodes[node].node.as_mut() else {
                     return;
                 };
-                let id = n.command(now, cmd);
+                let id = n.command(local, cmd);
                 self.rec.stats.commands += 1;
                 self.rec
                     .push(self.rec.cfg.events, || Record::Command { t: now, node, id });
@@ -629,7 +640,8 @@ impl<N: SimNode> Sim<N> {
         while let Some(e) = n.poll_event() {
             self.rec.event(now, node, &e);
         }
-        let deadline = n.poll_timeout();
+        // The node's deadlines are on its own clock; the queue runs on the shared one.
+        let deadline = n.poll_timeout().map(|d| behind(d, slot.clock));
         if deadline != slot.timer {
             slot.timer = deadline;
             slot.timer_gen += 1;
@@ -908,7 +920,9 @@ impl<N: SimNode> Sim<N> {
             end.known = true;
         }
         let id = end.id;
-        let Some(n) = self.nodes[node].node.as_mut() else {
+        let slot = &mut self.nodes[node];
+        let local = now + slot.clock;
+        let Some(n) = slot.node.as_mut() else {
             return;
         };
         for frame in &frames {
@@ -920,7 +934,7 @@ impl<N: SimNode> Sim<N> {
                 len: frame.len(),
                 hash: fnv1a(frame),
             });
-            n.handle_stream(now, id, StreamEvent::Frame(frame));
+            n.handle_stream(local, id, StreamEvent::Frame(frame));
         }
         if framing_failed {
             self.fail_conn(conn);
@@ -948,7 +962,9 @@ impl<N: SimNode> Sim<N> {
         if !known {
             return;
         }
-        let Some(n) = self.nodes[node].node.as_mut() else {
+        let slot = &mut self.nodes[node];
+        let local = now + slot.clock;
+        let Some(n) = slot.node.as_mut() else {
             return;
         };
         if failed {
@@ -958,7 +974,7 @@ impl<N: SimNode> Sim<N> {
                     node,
                     conn: id,
                 });
-            n.handle_stream(now, id, StreamEvent::Failed);
+            n.handle_stream(local, id, StreamEvent::Failed);
         } else {
             self.rec
                 .push(self.rec.cfg.streams, || Record::StreamClosed {
@@ -966,7 +982,7 @@ impl<N: SimNode> Sim<N> {
                     node,
                     conn: id,
                 });
-            n.handle_stream(now, id, StreamEvent::Closed);
+            n.handle_stream(local, id, StreamEvent::Closed);
         }
     }
 
@@ -1018,8 +1034,16 @@ impl<N: SimNode> Sim<N> {
         let slot = &mut self.nodes[node];
         slot.node = Some(fresh);
         slot.busy_until = self.now;
+        // A new process starts on the shared clock.
+        slot.clock = Duration::ZERO;
         self.drain(node);
     }
+}
+
+/// `t` moved back by `by`, as an instant on the shared clock of a node running `by` ahead.
+fn behind(t: Instant, by: Duration) -> Instant {
+    let by = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
+    Instant::from_nanos(t.as_nanos().saturating_sub(by))
 }
 
 fn datagram_delay(link: &LinkConfig, rng: &mut Rng) -> Duration {

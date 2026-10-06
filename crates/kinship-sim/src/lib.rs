@@ -21,8 +21,9 @@
 //! ```
 //!
 //! The network models per-link latency distributions, loss, duplication and reordering,
-//! symmetric and one-way partitions, crashed and restarted nodes, and slow nodes whose inputs
-//! are processed late (see [`Action::Pause`], [`Action::Slow`] and [`Action::Starve`]). Streams model TCP: reliable
+//! symmetric and one-way partitions, crashed and restarted nodes, slow nodes whose inputs
+//! are processed late (see [`Action::Pause`], [`Action::Slow`] and [`Action::Starve`]), and nodes
+//! whose clock jumps ahead of the others ([`Action::ClockJump`]). Streams model TCP: reliable
 //! and ordered, failing after a timeout when the peer is unreachable.
 
 mod echo;

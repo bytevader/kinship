@@ -1,0 +1,9 @@
+# The driver keeps time with tokio's monotonic clock, which the core's timeline is built on and
+# which tokio's test clock can pause. Wall-clock time can jump under NTP or a suspend.
+disallowed-types = [
+    { path = "std::time::SystemTime", reason = "wall-clock time can jump; use tokio::time::Instant" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use tokio::time::Instant::now, which tokio's test clock controls" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time can jump; use tokio::time::Instant" },
+]
