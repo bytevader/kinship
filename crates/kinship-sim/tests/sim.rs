@@ -117,6 +117,7 @@ fn eventful_run_exercises_every_fault() {
     assert!(s.partitioned > 0, "{s:?}");
     assert!(s.to_down_node > 0, "{s:?}");
     assert!(s.stream_failures >= 2, "{s:?}");
+    assert!(s.sent_bytes >= s.sent && s.stream_bytes > 0, "{s:?}");
     let events = event_values(&sim);
     assert!(events.iter().any(|e| e["type"] == "echoed"));
     assert!(events.iter().any(|e| e["type"] == "tcp_echoed"));
