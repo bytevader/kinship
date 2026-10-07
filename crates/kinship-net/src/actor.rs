@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use crate::conn::{self, Report, Reports, Write};
+use crate::conn::{self, Budget, Report, Reports, Write};
 use crate::events::{Event, Hub};
 use crate::transport::Transport;
 use crate::{Error, Stats};
@@ -204,6 +204,8 @@ pub(crate) struct Actor<T: Transport> {
     conns: HashMap<StreamId, Conn>,
     /// Inbound connections still running, oldest first.
     inbound: VecDeque<StreamId>,
+    /// Bytes inbound connections may hold before their frames are handled.
+    budget: Arc<Budget>,
     next_inbound: u64,
     tasks: JoinSet<()>,
     pending: HashMap<CommandId, Pending>,
@@ -247,6 +249,7 @@ impl<T: Transport> Actor<T> {
             reports,
             conns: HashMap::new(),
             inbound: VecDeque::new(),
+            budget: Budget::for_frames(opts.limits.max_stream_frame),
             next_inbound: 0,
             tasks: JoinSet::new(),
             pending: HashMap::new(),
@@ -406,7 +409,7 @@ impl<T: Transport> Actor<T> {
 
     fn report(&mut self, conn: StreamId, report: Report) {
         let ev = match &report {
-            Report::Frame(frame) => StreamEvent::Frame(frame),
+            Report::Frame { frame, .. } => StreamEvent::Frame(frame),
             Report::Closed => StreamEvent::Closed,
             Report::Failed => StreamEvent::Failed,
             Report::Done => {
@@ -435,7 +438,14 @@ impl<T: Transport> Actor<T> {
         let conn = StreamId::inbound(self.next_inbound);
         self.next_inbound += 1;
         let (writes, rx) = mpsc::unbounded_channel();
-        let task = conn::inbound(stream, conn, self.opts.limits, rx, self.reports_tx.clone());
+        let task = conn::inbound(
+            stream,
+            conn,
+            self.opts.limits,
+            Arc::clone(&self.budget),
+            rx,
+            self.reports_tx.clone(),
+        );
         let abort = self.tasks.spawn(task);
         self.conns.insert(conn, Conn { writes, abort });
         self.inbound.push_back(conn);
