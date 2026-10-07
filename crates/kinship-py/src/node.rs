@@ -368,6 +368,7 @@ impl Node {
             ("packets_received", m.packets_received),
             ("decode_errors", m.decode_errors),
             ("decrypt_failures", m.decrypt_failures),
+            ("replays_dropped", m.replays_dropped),
             ("probes_sent", m.probes_sent),
             ("probes_failed", m.probes_failed),
             ("indirect_probes", m.indirect_probes),

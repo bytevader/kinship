@@ -7,7 +7,7 @@
 //!  2      version
 //!  3      flags: bit 0 encrypted, bit 1 stream frame, rest reserved (zero)
 //!  4..8   key_id, first 4 bytes of BLAKE3(key)
-//!  8..32  nonce, 24 random bytes
+//!  8..32  nonce, 24 bytes from the caller: kinship-core puts its cluster time first
 //!  32..n  ciphertext of the inner payload
 //!  n..+16 Poly1305 tag
 //! ```
@@ -532,6 +532,18 @@ impl Codec {
         };
         Payload::parse(&buf[range], &self.limits)
     }
+}
+
+/// The nonce in the header of a sealed packet, read without authenticating anything.
+///
+/// `None` unless `buf` starts like an encrypted packet of either kind and is long enough to
+/// hold a header and a tag. The receiver may use it to drop a packet cheaply before opening it,
+/// but nothing read here is authentic until [`Codec::open`] succeeds.
+pub fn sealed_nonce(buf: &[u8]) -> Option<[u8; NONCE_LEN]> {
+    if buf.len() < ENCRYPTED_OVERHEAD || buf[..2] != MAGIC || buf[3] & FLAG_ENCRYPTED == 0 {
+        return None;
+    }
+    buf[8..ENCRYPTED_HEADER_LEN].try_into().ok()
 }
 
 /// The AEAD associated data: header bytes then label, on the stack.

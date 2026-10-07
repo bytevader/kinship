@@ -27,6 +27,6 @@ pub use message::{
 };
 pub use packet::{
     Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, Key, KeyId, MAGIC, MAX_LABEL_LEN, NONCE_LEN,
-    PLAINTEXT_HEADER_LEN, PacketKind, TAG_LEN, WIRE_VERSION,
+    PLAINTEXT_HEADER_LEN, PacketKind, TAG_LEN, WIRE_VERSION, sealed_nonce,
 };
 pub use stream::FrameReader;

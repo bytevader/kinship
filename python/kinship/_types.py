@@ -179,6 +179,7 @@ class Stats:
     packets_received: int
     decode_errors: int
     decrypt_failures: int
+    replays_dropped: int
     probes_sent: int
     probes_failed: int
     indirect_probes: int

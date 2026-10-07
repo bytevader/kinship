@@ -147,6 +147,7 @@ fn stats(cluster: &Cluster) -> Value {
         "push_pull_failures": m.push_pull_failures,
         "decode_errors": m.decode_errors,
         "decrypt_failures": m.decrypt_failures,
+        "replays_dropped": m.replays_dropped,
     })
 }
 

@@ -7,6 +7,7 @@ use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect};
 
 use crate::Node;
 use crate::io::{StreamId, Transmit};
+use crate::replay::STAMP_LEN;
 use crate::rng::Rng;
 use crate::suspicion::retransmit_limit;
 use crate::time::Instant;
@@ -192,6 +193,8 @@ pub(crate) struct Outbox {
     pub transmits: VecDeque<Transmit>,
     /// Nonces only; kept apart from the protocol's RNG so sealing never shifts its choices.
     nonces: Rng,
+    /// Cluster time in milliseconds, which leads every nonce; the node keeps it current.
+    pub stamp: u64,
 }
 
 impl Outbox {
@@ -201,7 +204,19 @@ impl Outbox {
             broadcasts: Broadcasts::default(),
             transmits: VecDeque::new(),
             nonces,
+            stamp: 0,
         }
+    }
+
+    /// A fresh nonce: the cluster time, then random bytes. All zero in plaintext mode, which
+    /// sends no nonce.
+    fn nonce(&mut self) -> [u8; kinship_proto::NONCE_LEN] {
+        let mut nonce = [0; kinship_proto::NONCE_LEN];
+        if self.codec.is_encrypted() {
+            nonce[..STAMP_LEN].copy_from_slice(&self.stamp.to_be_bytes());
+            self.nonces.fill(&mut nonce[STAMP_LEN..]);
+        }
+        nonce
     }
 
     /// Sends `head` to `to` in one datagram, filling the space left with queued gossip that
@@ -217,6 +232,7 @@ impl Outbox {
         if head.is_empty() && picked.is_empty() {
             return false;
         }
+        let nonce = self.nonce();
         let mut msgs = Vec::with_capacity(head.len() + picked.len());
         msgs.extend_from_slice(head);
         msgs.extend(
@@ -224,10 +240,6 @@ impl Outbox {
                 .iter()
                 .map(|&i| self.broadcasts.queue[i].gossip.message()),
         );
-        let mut nonce = [0; kinship_proto::NONCE_LEN];
-        if self.codec.is_encrypted() {
-            self.nonces.fill(&mut nonce);
-        }
         let mut payload = Vec::new();
         // Only an oversized head can fail, and no head is near the limit.
         let sealed = self
@@ -248,10 +260,7 @@ impl Outbox {
     /// Writes `msgs` to `conn` as one length-prefixed stream frame. Returns false, sending
     /// nothing, if they do not fit in `max_stream_frame`.
     pub fn frame(&mut self, conn: StreamId, msgs: &[Message<'_>]) -> bool {
-        let mut nonce = [0; kinship_proto::NONCE_LEN];
-        if self.codec.is_encrypted() {
-            self.nonces.fill(&mut nonce);
-        }
+        let nonce = self.nonce();
         let mut frame = Vec::new();
         if self
             .codec
