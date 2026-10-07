@@ -11,6 +11,9 @@ pub struct Metrics {
     pub decode_errors: u64,
     /// Packets whose key id matched but whose tag did not verify, or with an unknown key id.
     pub decrypt_failures: u64,
+    /// Encrypted packets dropped as replays: stamped older than the replay window, which is
+    /// checked before decrypting, or a copy of a packet already accepted inside it.
+    pub replays_dropped: u64,
     /// Probe rounds started.
     pub probes_sent: u64,
     /// Probe rounds that ended without an Ack, direct or indirect.

@@ -28,6 +28,7 @@ mod io;
 mod member;
 mod metrics;
 mod probe;
+mod replay;
 mod rng;
 mod suspicion;
 mod sync;
@@ -37,10 +38,11 @@ mod time;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{KeyringError, Message, NodeId, PacketKind, Payload};
+use kinship_proto::{KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce};
 
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
+use crate::replay::Replay;
 use crate::suspicion::Suspicion;
 use crate::sync::Sync;
 use crate::table::{Entry, Table};
@@ -127,6 +129,8 @@ pub struct Node {
     sync: Sync,
     /// Lifeguard's local health multiplier; see [`Node::local_health`].
     health: u32,
+    /// Cluster time and the nonces seen inside the replay window.
+    replay: Replay,
 }
 
 impl Node {
@@ -155,6 +159,7 @@ impl Node {
             (!interval.is_zero()).then(|| now + jitter(&mut rng, interval))
         };
         let sync = Sync::new(first(cfg.push_pull_interval), first(cfg.reconnect_interval));
+        let replay = Replay::new(replay::window(&cfg), now);
         let local = Entry {
             member: Member {
                 name: me.name.clone(),
@@ -187,7 +192,9 @@ impl Node {
             suspicions: BTreeMap::new(),
             sync,
             health: 0,
+            replay,
         };
+        node.out.stamp = node.replay.stamp(now);
         node.broadcast(node.local_alive());
         Ok(node)
     }
@@ -238,13 +245,20 @@ impl Node {
             self.metrics.decode_errors += 1;
             return;
         }
+        let stamp = self.check_stamp(buf);
+        if let Stamp::Stale = stamp {
+            self.metrics.replays_dropped += 1;
+            return;
+        }
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(buf);
         match self.out.codec.open(PacketKind::Datagram, &mut scratch) {
             Ok(payload) => {
-                self.metrics.packets_received += 1;
-                self.process(&payload);
+                if self.accept_stamp(&stamp) {
+                    self.metrics.packets_received += 1;
+                    self.process(&payload);
+                }
             }
             Err(e) => self.count_error(&e),
         }
@@ -410,6 +424,39 @@ impl Node {
     fn advance(&mut self, now: Instant) {
         // Drivers may hand in the same instant twice but never go backwards; clamp if they do.
         self.now = self.now.max(now);
+        self.replay.tick(self.now);
+        self.out.stamp = self.replay.stamp(self.now);
+    }
+
+    /// Checks an encrypted packet's stamp against the replay window, before anything is
+    /// decrypted.
+    fn check_stamp(&self, buf: &[u8]) -> Stamp {
+        if !self.out.codec.is_encrypted() {
+            return Stamp::Unchecked;
+        }
+        // Bytes that are not a sealed packet fail to open, and are counted there.
+        let Some(nonce) = sealed_nonce(buf) else {
+            return Stamp::Unchecked;
+        };
+        if self.replay.is_stale(replay::stamp_of(&nonce)) {
+            Stamp::Stale
+        } else {
+            Stamp::Fresh(nonce)
+        }
+    }
+
+    /// Records the nonce of a packet that authenticated, catching up with its cluster time.
+    /// False, and counted, if the packet is a copy of one already accepted.
+    fn accept_stamp(&mut self, stamp: &Stamp) -> bool {
+        let Stamp::Fresh(nonce) = stamp else {
+            return true;
+        };
+        if !self.replay.accept(self.now, nonce) {
+            self.metrics.replays_dropped += 1;
+            return false;
+        }
+        self.out.stamp = self.replay.stamp(self.now);
+        true
     }
 
     fn count_error(&mut self, e: &kinship_proto::DecodeError) {
@@ -437,6 +484,17 @@ impl Node {
             }
         }
     }
+}
+
+/// What the replay window says about a packet before it is opened.
+#[derive(Debug, Clone, Copy)]
+enum Stamp {
+    /// Plaintext, or not a sealed packet: nothing to check.
+    Unchecked,
+    /// Stamped before the replay window.
+    Stale,
+    /// Inside the window, with this nonce.
+    Fresh([u8; kinship_proto::NONCE_LEN]),
 }
 
 /// A uniform delay in `[0, max)`.
@@ -522,6 +580,69 @@ mod tests {
 
         n.handle_datagram(Instant::ZERO, addr(2), b"garbage");
         assert_eq!(n.metrics().decode_errors, 1);
+    }
+
+    /// A Ping sealed at cluster time `stamp` (milliseconds), with random bytes `tail`.
+    fn stamped_ping(codec: &Codec, stamp: u64, tail: u8) -> Vec<u8> {
+        let ping = Message::Ping(Ping {
+            seq: 1,
+            target: NodeId::new("a").unwrap(),
+            source: NodeId::new("b").unwrap(),
+            source_addr: addr(2),
+        });
+        let mut nonce = [tail; 24];
+        nonce[..8].copy_from_slice(&stamp.to_be_bytes());
+        let mut pkt = Vec::new();
+        codec
+            .seal(PacketKind::Datagram, &[ping], &nonce, &mut pkt)
+            .unwrap();
+        pkt
+    }
+
+    #[test]
+    fn copies_and_stale_datagrams_are_dropped_as_replays() {
+        let key = Key::from_bytes([3; 32]);
+        let mut n = node(Security::Keys(vec![key.clone()]));
+        let codec = Codec::encrypted(b"default", Limits::default(), vec![key]).unwrap();
+        let acks = |n: &mut Node| std::iter::from_fn(|| n.poll_transmit()).count();
+        let secs = |s: u64| Instant::ZERO + core::time::Duration::from_secs(s);
+        // A node that has been running for a minute, waking every second.
+        let run = |n: &mut Node, from: u64, to: u64| {
+            for s in from..=to {
+                n.handle_timeout(secs(s));
+                acks(n);
+            }
+        };
+        run(&mut n, 1, 60);
+        let t = secs(60);
+
+        let pkt = stamped_ping(&codec, 55_000, 1);
+        n.handle_datagram(t, addr(2), &pkt);
+        assert_eq!(acks(&mut n), 1, "a fresh Ping is answered");
+        n.handle_datagram(t, addr(2), &pkt);
+        assert_eq!(acks(&mut n), 0, "its copy is not");
+        assert_eq!(n.metrics().replays_dropped, 1);
+
+        // Sealed 31 s before this node's cluster time: dropped before it is decrypted.
+        let old = stamped_ping(&codec, 29_000, 2);
+        n.handle_datagram(t, addr(2), &old);
+        assert_eq!(acks(&mut n), 0);
+        assert_eq!(n.metrics().replays_dropped, 2);
+        assert_eq!(n.metrics().packets_received, 1);
+        assert_eq!(n.metrics().decrypt_failures, 0);
+
+        // A member whose clock jumped two minutes ahead moves this node's cluster time
+        // forward. Members still on the old timeline are heard while they catch up.
+        let ahead = stamped_ping(&codec, 180_000, 3);
+        n.handle_datagram(t, addr(2), &ahead);
+        assert_eq!(acks(&mut n), 1);
+        n.handle_datagram(t, addr(2), &stamped_ping(&codec, 60_000, 4));
+        assert_eq!(acks(&mut n), 1, "the old timeline, a moment later");
+        // Two minutes on, the floor has caught up, and that timeline is stale.
+        run(&mut n, 61, 180);
+        n.handle_datagram(secs(180), addr(2), &stamped_ping(&codec, 61_000, 5));
+        assert_eq!(acks(&mut n), 0);
+        assert_eq!(n.metrics().replays_dropped, 3);
     }
 
     #[test]

@@ -7,9 +7,15 @@
 //! frame, so a peer that trickles bytes cannot hold a connection open. The frame's length is
 //! checked against `max_stream_frame` as soon as its prefix arrives, before anything is set
 //! aside for it.
+//!
+//! A frame can only be authenticated once it is complete, so the bytes of inbound frames are
+//! held on behalf of peers nobody has verified yet. All inbound connections draw them from one
+//! [`Budget`] of twice `max_stream_frame`, and a connection whose next read does not fit is
+//! dropped: a peer without a key can fill the budget, but not the node's memory.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kinship_core::StreamId;
@@ -36,7 +42,11 @@ pub(crate) enum Write {
 #[derive(Debug)]
 pub(crate) enum Report {
     /// The one frame this connection carries, without its length prefix.
-    Frame(Vec<u8>),
+    Frame {
+        frame: Vec<u8>,
+        /// For an inbound connection, its share of the budget, held until the actor is done.
+        _held: Option<Held>,
+    },
     /// The peer closed before sending a frame. Outbound connections only.
     Closed,
     /// Connect failed or timed out, a read or write failed or timed out, or framing failed,
@@ -47,6 +57,74 @@ pub(crate) enum Report {
 }
 
 pub(crate) type Reports = mpsc::UnboundedSender<(StreamId, Report)>;
+
+/// Bytes that inbound connections may hold between them before their frames are handled.
+#[derive(Debug)]
+pub(crate) struct Budget {
+    left: AtomicUsize,
+}
+
+impl Budget {
+    /// Twice `max_stream_frame`: room for one largest frame while another is being read.
+    pub fn for_frames(max_stream_frame: usize) -> Arc<Self> {
+        Arc::new(Self {
+            left: AtomicUsize::new(max_stream_frame.saturating_mul(2)),
+        })
+    }
+
+    /// Takes `n` more bytes for `held`, or returns false and takes nothing if they do not fit.
+    fn take(self: &Arc<Self>, held: &mut Held, n: usize) -> bool {
+        // A compare-exchange loop: `fetch_update` is deprecated on newer Rust, and its
+        // replacement is newer than the 1.85 MSRV.
+        let mut left = self.left.load(Ordering::Acquire);
+        loop {
+            let Some(rest) = left.checked_sub(n) else {
+                return false;
+            };
+            match self
+                .left
+                .compare_exchange_weak(left, rest, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    held.bytes += n;
+                    return true;
+                }
+                Err(now) => left = now,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn left(&self) -> usize {
+        self.left.load(Ordering::Acquire)
+    }
+}
+
+/// A connection's share of the [`Budget`], given back when dropped.
+#[derive(Debug)]
+pub(crate) struct Held {
+    budget: Arc<Budget>,
+    bytes: usize,
+}
+
+impl Held {
+    fn new(budget: Arc<Budget>) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    /// Keeps only `n` of the bytes held.
+    fn keep(&mut self, n: usize) {
+        let extra = self.bytes.saturating_sub(n);
+        self.budget.left.fetch_add(extra, Ordering::AcqRel);
+        self.bytes -= extra;
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.budget.left.fetch_add(self.bytes, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
@@ -87,22 +165,34 @@ pub(crate) async fn outbound<T: Transport>(
             },
         }
     };
-    let outcome = exchange(stream, limits, queued, writes, &reports, conn).await;
+    let outcome = exchange(stream, limits, None, queued, writes, &reports, conn).await;
     finish(&reports, conn, outcome.map(|o| o.report()));
 }
 
 /// Runs the exchange on a connection a peer opened. Until its first frame arrives the core does
-/// not know the connection exists, so nothing but that frame is reported.
+/// not know the connection exists, so nothing but that frame is reported. The bytes it reads
+/// come out of `budget`.
 pub(crate) async fn inbound<S>(
     stream: S,
     conn: StreamId,
     limits: Limits,
+    budget: Arc<Budget>,
     writes: mpsc::UnboundedReceiver<Write>,
     reports: Reports,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    exchange(stream, limits, Vec::new(), writes, &reports, conn).await;
+    let held = Held::new(budget);
+    exchange(
+        stream,
+        limits,
+        Some(held),
+        Vec::new(),
+        writes,
+        &reports,
+        conn,
+    )
+    .await;
     finish(&reports, conn, None);
 }
 
@@ -130,10 +220,12 @@ impl Outcome {
 }
 
 /// Reads one frame and writes what the actor sends until it says to close. Returns how the
-/// connection ended if that happened before the frame arrived.
+/// connection ended if that happened before the frame arrived. With `held`, every byte read is
+/// taken from its budget first.
 async fn exchange<S>(
     stream: S,
     limits: Limits,
+    mut held: Option<Held>,
     queued: Vec<Vec<u8>>,
     mut writes: mpsc::UnboundedReceiver<Write>,
     reports: &Reports,
@@ -174,14 +266,26 @@ where
                     return Some(outcome);
                 }
                 Ok(n) => {
+                    if let Some(h) = &mut held {
+                        if !Arc::clone(&h.budget).take(h, n) {
+                            tracing::debug!(?conn, "inbound buffer budget spent; dropping connection");
+                            return Some(Outcome::Failed);
+                        }
+                    }
                     reader.push(&chunk[..n]);
                     match reader.next_frame() {
                         Ok(Some(frame)) => {
                             got_frame = true;
                             deadline = Instant::now() + limits.tcp_timeout;
-                            // The read side is done; release its buffers before waiting.
+                            // The read side is done; release its buffers before waiting, and
+                            // hold only the frame against the budget until the actor is done.
                             chunk = Vec::new();
-                            let _ = reports.send((conn, Report::Frame(frame)));
+                            reader = FrameReader::new(0);
+                            let mut held = held.take();
+                            if let Some(h) = &mut held {
+                                h.keep(frame.len());
+                            }
+                            let _ = reports.send((conn, Report::Frame { frame, _held: held }));
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -220,7 +324,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some((_, r)) = rx.recv().await {
             out.push(match r {
-                Report::Frame(_) => "frame",
+                Report::Frame { .. } => "frame",
                 Report::Closed => "closed",
                 Report::Failed => "failed",
                 Report::Done => "done",
@@ -237,12 +341,23 @@ mod tests {
         let (mut peer, ours) = duplex(1024);
         let (wtx, wrx) = mpsc::unbounded_channel();
         let (rtx, mut rrx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(inbound(ours, StreamId::inbound(0), LIMITS, wrx, rtx));
+        let budget = Budget::for_frames(LIMITS.max_stream_frame);
+        let task = tokio::spawn(inbound(
+            ours,
+            StreamId::inbound(0),
+            LIMITS,
+            Arc::clone(&budget),
+            wrx,
+            rtx,
+        ));
         let mut two = frame(b"abcd");
         two.extend(frame(b"efgh"));
         peer.write_all(&two).await.unwrap();
         let (_, first) = rrx.recv().await.unwrap();
-        assert!(matches!(first, Report::Frame(f) if f == b"abcd"));
+        assert!(matches!(&first, Report::Frame { frame, _held: Some(_) } if frame == b"abcd"));
+        assert_eq!(budget.left(), 128 - 4, "only the frame stays held");
+        drop(first);
+        assert_eq!(budget.left(), 128);
         wtx.send(Write::Bytes(frame(b"ok"))).unwrap();
         wtx.send(Write::Close).unwrap();
         let mut answer = Vec::new();
@@ -259,7 +374,7 @@ mod tests {
         let (rtx, mut rrx) = mpsc::unbounded_channel();
         let conn = StreamId::outbound(0);
         let task = tokio::spawn(async move {
-            let outcome = exchange(ours, LIMITS, Vec::new(), wrx, &rtx, conn).await;
+            let outcome = exchange(ours, LIMITS, None, Vec::new(), wrx, &rtx, conn).await;
             finish(&rtx, conn, outcome.map(Outcome::report));
         });
         peer.write_all(&65u32.to_be_bytes()).await.unwrap();
@@ -275,7 +390,7 @@ mod tests {
         let conn = StreamId::outbound(1);
         let started = Instant::now();
         tokio::spawn(async move {
-            let outcome = exchange(ours, LIMITS, Vec::new(), wrx, &rtx, conn).await;
+            let outcome = exchange(ours, LIMITS, None, Vec::new(), wrx, &rtx, conn).await;
             finish(&rtx, conn, outcome.map(Outcome::report));
         });
         assert_eq!(reports_of(&mut rrx).await, ["failed", "done"]);
@@ -289,7 +404,7 @@ mod tests {
         let (rtx, mut rrx) = mpsc::unbounded_channel();
         let conn = StreamId::outbound(2);
         tokio::spawn(async move {
-            let outcome = exchange(ours, LIMITS, Vec::new(), wrx, &rtx, conn).await;
+            let outcome = exchange(ours, LIMITS, None, Vec::new(), wrx, &rtx, conn).await;
             finish(&rtx, conn, outcome.map(Outcome::report));
         });
         let trickle = tokio::spawn(async move {
@@ -305,13 +420,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inbound_read_past_the_budget_drops_the_connection() {
+        let budget = Budget::for_frames(LIMITS.max_stream_frame);
+        let mut other = Held::new(Arc::clone(&budget));
+        assert!(budget.take(&mut other, 100));
+        let (mut peer, ours) = duplex(1024);
+        let (_wtx, wrx) = mpsc::unbounded_channel();
+        let (rtx, mut rrx) = mpsc::unbounded_channel();
+        let conn = StreamId::inbound(1);
+        let task = tokio::spawn(inbound(ours, conn, LIMITS, Arc::clone(&budget), wrx, rtx));
+        peer.write_all(&frame(&[7; 40])).await.unwrap();
+        assert_eq!(reports_of(&mut rrx).await, ["done"]);
+        task.await.unwrap();
+        assert_eq!(
+            budget.left(),
+            28,
+            "the dropped connection gave its share back"
+        );
+        drop(other);
+        assert_eq!(budget.left(), 128);
+    }
+
+    #[tokio::test]
     async fn an_early_close_is_reported_as_closed() {
         let (peer, ours) = duplex(1024);
         let (_wtx, wrx) = mpsc::unbounded_channel();
         let (rtx, mut rrx) = mpsc::unbounded_channel();
         let conn = StreamId::outbound(3);
         drop(peer);
-        let outcome = exchange(ours, LIMITS, Vec::new(), wrx, &rtx, conn).await;
+        let outcome = exchange(ours, LIMITS, None, Vec::new(), wrx, &rtx, conn).await;
         finish(&rtx, conn, outcome.map(Outcome::report));
         assert_eq!(reports_of(&mut rrx).await, ["closed", "done"]);
     }

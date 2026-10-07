@@ -13,12 +13,13 @@ use std::collections::BTreeMap;
 
 use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records, Suspect};
 
-use crate::Node;
 use crate::broadcast::{Gossip, id};
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
 use crate::io::{StreamEvent, StreamId, Transmit};
 use crate::member::State;
+use crate::replay::stamp_of;
 use crate::time::Instant;
+use crate::{Node, Stamp};
 
 /// Why this node opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub(crate) enum Purpose {
 pub(crate) struct Outbound {
     purpose: Purpose,
     deadline: Instant,
+    to: SocketAddr,
+    /// The cluster time this node's frame was sealed at.
+    stamp: u64,
+    /// This exchange repeats one the peer answered as stale; it is not repeated again.
+    repeat: bool,
 }
 
 /// A join in progress.
@@ -134,24 +140,47 @@ impl Node {
             self.metrics.decode_errors += 1;
             return self.end_stream(conn, false);
         }
+        let stamp = self.check_stamp(frame);
+        if matches!(stamp, Stamp::Stale) && !conn.is_inbound() {
+            // The peer sealed its reply after reading this node's request and catching up with
+            // it, so a stale reply is a recording.
+            self.metrics.replays_dropped += 1;
+            return self.end_stream(conn, false);
+        }
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(frame);
         let answered = match self.out.codec.open(PacketKind::Stream, &mut scratch) {
+            Ok(payload) if matches!(stamp, Stamp::Stale) => {
+                // An authentic request from a node that has fallen behind cluster time: one that
+                // just started, or a recording. Merge nothing, and answer a push-pull with this
+                // node's own record only: a real joiner catches up from it and asks again.
+                self.metrics.replays_dropped += 1;
+                let push_pull = payload.iter().any(|m| matches!(m, Message::PushPull(_)));
+                push_pull && self.send_state(conn, false, false)
+            }
             Ok(payload) => {
-                self.metrics.packets_received += 1;
-                let mut answered = false;
-                for msg in payload.iter() {
-                    answered = if conn.is_inbound() {
-                        self.serve(now, conn, &msg)
-                    } else {
-                        self.on_reply(now, conn, &msg)
+                if self.accept_stamp(&stamp) {
+                    self.metrics.packets_received += 1;
+                    let reply_stamp = match stamp {
+                        Stamp::Fresh(nonce) => Some(stamp_of(&nonce)),
+                        _ => None,
                     };
-                    if answered {
-                        break;
+                    let mut answered = false;
+                    for msg in payload.iter() {
+                        answered = if conn.is_inbound() {
+                            self.serve(now, conn, &msg)
+                        } else {
+                            self.on_reply(now, conn, &msg, reply_stamp)
+                        };
+                        if answered {
+                            break;
+                        }
                     }
+                    answered
+                } else {
+                    false
                 }
-                answered
             }
             Err(e) => {
                 self.count_error(&e);
@@ -167,7 +196,7 @@ impl Node {
         match msg {
             Message::PushPull(p) => {
                 self.merge(now, p.records);
-                if self.send_state(conn, false) {
+                if self.send_state(conn, false, true) {
                     self.metrics.push_pulls_served += 1;
                 }
                 true
@@ -185,13 +214,29 @@ impl Node {
     }
 
     /// Handles the reply on a connection this node opened. True if `msg` was the reply.
-    fn on_reply(&mut self, now: Instant, conn: StreamId, msg: &Message<'_>) -> bool {
-        let Some(purpose) = self.sync.streams.get(&conn).map(|o| o.purpose) else {
+    /// `stamp` is the cluster time the reply was sealed at, when encrypted.
+    fn on_reply(
+        &mut self,
+        now: Instant,
+        conn: StreamId,
+        msg: &Message<'_>,
+        stamp: Option<u64>,
+    ) -> bool {
+        let Some(out) = self.sync.streams.get(&conn).cloned() else {
             return false;
         };
+        let purpose = out.purpose;
         match (purpose, msg) {
             (Purpose::Join { .. } | Purpose::Sync, Message::PushPull(p)) => {
                 self.merge(now, p.records);
+                let window = self.replay.window_ms();
+                let was_stale = stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window);
+                if was_stale && !out.repeat {
+                    // The peer found this node's request stale and sent only its own record.
+                    // This node has caught up from the reply, so it asks again at once.
+                    self.push_pull_with(out.to, purpose, true);
+                    return true;
+                }
                 self.metrics.push_pulls += 1;
                 if let Purpose::Join { cmd, seed } = purpose {
                     self.seed_done(now, cmd, seed, true);
@@ -262,10 +307,12 @@ impl Node {
         }
     }
 
-    /// Writes this node's whole view, tombstones included, to `conn`. False if it does not fit.
-    fn send_state(&mut self, conn: StreamId, join: bool) -> bool {
+    /// Writes this node's whole view, tombstones included, to `conn`, or with `full` false its
+    /// own record only. False if it does not fit.
+    fn send_state(&mut self, conn: StreamId, join: bool, full: bool) -> bool {
+        let others = if full { self.table.len() } else { 0 };
         let records: Vec<Record<'_>> = std::iter::once(&self.local)
-            .chain(self.table.iter())
+            .chain(self.table.iter().take(others))
             .map(|e| Record {
                 state: wire_state(e.member.state),
                 alive: Alive {
@@ -291,22 +338,32 @@ impl Node {
     }
 
     /// Opens a connection to `to` and remembers why.
-    fn connect(&mut self, to: SocketAddr, purpose: Purpose) -> StreamId {
+    fn connect(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) -> StreamId {
         let conn = StreamId::outbound(self.sync.next_stream);
         self.sync.next_stream += 1;
         self.out.transmits.push_back(Transmit::Connect { conn, to });
         let deadline = self.now + self.cfg.tcp_timeout;
-        self.sync
-            .streams
-            .insert(conn, Outbound { purpose, deadline });
+        let outbound = Outbound {
+            purpose,
+            deadline,
+            to,
+            stamp: self.out.stamp,
+            repeat,
+        };
+        self.sync.streams.insert(conn, outbound);
         conn
     }
 
     /// Opens a push-pull exchange with `to`.
     fn push_pull(&mut self, to: SocketAddr, purpose: Purpose) {
-        let conn = self.connect(to, purpose);
+        self.push_pull_with(to, purpose, false);
+    }
+
+    /// Opens a push-pull exchange with `to`; `repeat` marks the second try after a stale one.
+    fn push_pull_with(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) {
+        let conn = self.connect(to, purpose, repeat);
         let join = matches!(purpose, Purpose::Join { .. });
-        if !self.send_state(conn, join) {
+        if !self.send_state(conn, join, true) {
             self.end_stream(conn, false);
         }
     }
@@ -314,7 +371,7 @@ impl Node {
     /// Sends the probe of round `seq` to `to` over TCP as well; the stream is closed with the
     /// round.
     pub(crate) fn tcp_ping(&mut self, to: SocketAddr, target: &str, seq: u32) -> StreamId {
-        let conn = self.connect(to, Purpose::Ping { seq });
+        let conn = self.connect(to, Purpose::Ping { seq }, false);
         let ping = Message::Ping(Ping {
             seq,
             target: id(target),
@@ -537,6 +594,16 @@ mod tests {
         Node::new(cfg, me, Instant::ZERO, u64::from(port)).unwrap()
     }
 
+    fn key() -> crate::Key {
+        crate::Key::from_bytes([5; 32])
+    }
+
+    fn secure_node(name: &str, port: u16) -> Node {
+        let cfg = Config::lan(Security::Keys(vec![key()]));
+        let me = Identity::new(name, addr(port)).unwrap();
+        Node::new(cfg, me, Instant::ZERO, u64::from(port)).unwrap()
+    }
+
     /// Two nodes on a perfect network: datagrams to the other's address arrive, and
     /// connections to it are accepted, unless `refuse` is set.
     struct Pair {
@@ -545,6 +612,8 @@ mod tests {
         conns: BTreeMap<(usize, StreamId), (usize, StreamId)>,
         accepted: u64,
         refuse: bool,
+        /// How far each node's clock runs ahead of the time the test passes in.
+        skew: [Duration; 2],
     }
 
     impl Pair {
@@ -554,6 +623,7 @@ mod tests {
                 conns: BTreeMap::new(),
                 accepted: 0,
                 refuse: false,
+                skew: [Duration::ZERO; 2],
             }
         }
 
@@ -578,6 +648,7 @@ mod tests {
         fn deliver(&mut self, now: Instant, i: usize, t: Transmit) {
             let j = 1 - i;
             let from = self.nodes[i].local().addr;
+            let (now_i, now) = (now + self.skew[i], now + self.skew[j]);
             match t {
                 Transmit::Datagram { to, payload } => {
                     if to == self.nodes[j].local().addr {
@@ -585,7 +656,7 @@ mod tests {
                     }
                 }
                 Transmit::Connect { conn, .. } if self.refuse => {
-                    self.nodes[i].handle_stream(now, conn, StreamEvent::Failed);
+                    self.nodes[i].handle_stream(now_i, conn, StreamEvent::Failed);
                 }
                 Transmit::Connect { conn, .. } => {
                     let peer = StreamId::inbound(self.accepted);
@@ -654,6 +725,133 @@ mod tests {
         assert_eq!(p.nodes[1].metrics().push_pulls_served, 1);
         assert!(p.conns.is_empty(), "both ends closed");
         assert!(p.nodes[0].sync.streams.is_empty());
+    }
+
+    #[test]
+    fn a_node_behind_cluster_time_joins_in_two_exchanges() {
+        // The seed has run for an hour; the joiner just started, so its request is stale.
+        let mut b = secure_node("b", 2);
+        b.add_member(Instant::ZERO, "c", addr(3)).unwrap();
+        let mut p = Pair::new(secure_node("a", 1), b);
+        p.skew[1] = Duration::from_secs(3600);
+        p.events(1);
+        let t = Instant::ZERO;
+        let cmd = p.nodes[0].command(
+            t,
+            Command::Join {
+                seeds: vec![addr(2)],
+            },
+        );
+        p.pump(t);
+        let ev = p.events(0);
+        assert_eq!(done(&ev, cmd), Some(Ok(CommandOutput::Joined { seeds: 1 })));
+        let names: Vec<&str> = joined(&ev).iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["b", "c"], "the seed's own record, then the rest");
+        assert_eq!(
+            joined(&p.events(1))[0].name,
+            "a",
+            "the second request merged"
+        );
+        assert_eq!(p.nodes[1].metrics().replays_dropped, 1);
+        assert_eq!(p.nodes[1].metrics().push_pulls_served, 1);
+        assert_eq!(p.nodes[0].metrics().push_pulls, 1);
+        assert!(p.conns.is_empty() && p.nodes[0].sync.streams.is_empty());
+    }
+
+    /// A push-pull from "x", which claims a member "ghost", sealed at cluster time `stamp`.
+    fn recorded_push_pull(stamp: u64) -> Vec<u8> {
+        let codec = kinship_proto::Codec::encrypted(
+            b"default",
+            kinship_proto::Limits::default(),
+            vec![key()],
+        )
+        .unwrap();
+        let alive = |name: &'static str, port| Record {
+            state: kinship_proto::State::Alive,
+            alive: Alive {
+                inc: 0,
+                node: id(name),
+                addr: addr(port),
+                meta: b"",
+                vmin: 1,
+                vmax: 1,
+            },
+        };
+        let records = [alive("x", 8), alive("ghost", 9)];
+        let msg = Message::PushPull(PushPull {
+            join: true,
+            records: Records::Slice(&records),
+        });
+        let mut nonce = [7; kinship_proto::NONCE_LEN];
+        nonce[..8].copy_from_slice(&stamp.to_be_bytes());
+        let mut frame = Vec::new();
+        codec
+            .seal(PacketKind::Stream, &[msg], &nonce, &mut frame)
+            .unwrap();
+        frame
+    }
+
+    /// Records in the push-pull `n` wrote to `conn`, and whether it closed the connection.
+    fn answer(n: &mut Node, conn: StreamId) -> (Option<usize>, bool) {
+        let codec = kinship_proto::Codec::encrypted(
+            b"default",
+            kinship_proto::Limits::default(),
+            vec![key()],
+        )
+        .unwrap();
+        let (mut records, mut closed) = (None, false);
+        while let Some(t) = n.poll_transmit() {
+            match t {
+                Transmit::Stream { conn: c, mut frame } if c == conn => {
+                    let payload = codec.open(PacketKind::Stream, &mut frame[4..]).unwrap();
+                    if let Some(Message::PushPull(p)) = payload.iter().next() {
+                        records = Some(p.records.len());
+                    }
+                }
+                Transmit::Close { conn: c } if c == conn => closed = true,
+                _ => {}
+            }
+        }
+        (records, closed)
+    }
+
+    #[test]
+    fn recorded_push_pulls_are_answered_with_no_more_than_one_record() {
+        let mut b = secure_node("b", 2);
+        b.add_member(Instant::ZERO, "c", addr(3)).unwrap();
+        // Nodes that have been running for 100 s, waking every second.
+        let run = |b: &mut Node| {
+            for s in 1..=100 {
+                b.handle_timeout(Instant::ZERO + Duration::from_secs(s));
+                while b.poll_transmit().is_some() {}
+            }
+        };
+        run(&mut b);
+        let t = Instant::ZERO + Duration::from_secs(100);
+        let frame = recorded_push_pull(95_000);
+        let known = b.all_members().count();
+
+        b.handle_stream(t, StreamId::inbound(0), StreamEvent::Frame(&frame));
+        assert_eq!(
+            answer(&mut b, StreamId::inbound(0)),
+            (Some(known + 2), true)
+        );
+        assert!(b.member("ghost").is_some());
+
+        // The same frame again, inside the window: a copy, closed unanswered.
+        b.handle_stream(t, StreamId::inbound(1), StreamEvent::Frame(&frame));
+        assert_eq!(answer(&mut b, StreamId::inbound(1)), (None, true));
+        assert_eq!(b.metrics().replays_dropped, 1);
+
+        // A recording older than the window: only b's own record goes back, nothing merges.
+        let mut b = secure_node("b", 2);
+        run(&mut b);
+        let old = recorded_push_pull(60_000);
+        b.handle_stream(t, StreamId::inbound(0), StreamEvent::Frame(&old));
+        assert_eq!(answer(&mut b, StreamId::inbound(0)), (Some(1), true));
+        assert!(b.member("ghost").is_none() && b.member("x").is_none());
+        assert_eq!(b.metrics().replays_dropped, 1);
+        assert_eq!(b.metrics().push_pulls_served, 0);
     }
 
     #[test]
