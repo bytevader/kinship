@@ -115,7 +115,7 @@ Incarnation is a u32 per member. A node starts at 0, or at the value it learns a
 | Dead(i) or Left(i) | Alive or Suspect(j) | i ≥ j |
 | any | Dead or Left(j) | only Alive(i) with i > j |
 
-When a node receives Suspect(i) or Dead(i) naming itself with i ≥ its own incarnation, it sets its incarnation to i + 1, broadcasts Alive, and raises its local health score. Dead and Left members stay as tombstones for dead_reclaim (30 s by default) so that late rumours cannot resurrect them, then are deleted.
+When a node receives Suspect(i) or Dead(i) naming itself with i ≥ its own incarnation, it sets its incarnation to i + 1, broadcasts Alive, and raises its local health score. Dead and Left members stay as tombstones for dead_reclaim (30 s by default), or the replay window if that is longer, so that late rumours and recorded packets cannot resurrect them, then are deleted.
 
 ### Probe round
 
@@ -204,15 +204,17 @@ Every UDP datagram, and every TCP frame after a u32 big-endian length prefix, st
 | 2 | 1 | version | wire version, 1 for 0.1 |
 | 3 | 1 | flags | bit 0 encrypted, bit 1 stream frame, rest reserved and must be 0 |
 | 4 | 4 | key_id | first 4 bytes of BLAKE3(key); 0 when plaintext |
-| 8 | 24 | nonce | random XChaCha20 nonce; absent when plaintext |
+| 8 | 24 | nonce | sender's cluster time in ms (8 bytes), then 16 random bytes; absent when plaintext |
 | 32 | n | body | ciphertext of the inner payload |
 | 32 + n | 16 | tag | Poly1305 tag; absent when plaintext |
 
 The associated data for the AEAD is the 32 header bytes plus the configured cluster label (at most 255 bytes), so a packet from another cluster or a tampered header fails authentication. In plaintext mode, which exists for tests, the simulator and loopback use, an 8-byte BLAKE3 hash of the cluster label replaces key_id and nonce, giving a 12-byte header and no tag, so clusters still cannot cross-talk by accident. The encrypted overhead is 48 bytes per packet.
 
-The receiver checks, in this order and before any cryptography: the size limit, magic, version, reserved flag bits, that the stream-frame flag matches the channel the bytes arrived on (a datagram cannot be replayed as a stream frame or the reverse), that the encrypted flag matches the node's own mode (an encrypting node never accepts plaintext, so there is no downgrade), and that some installed key has the packet's key_id. Only then does it verify the tag, once per installed key with that id. A failed verification leaves the buffer untouched. The sender takes the nonce from its caller, so the sans-IO crates never draw randomness: production passes 24 bytes from the OS RNG, the simulator passes bytes from its seeded RNG.
+The receiver checks, in this order and before any cryptography: the size limit, magic, version, reserved flag bits, that the stream-frame flag matches the channel the bytes arrived on (a datagram cannot be replayed as a stream frame or the reverse), that the encrypted flag matches the node's own mode (an encrypting node never accepts plaintext, so there is no downgrade), and that some installed key has the packet's key_id. Only then does it verify the tag, once per installed key with that id. A failed verification leaves the buffer untouched. The sender takes the nonce from its caller, so kinship-proto never draws randomness: the core writes its cluster time into the first 8 bytes and fills the other 16 from its nonce generator, which production seeds from the OS RNG and the simulator from the run's seed.
 
-XChaCha20-Poly1305 is the default because its 192-bit random nonce is safe to pick at random for the life of a key, which memberlist's 96-bit AES-GCM nonce is not. AES-GCM-SIV stays an open alternative for hardware with AES acceleration and no fast ChaCha.
+Encrypted packets cannot be replayed. Cluster time is each node's monotonic clock plus an offset that only grows: a node adopts any later time it reads from an authenticated packet, so the members keep one clock between them without synchronized wall clocks. A packet stamped below the node's floor, the replay window (30 s, or twice tcp_timeout if longer) behind its cluster time, is dropped before any cryptography; a packet above it whose nonce the node already accepted is dropped after it authenticates; both count as replays_dropped. A node that has heard nobody for longer than the window, such as a process that just started, is stale until it reads a packet from the cluster: a seed answers its join with only its own record and merges nothing, and the joiner, caught up by that reply, pushes and pulls again at once. The floor follows cluster time at no more than twice the node's own clock and half a window per input, so when some member's clock jumps ahead, packets from members still on the old timeline keep arriving while the others catch up. `crates/kinship-core/src/replay.rs` has the details and SECURITY.md the attacks this stops.
+
+XChaCha20-Poly1305 is the default because its 192-bit nonce holds a timestamp beside 128 random bits, enough to pick at random for the life of a key, which memberlist's 96-bit AES-GCM nonce is not. AES-GCM-SIV stays an open alternative for hardware with AES acceleration and no fast ChaCha.
 
 ### Inner payload
 
@@ -296,6 +298,7 @@ The side that opened the connection writes its state and waits for one frame bac
 
 - TCP connections are short-lived, one exchange each, with tcp_timeout (10 s) covering connect, write and read. There is no connection pool in 0.1.
 - The listener accepts at most max_inbound_streams (64) concurrent connections, and drops the oldest beyond that, so a slow or hostile peer cannot pin the actor.
+- A frame can only be authenticated once it has all arrived, so inbound connections draw the bytes they read from one budget of twice max_stream_frame, and a connection whose read does not fit is dropped. A complete frame stays charged until the actor has handled it. A peer without a key can fill the budget but not the node's memory.
 - bind_addr and advertise_addr are separate, for NAT, containers and 0.0.0.0 binds. advertise_addr is what goes in Alive messages.
 - The driver talks to sockets through a Transport trait with send_datagram, recv_datagram, connect and accept. The default is tokio UDP and TCP. An in-memory transport backs the integration tests, and QUIC can be added later without touching the core.
 
@@ -501,7 +504,7 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 | nacks | True | Lifeguard: ask relays for Nacks and count missing ones against local health |
 | dynamic_suspicion | True | Lifeguard: suspicion timeout starts at the maximum and shrinks with confirmations |
 | buddy_system | True | Lifeguard: Pings to a suspected member carry the suspicion first |
-| dead_reclaim | 30 s | how long Dead and Left tombstones are kept |
+| dead_reclaim | 30 s | how long Dead and Left tombstones are kept, at least the replay window |
 
 ### Gossip and sync
 
@@ -547,12 +550,14 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | Two live nodes with the same name | Alive with the same name and a different address is not applied; a NameConflict event fires on both sides | kinship-sim `failure::a_second_node_with_a_live_name_never_takes_it_thousand_seeds`; kinship-core `tests::a_second_live_node_cannot_take_a_name`; `test_cluster.py::test_two_live_nodes_with_one_name_both_see_the_conflict` |
 | Key mismatch during rotation | Packets that fail authentication are dropped and counted under decrypt_failures; the node looks dead to peers without the key | kinship-sim `keyring::a_node_that_falls_behind_dies_and_rejoins_thousand_seeds` and `keyring::rotating_every_node_never_raises_a_suspicion_thousand_seeds`; kinship `keyring::rotating_a_cluster_keeps_every_node_alive` |
 | Garbage, truncated or hostile packets | Bounds-checked decoder drops them and counts decode_errors; never panics | cargo-fuzz targets `decode_datagram`, `decode_stream_frame` and `decode_payload` in `crates/kinship-proto/fuzz`, and `node_input` in `crates/kinship-core/fuzz`, which feeds Node::handle_datagram and handle_stream and checks that the metrics only count up; kinship-core `tests::counts_good_and_bad_datagrams` |
+| Recorded packets replayed by an attacker without the key | Packets stamped before the replay window are dropped before decryption, copies inside it after authentication, and a stale push-pull is answered with the node's own record only; both count as replays_dropped | kinship-sim `replay::a_replayed_alive_never_resurrects_a_member_that_left` and `replay::a_replayed_rumour_never_kills_a_member_that_restarted`; kinship-core `tests::copies_and_stale_datagrams_are_dropped_as_replays`, `sync::tests::recorded_push_pulls_are_answered_with_no_more_than_one_record` and `sync::tests::a_node_behind_cluster_time_joins_in_two_exchanges` |
+| Partial stream frames from a peer without the key | Inbound connections share a budget of twice max_stream_frame; a read past it drops the connection | kinship-net `streams::inbound_connections_share_a_bounded_buffer` and `conn::tests::an_inbound_read_past_the_budget_drops_the_connection` |
 | Wall clock jumps (NTP, suspend) | Only monotonic time is used; a suspend looks like a long pause and is absorbed by LHM and refutation | kinship-sim `failure::a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds`, a jump alone or after a suspend; the `clippy.toml` of kinship-core, which reads no clock, and of kinship-net reject std::time::SystemTime and std::time::Instant::now |
 | Oversized metadata or member table | set_meta raises ValueError; push-pull frames over max_stream_frame are refused and counted | kinship-core `tests::new_rejects_invalid_config_and_meta`, `sync::tests::state_too_large_for_a_frame_is_refused` and `sync::tests::oversized_frames_are_dropped_before_they_are_copied`; kinship-net `streams::an_oversized_frame_is_refused_from_its_length_prefix`; `test_cluster.py::test_metadata_set_update_and_limits` |
 | Actor panic | The panic is caught, the node moves to closed, pending and later calls fail with Closed (KinshipClosed in Python), and the events iterator ends with that error | kinship-net `tests::an_actor_panic_fails_pending_and_later_calls_and_marks_events_failed`, through a hook behind the hidden test-hooks feature; `test_panic.py::test_an_actor_panic_ends_the_event_iterator_with_kinship_closed`, run in CI against a second wheel built with that feature, never the release one |
 | os.fork after start | The child raises on first use instead of hanging on a dead runtime | `test_blocking.py::test_a_forked_child_raises_instead_of_hanging` and `test_a_forked_child_can_start_its_own_cluster` |
 
-What kinship does not protect against: split-brain decisions made by the application during a partition, a member that answers probes but is otherwise broken, and a compromised node that holds a valid key.
+What kinship does not protect against: split-brain decisions made by the application during a partition, a member that answers probes but is otherwise broken, a compromised node that holds a valid key, an attacker on the path that drops or delays traffic, floods of traffic that fails authentication, traffic analysis, and anyone who can reach a node running in plaintext. SECURITY.md has the threat model, the findings of the security audit and the details of each.
 
 ## Decisions from the README review
 

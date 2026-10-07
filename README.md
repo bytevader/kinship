@@ -90,7 +90,7 @@ async with kinship.Cluster(cfg) as cluster:   # binds, then joins cfg.seeds
 | `await cluster.set_meta(meta)` | `None` | Replace this node's metadata and gossip it. |
 | `await cluster.update_meta(**changes)` | `None` | Change some metadata keys; a value of `None` deletes the key. |
 | `cluster.keyring` | `Keyring` | Runtime key rotation on this node; see Encryption. |
-| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, `decrypt_failures`, `decode_errors`. |
+| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, `decrypt_failures`, `decode_errors`, `replays_dropped`. |
 | `await cluster.leave(timeout=5.0)` | `None` | Tell the cluster this node is leaving and wait for it to spread. |
 | `await cluster.close()` | `None` | Stop the node and close sockets. Without `leave()` first, peers see a crash. |
 
@@ -171,7 +171,7 @@ Durations are seconds as `float`, or a `datetime.timedelta`. Every field is vali
 
 ## Encryption and keys
 
-Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything. Keys are 32 bytes, given as `bytes` or base64 text, and never logged.
+Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything, and packets it recorded are refused when it plays them back. Keys are 32 bytes, given as `bytes` or base64 text, and never logged. The threat model and what kinship does not protect against are in [SECURITY.md](SECURITY.md).
 
 The first key in `keys` encrypts; every key in the list decrypts. Rotate with no downtime in three steps, each run on every node:
 
