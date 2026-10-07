@@ -46,6 +46,10 @@ pub struct NodeSpec {
 #[non_exhaustive]
 pub struct Stats {
     pub sent: u64,
+    /// Payload bytes of every datagram sent, lost or not.
+    pub sent_bytes: u64,
+    /// Bytes of every stream frame sent.
+    pub stream_bytes: u64,
     pub delivered: u64,
     pub lost: u64,
     pub partitioned: u64,
@@ -667,6 +671,7 @@ impl<N: SimNode> Sim<N> {
         self.net.next_packet += 1;
         let target = self.addrs.get(&to).copied();
         self.rec.stats.sent += 1;
+        self.rec.stats.sent_bytes += payload.len() as u64;
         self.rec.push(self.rec.cfg.network, || Record::Send {
             t: now,
             packet,
@@ -801,6 +806,7 @@ impl<N: SimNode> Sim<N> {
         if self.net.blocked(from, end.node) || self.nodes[end.node].node.is_none() {
             return self.fail_conn(conn);
         }
+        self.rec.stats.stream_bytes += bytes.len() as u64;
         self.rec.push(self.rec.cfg.streams, || Record::StreamSend {
             t: now,
             node: from,
