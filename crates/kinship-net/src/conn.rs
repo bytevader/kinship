@@ -74,16 +74,24 @@ impl Budget {
 
     /// Takes `n` more bytes for `held`, or returns false and takes nothing if they do not fit.
     fn take(self: &Arc<Self>, held: &mut Held, n: usize) -> bool {
-        let fits = self
-            .left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(n)
-            })
-            .is_ok();
-        if fits {
-            held.bytes += n;
+        // A compare-exchange loop: `fetch_update` is deprecated on newer Rust, and its
+        // replacement is newer than the 1.85 MSRV.
+        let mut left = self.left.load(Ordering::Acquire);
+        loop {
+            let Some(rest) = left.checked_sub(n) else {
+                return false;
+            };
+            match self
+                .left
+                .compare_exchange_weak(left, rest, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    held.bytes += n;
+                    return true;
+                }
+                Err(now) => left = now,
+            }
         }
-        fits
     }
 
     #[cfg(test)]
