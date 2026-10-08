@@ -20,6 +20,10 @@ def test_presets_differ_only_in_timing() -> None:
     assert lan.tcp_fallback_ping and not local.tcp_fallback_ping
     assert lan.bind == "0.0.0.0:7946" and local.bind == "127.0.0.1:7946"
     assert lan.event_buffer == 1024 and lan.max_meta_bytes == 512 and lan.runtime_threads == 1
+    assert (lan.max_inbound_streams, lan.max_inbound_streams_per_ip) == (64, 16)
+    assert lan.max_inbound_bytes_per_ip is None and lan.tcp_header_timeout == 1.0
+    one_frame = lan.max_stream_frame + 4
+    assert lan.replace(max_inbound_bytes_per_ip=one_frame).max_inbound_bytes_per_ip == one_frame
     assert kinship.Config(keys=[KEY]).preset == "lan"
 
 
@@ -80,6 +84,10 @@ def test_default_names_are_generated_once_per_config() -> None:
         ({"cluster": "c" * 256}, "cluster"),
         ({"udp_max_payload": 576}, "udp_max_payload"),
         ({"max_meta_bytes": 4096}, "max_meta_bytes"),
+        ({"max_inbound_streams_per_ip": 0}, "max_inbound_streams_per_ip"),
+        ({"max_inbound_bytes_per_ip": 1024}, "max_inbound_bytes_per_ip"),
+        ({"max_inbound_bytes_per_ip": "8MiB"}, "max_inbound_bytes_per_ip"),
+        ({"tcp_header_timeout": 0.0}, "tcp_header_timeout"),
     ],
 )
 def test_bad_fields_raise_config_error_naming_the_field(fields: dict, field: str) -> None:

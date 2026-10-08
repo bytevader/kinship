@@ -307,6 +307,66 @@ fn wrong_key_with_matching_id_fails_authentication_not_lookup() {
 }
 
 #[test]
+fn a_header_check_passes_what_its_codec_could_open_and_nothing_else() {
+    let both = enc(b"c", &[1, 2]);
+    let check = both.header_check();
+    for packet in [
+        seal(&enc(b"c", &[1]), PacketKind::Stream, &[ping()]),
+        seal(&enc(b"c", &[2]), PacketKind::Stream, &[ping()]),
+    ] {
+        assert_eq!(check.check(PacketKind::Stream, &packet[..8]), Ok(()));
+        assert_eq!(
+            check.check(PacketKind::Datagram, &packet),
+            Err(DecodeError::WrongPacketKind)
+        );
+    }
+    let other_key = seal(&enc(b"c", &[3]), PacketKind::Stream, &[ping()]);
+    assert_eq!(
+        check.check(PacketKind::Stream, &other_key),
+        Err(DecodeError::UnknownKey(key(3).id()))
+    );
+    let plain_c = seal(&plain(b"c"), PacketKind::Stream, &[ping()]);
+    assert_eq!(
+        check.check(PacketKind::Stream, &plain_c),
+        Err(DecodeError::EncryptionMismatch)
+    );
+    assert_eq!(
+        check.check(PacketKind::Stream, &other_key[..7]),
+        Err(DecodeError::Truncated)
+    );
+    let mut bad = seal(&enc(b"c", &[1]), PacketKind::Stream, &[ping()]);
+    bad[0] = b'x';
+    assert_eq!(
+        check.check(PacketKind::Stream, &bad),
+        Err(DecodeError::BadMagic)
+    );
+
+    // Plaintext checks the start of the label's hash in place of a key id.
+    let check = plain(b"c").header_check();
+    assert_eq!(check.check(PacketKind::Stream, &plain_c), Ok(()));
+    let plain_d = seal(&plain(b"d"), PacketKind::Stream, &[ping()]);
+    assert_eq!(
+        check.check(PacketKind::Stream, &plain_d),
+        Err(DecodeError::WrongCluster)
+    );
+    let sealed = seal(&enc(b"c", &[1]), PacketKind::Stream, &[ping()]);
+    assert_eq!(
+        check.check(PacketKind::Stream, &sealed),
+        Err(DecodeError::EncryptionMismatch)
+    );
+
+    // A key installed later passes only once a new check is taken.
+    let mut codec = enc(b"c", &[1]);
+    let before = codec.header_check();
+    codec.install_key(key(3)).unwrap();
+    assert!(before.check(PacketKind::Stream, &other_key).is_err());
+    assert_eq!(
+        codec.header_check().check(PacketKind::Stream, &other_key),
+        Ok(())
+    );
+}
+
+#[test]
 fn key_debug_never_prints_key_bytes() {
     let s = format!("{:?}", Key::from_bytes([0xAB; 32]));
     assert!(!s.to_lowercase().contains("abab"));

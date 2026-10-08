@@ -2,7 +2,7 @@
 
 Report a vulnerability privately, through a GitHub security advisory on this repository, rather than in a public issue.
 
-This file holds kinship's threat model and the findings of the security audit of 2026-10-07, which looked at kinship first as an attacker on the network who holds no key, then as a compromised member that does. Findings marked Fixed were fixed in the same change; the rest are documented here with a reproduction and the fix we recommend. The architecture is in `docs/design.md` and the public API in `README.md`.
+This file holds kinship's threat model and the findings of the security audit of 2026-10-07, which looked at kinship first as an attacker on the network who holds no key, then as a compromised member that does. Findings marked Fixed were fixed in the same change or since, each with a Fix paragraph and what remains; the rest are documented here with a reproduction and the fix we recommend. The architecture is in `docs/design.md` and the public API in `README.md`.
 
 ## Threat model
 
@@ -26,6 +26,7 @@ Other processes on the same host count as network attackers, except in plaintext
 - A recording is useless once it is older than the replay window (30 s, or twice `tcp_timeout` if that is longer), and a copy of a packet is useless at once (KS-01). Tombstones outlive the window, so no recording can bring back a member that left or died.
 - No reply goes to an address it chooses: replies go to addresses inside authenticated messages, never to a datagram's source address. A packet that does not authenticate gets no reply at all, and a stale push-pull that does gets at most the answering node's own record.
 - What it sends costs bounded work and memory: header checks before any cryptography, at most one tag verification per installed key with the packet's key id, frame lengths checked from their prefix, and at most twice `max_stream_frame` held for unauthenticated stream frames across all connections (KS-02).
+- From one address it cannot keep a node from serving others over TCP: it gets at most 16 of the node's inbound connections and one largest frame's worth of the inbound buffer, a new connection when all are taken displaces the address with the most, and a connection that does not start with a header for this node within a second is dropped (KS-03).
 
 A compromised member is outside these guarantees: see "What kinship does not protect against".
 
@@ -44,7 +45,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | --- | --- | --- | --- | --- |
 | KS-01 | High | no key | Recorded datagrams and push-pull frames were accepted again | Fixed |
 | KS-02 | High | no key | Unauthenticated stream frames could pin 512 MiB | Fixed |
-| KS-03 | Medium | no key | A connection flood evicts real inbound exchanges | Open |
+| KS-03 | Medium | no key | A connection flood evicted real inbound exchanges | Fixed |
 | KS-04 | Medium | no key | Plaintext mode accepts forgeries and reflects 46x | Open |
 | KS-05 | Low | no key | Key id lookup timing reveals installed keys | Open |
 | KS-06 | Low | no key | Nonce bytes come from a non-cryptographic generator | Open |
@@ -93,15 +94,28 @@ A stream frame can only be authenticated once all of it has arrived. Each inboun
 
 **Fix:** inbound connections draw every byte they read from one budget of twice `max_stream_frame` (`conn::Budget` in kinship-net). A read that does not fit drops the connection. Once a frame is complete, the connection's read buffers are freed and only the frame stays charged, until the actor has handled it. Outbound connections are not charged: they are bounded by the exchanges the node itself starts.
 
-### KS-03 A connection flood evicts real inbound exchanges
+### KS-03 A connection flood evicted real inbound exchanges
 
-**Severity:** Medium. **Status:** Open.
+**Severity:** Medium. **Status:** Fixed.
 
-Beyond `max_inbound_streams` (64) the node drops its oldest inbound connection, and since KS-02 a connection whose read does not fit the budget is dropped too. A peer without a key that opens connections faster than real exchanges complete, or that fills the budget with partial frames, makes this node fail every join through it, every push-pull other members start with it and every TCP fallback ping to it. UDP probing is unaffected, so nothing is declared dead, but joins, anti-entropy and the one-way-UDP failure mode depend on the attacker's restraint.
+Beyond `max_inbound_streams` (64) the node dropped its oldest inbound connection, and since KS-02 a connection whose read did not fit the budget was dropped too. A peer without a key that opened connections faster than real exchanges completed, or that filled the budget with partial frames, made the node fail every join through it, every push-pull other members started with it and every TCP fallback ping to it. UDP probing was unaffected, so nothing was declared dead, but joins, anti-entropy and the one-way-UDP failure mode depended on the attacker's restraint.
 
-**Reproduction:** kinship-net `streams::a_full_inbound_budget_refuses_a_real_join` (ignored): three connections send partial frames that leave less of the budget than a real frame needs, and a real node's `join()` through the node fails for as long as they wait, up to `tcp_timeout`. Keeping it up costs twice `max_stream_frame` every `tcp_timeout`, 13 Mbit/s with the defaults. `streams::beyond_64_inbound_connections_the_oldest_are_dropped` shows connections evicting each other.
+**Reproduction:** kinship-net `streams::a_peer_that_fills_the_inbound_budget_cannot_refuse_a_real_join`, which was the ignored `a_full_inbound_budget_refuses_a_real_join`: partial frames leave 10 bytes of the 2 MiB budget, less than any real frame, and a real node joins through the node. Before the fix the join failed for as long as the partial frames waited, up to `tcp_timeout`, and keeping that up cost twice `max_stream_frame` every `tcp_timeout`, 13 Mbit/s with the defaults. The test now sends the partial frames from three addresses, each within its share and with a valid header, and the join gets through. Unit tests: kinship-net `conn::tests::an_address_holds_at_most_its_share_and_room_comes_from_the_address_holding_the_most`, `conn::tests::a_read_past_the_budget_evicts_a_partial_frame_of_the_address_holding_the_most`, `conn::tests::a_connection_without_a_header_for_this_node_is_dropped_early` and `actor::tests::a_new_connection_evicts_its_own_address_first_then_the_address_with_the_most`; kinship-net `streams::inbound_connections_are_capped_per_address_then_taken_from_the_address_with_the_most` and `streams::a_connection_must_start_with_a_header_for_this_node`; kinship-proto `a_header_check_passes_what_its_codec_could_open_and_nothing_else`.
 
-**Recommended fix:** cap concurrent connections and budget per source IP address, evict from the address holding the most, and drop a connection whose first 8 bytes are not a valid header for this node (magic, version, flags, an installed key id) within a second.
+**Fix:** inbound connections are limited per source address, and an address that has used its share cannot take room from the others (`conn::Budget` and `actor::evict_for` in kinship-net):
+
+- Connections: one address keeps at most `max_inbound_streams_per_ip` (16) at once, and a new one beyond that drops that address's oldest. Once all `max_inbound_streams` (64) are taken, a new connection drops the oldest of the address with the most, so a flood from one address only ever displaces itself.
+- Bytes: the connections from one address hold at most `max_inbound_bytes_per_ip` of the budget, by default one largest frame, `max_stream_frame` and its 4-byte length prefix, and a read past that drops its connection. A read past the whole budget evicts the partial frame holding the most of the address holding the most, if that address holds more than the reader's, and waits until its task has given the bytes back, so the budget still bounds memory. Otherwise the reader is dropped.
+- Header: the first 8 bytes of an inbound frame after its length prefix must be a header for this node, with the magic, version and flags of a stream frame in the node's mode and an installed key's id, or in plaintext mode the start of the label's hash. They are checked as soon as they arrive, against a `HeaderCheck` the actor takes from the core after every keyring command, and must arrive within `tcp_header_timeout` (1 s), or `tcp_timeout` if that is shorter. A connection that sends anything else is dropped at once, and one that sends nothing after that second rather than after `tcp_timeout`.
+
+The three new limits are fields of the kinship and Python configs, validated with the others: `max_inbound_bytes_per_ip` must hold at least one largest frame.
+
+**What remains:**
+
+- A peer with many addresses gets a share for each: an IPv6 host can use a whole prefix, and a botnet has many hosts. Together they can still take every connection slot and the whole budget, and a real exchange is then evicted when its frame holds more than any one of their addresses does, such as a push-pull of a large member table. Addresses are counted one by one rather than by prefix, because the members of one IPv6 subnet share their prefix.
+- Members behind one NAT address share that address's 16 connections and one frame's worth of bytes: when two of them send this node large frames at once, the second is dropped and its exchange fails, as one beyond `max_stream_frame` would.
+- The header check passes anyone who has seen a packet of the cluster, since key ids and the label's hash are sent in the clear (KS-09). It shuts out peers that have not, such as scanners and nodes of other clusters, and makes the rest send a valid header within a second.
+- Whether a connection survives its header tells a peer whether the node has a given key id installed. A peer can only ask about ids it already knows, since an id is 32 bits of a key's hash; see KS-05.
 
 ### KS-04 Plaintext mode accepts forgeries and reflects 46x
 
@@ -221,7 +235,7 @@ Every node adopts the latest cluster time it authenticates, and the replay floor
 
 - **A compromised member.** A node that holds a valid key can forge any rumour about any member (KI-01 to KI-06). Remove it by rotating the key on every other node: install a new key, use it, remove the old one.
 - **Dropping and delaying traffic.** An attacker on the path that drops a member's packets makes it look dead, as a real failure would; that is what a failure detector reports. Partitions are healed when traffic flows again, not prevented.
-- **Floods.** A peer without a key can fill a node's UDP socket, CPU or inbound connection slots with traffic that fails authentication (KS-03). Each packet costs at most one tag verification per installed key with its key id, and no reply.
+- **Floods.** A peer without a key can fill a node's UDP socket or CPU with traffic that fails authentication, and one with many addresses can fill its inbound connection slots and buffer (KS-03). Each packet costs at most one tag verification per installed key with its key id, and no reply.
 - **Traffic analysis.** Sizes, timing, addresses, key ids and the cluster time stamp are visible (KS-09).
 - **Plaintext mode.** `insecure_plaintext=True`, and `Config.local()` on loopback, trust everyone who can reach the port, have no replay protection, and reflect forged Pings with gossip (KS-04).
 - **The application's own decisions.** Split-brain decisions made during a partition, and a member that answers probes but is otherwise broken.

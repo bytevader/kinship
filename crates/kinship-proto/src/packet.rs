@@ -278,6 +278,20 @@ impl Codec {
         }
     }
 
+    /// What the first [`HeaderCheck::LEN`] bytes of a packet must hold for this codec, with
+    /// the keys installed now.
+    pub fn header_check(&self) -> HeaderCheck {
+        let mut label = [0; 4];
+        label.copy_from_slice(&self.label_hash[..4]);
+        HeaderCheck {
+            key_ids: match &self.security {
+                Security::Plaintext => None,
+                Security::Encrypted(keys) => Some(keys.iter().map(Key::id).collect()),
+            },
+            label,
+        }
+    }
+
     /// Adds `key` to the keys that open packets, after the existing ones. Does nothing if it is
     /// already installed.
     pub fn install_key(&mut self, key: Key) -> Result<(), KeyringError> {
@@ -462,22 +476,7 @@ impl Codec {
         if buf.len() > self.limit(kind) {
             return Err(DecodeError::TooLarge);
         }
-        let [m0, m1, version, flags, ..] = *buf else {
-            return Err(DecodeError::Truncated);
-        };
-        if [m0, m1] != MAGIC {
-            return Err(DecodeError::BadMagic);
-        }
-        if version == 0 || version > WIRE_VERSION {
-            return Err(DecodeError::UnsupportedVersion(version));
-        }
-        if flags & FLAGS_RESERVED != 0 {
-            return Err(DecodeError::ReservedFlags);
-        }
-        if (flags & FLAG_STREAM != 0) != (kind == PacketKind::Stream) {
-            return Err(DecodeError::WrongPacketKind);
-        }
-        let encrypted = flags & FLAG_ENCRYPTED != 0;
+        let encrypted = check_start(kind, buf)?;
         let range = match (&self.security, encrypted) {
             (Security::Plaintext, false) => {
                 let hash = buf
@@ -531,6 +530,66 @@ impl Codec {
             _ => return Err(DecodeError::EncryptionMismatch),
         };
         Payload::parse(&buf[range], &self.limits)
+    }
+}
+
+/// Checks the magic, version and flags that start every packet, and that the packet is of
+/// `kind`. Returns whether it is encrypted.
+fn check_start(kind: PacketKind, buf: &[u8]) -> Result<bool, DecodeError> {
+    let [m0, m1, version, flags, ..] = *buf else {
+        return Err(DecodeError::Truncated);
+    };
+    if [m0, m1] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    if version == 0 || version > WIRE_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    if flags & FLAGS_RESERVED != 0 {
+        return Err(DecodeError::ReservedFlags);
+    }
+    if (flags & FLAG_STREAM != 0) != (kind == PacketKind::Stream) {
+        return Err(DecodeError::WrongPacketKind);
+    }
+    Ok(flags & FLAG_ENCRYPTED != 0)
+}
+
+/// What the first [`LEN`](Self::LEN) bytes of a packet must hold for one [`Codec`]: magic,
+/// version, flags, and an installed key's id, or in plaintext mode the start of the cluster
+/// label's hash. These are the checks [`Codec::open`] makes before any cryptography that need
+/// nothing past the key id.
+///
+/// A driver uses it to drop a TCP connection that does not start like a frame for this node
+/// before the rest of the frame arrives. It is a copy: take a new one from
+/// [`Codec::header_check`] whenever the keys change. Like the header itself, passing it proves
+/// nothing about the sender: key ids are sent in the clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCheck {
+    /// Ids of the installed keys; `None` in plaintext mode.
+    key_ids: Option<Vec<u32>>,
+    /// The first bytes of BLAKE3(label), which a plaintext header carries after its flags.
+    label: [u8; 4],
+}
+
+impl HeaderCheck {
+    /// Bytes checked: magic, version, flags and key id.
+    pub const LEN: usize = 8;
+
+    /// Checks the first [`LEN`](Self::LEN) bytes of a packet of `kind`. Fewer bytes fail as
+    /// [`DecodeError::Truncated`]; bytes past them are ignored.
+    pub fn check(&self, kind: PacketKind, head: &[u8]) -> Result<(), DecodeError> {
+        let head = head.get(..Self::LEN).ok_or(DecodeError::Truncated)?;
+        let encrypted = check_start(kind, head)?;
+        let id = [head[4], head[5], head[6], head[7]];
+        match &self.key_ids {
+            None if encrypted => Err(DecodeError::EncryptionMismatch),
+            None if id != self.label => Err(DecodeError::WrongCluster),
+            Some(_) if !encrypted => Err(DecodeError::EncryptionMismatch),
+            Some(ids) if !ids.contains(&u32::from_be_bytes(id)) => {
+                Err(DecodeError::UnknownKey(u32::from_be_bytes(id)))
+            }
+            _ => Ok(()),
+        }
     }
 }
 

@@ -38,7 +38,9 @@ mod time;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce};
+use kinship_proto::{
+    DecodeError, KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce,
+};
 
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
@@ -50,7 +52,7 @@ use crate::table::{Entry, Table};
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
-pub use kinship_proto::{Key, KeyError, KeyId, Limits, WIRE_VERSION};
+pub use kinship_proto::{HeaderCheck, Key, KeyError, KeyId, Limits, WIRE_VERSION};
 pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;
@@ -347,6 +349,20 @@ impl Node {
         self.out.codec.key_ids()
     }
 
+    /// What the first bytes of a packet must hold for this node with its keys now, so that a
+    /// driver can drop a connection that does not start like a frame for it before the rest
+    /// arrives. Take a new one after every keyring command.
+    pub fn header_check(&self) -> HeaderCheck {
+        self.out.codec.header_check()
+    }
+
+    /// Counts a packet the driver dropped before handing it over, because this node's
+    /// [`HeaderCheck`] refused it, as the node counts the packets it refuses itself: under
+    /// `decrypt_failures` when it names a key this node lacks, under `decode_errors` otherwise.
+    pub fn count_refused(&mut self, error: &DecodeError) {
+        self.count_error(error);
+    }
+
     fn finish_keyring(&mut self, id: CommandId, result: Result<(), KeyringError>) {
         let result = match result {
             Ok(()) => Ok(CommandOutput::Done),
@@ -471,7 +487,7 @@ impl Node {
         true
     }
 
-    fn count_error(&mut self, e: &kinship_proto::DecodeError) {
+    fn count_error(&mut self, e: &DecodeError) {
         if e.is_auth_failure() {
             self.metrics.decrypt_failures += 1;
         } else {
@@ -592,6 +608,12 @@ mod tests {
 
         n.handle_datagram(Instant::ZERO, addr(2), b"garbage");
         assert_eq!(n.metrics().decode_errors, 1);
+
+        // What a driver refused on the node's behalf is counted the same way.
+        n.count_refused(&DecodeError::UnknownKey(7));
+        n.count_refused(&DecodeError::BadMagic);
+        assert_eq!(n.metrics().decrypt_failures, 2);
+        assert_eq!(n.metrics().decode_errors, 2);
     }
 
     /// A Ping sealed at cluster time `stamp` (milliseconds), with random bytes `tail`.

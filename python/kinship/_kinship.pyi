@@ -70,7 +70,11 @@ class Config:
     max_stream_frame: int
     max_meta_bytes: int
     tcp_timeout: float
+    tcp_header_timeout: float
     max_inbound_streams: int
+    max_inbound_streams_per_ip: int
+    # None: one max_stream_frame frame and its 4-byte length prefix
+    max_inbound_bytes_per_ip: int | None
     join_retries: int
     event_buffer: int
     runtime_threads: int
