@@ -381,6 +381,7 @@ impl Node {
             ("push_pull_failures", m.push_pull_failures),
             ("push_pulls_served", m.push_pulls_served),
             ("state_too_large", m.state_too_large),
+            ("gossip_too_large", m.gossip_too_large),
             ("tcp_pings", m.tcp_pings),
             ("tcp_ping_acks", m.tcp_ping_acks),
         ] {

@@ -4,13 +4,14 @@
 //! incarnation, a Suspect wins over Alive at the same incarnation, Dead and Left win over Alive
 //! and Suspect at the same incarnation, and tombstones yield only to a newer Alive. A rumour
 //! about this node at or above its own incarnation is refuted by raising the incarnation past it
-//! and gossiping Alive.
+//! and gossiping Alive; one below it is answered by gossiping the same Alive again, since its
+//! sender missed the refutation.
 
 use core::net::SocketAddr;
 
-use kinship_proto::{Alive, Dead, Suspect};
+use kinship_proto::{Alive, Dead, Message, Suspect};
 
-use crate::broadcast::Gossip;
+use crate::broadcast::{Gossip, id};
 use crate::event::Event;
 use crate::table::Entry;
 use crate::time::Instant;
@@ -125,12 +126,7 @@ impl Node {
     pub(crate) fn on_suspect(&mut self, now: Instant, s: &Suspect<'_>) {
         let name = s.node.as_str();
         if name == self.local.member.name {
-            if s.inc >= self.local.member.incarnation {
-                // Others missed our Acks: likely this node is the slow one.
-                self.health_delta(1);
-                self.refute(s.inc);
-            }
-            return;
+            return self.about_self(s.inc);
         }
         let Some(entry) = self.table.get(name) else {
             return;
@@ -176,11 +172,7 @@ impl Node {
     pub(crate) fn on_dead(&mut self, now: Instant, d: &Dead<'_>) {
         let name = d.node.as_str();
         if name == self.local.member.name {
-            if d.inc >= self.local.member.incarnation {
-                self.health_delta(1);
-                self.refute(d.inc);
-            }
-            return;
+            return self.about_self(d.inc);
         }
         let Some(entry) = self.table.get(name) else {
             return;
@@ -203,6 +195,61 @@ impl Node {
         self.broadcast(Gossip::from_dead(d));
     }
 
+    /// A peer's push-pull holds `name` as Suspect or Dead at `inc`.
+    ///
+    /// As in memberlist, either becomes a suspicion rather than a death: this node may have
+    /// heard from the member more recently, and a suspicion lets the member refute, which is
+    /// also how a reconnect heals a partition. Unlike memberlist, the suspicion is not this
+    /// node's: it never saw the member fail, so it counts no reporter of its own and is not
+    /// gossiped, which would make every other node count this one as an independent
+    /// confirmation. A suspicion already running at that incarnation is left as it is. The
+    /// member itself is told, as by the buddy system, so that it can refute.
+    pub(crate) fn on_merged_suspicion(&mut self, now: Instant, name: &str, inc: u32) {
+        if name == self.local.member.name {
+            return self.about_self(inc);
+        }
+        let Some(entry) = self.table.get(name) else {
+            return;
+        };
+        let (state, addr) = (entry.member.state, entry.member.addr);
+        match state {
+            State::Alive if inc >= entry.member.incarnation => {}
+            State::Suspect if inc > entry.member.incarnation => {}
+            _ => return,
+        }
+        let n = self.cluster_size();
+        let member = self
+            .table
+            .update(name, State::Suspect, inc, now)
+            .member
+            .clone();
+        self.suspicions
+            .insert(name.to_owned(), Suspicion::unreported(&self.cfg, n, now));
+        if state == State::Alive {
+            self.metrics.suspicions += 1;
+            self.events.push_back(Event::MemberSuspect(member));
+        }
+        let me = self.local.member.name.clone();
+        let suspect = Message::Suspect(Suspect {
+            inc,
+            node: id(name),
+            from: id(&me),
+        });
+        let limit = self.retransmit_limit();
+        self.out.send(addr, true, &[suspect], Some(limit));
+    }
+
+    /// A Suspect or Dead about this node at `inc`.
+    fn about_self(&mut self, inc: u32) {
+        if inc >= self.local.member.incarnation {
+            // Others missed our Acks: likely this node is the slow one.
+            self.health_delta(1);
+            self.refute(inc);
+        } else {
+            self.reassert();
+        }
+    }
+
     /// Raises this node's incarnation past `seen` and gossips Alive, unless it has left.
     pub(crate) fn refute(&mut self, seen: u32) {
         if self.has_left() {
@@ -214,6 +261,17 @@ impl Node {
         me.incarnation = me.incarnation.max(seen.saturating_add(1));
         self.metrics.refutations += 1;
         self.broadcast(self.local_alive());
+    }
+
+    /// Answers a Suspect or Dead about this node below its incarnation: the sender missed the
+    /// refutation, and only this node can repair that, so its Alive is queued again at the
+    /// incarnation it already has, to ride the next packets, the Ack to a buddy Ping first.
+    /// Not a refutation: the incarnation stays, local health does not move and nothing is
+    /// counted. A node that left stays gone.
+    fn reassert(&mut self) {
+        if !self.has_left() {
+            self.broadcast(self.local_alive());
+        }
     }
 
     fn name_conflict(&mut self, member: Member, other_addr: SocketAddr) {

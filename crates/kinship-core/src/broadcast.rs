@@ -7,6 +7,7 @@ use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect};
 
 use crate::Node;
 use crate::io::{StreamId, Transmit};
+use crate::member::State;
 use crate::replay::STAMP_LEN;
 use crate::rng::Rng;
 use crate::suspicion::retransmit_limit;
@@ -113,6 +114,8 @@ struct Queued {
     /// Encoded size inside a payload.
     len: usize,
     transmits: u32,
+    /// Only sends to live members count towards the limit.
+    live_only: bool,
     /// Insertion order; newer entries go first among equals.
     id: u64,
 }
@@ -130,15 +133,31 @@ pub(crate) struct Broadcasts {
 impl Broadcasts {
     /// Queues `gossip`, replacing anything queued about the same member.
     pub fn push(&mut self, gossip: Gossip) {
+        self.push_with(gossip, false);
+    }
+
+    /// Queues `gossip` like [`push`](Self::push), but only sends to members this node holds
+    /// live count towards its limit, so it is not done while it has only reached the dead.
+    pub fn push_to_live(&mut self, gossip: Gossip) {
+        self.push_with(gossip, true);
+    }
+
+    fn push_with(&mut self, gossip: Gossip, live_only: bool) {
         self.queue.retain(|q| q.gossip.node() != gossip.node());
         let len = gossip.message().encoded_len();
         self.queue.push(Queued {
             gossip,
             len,
             transmits: 0,
+            live_only,
             id: self.next_id,
         });
         self.next_id += 1;
+    }
+
+    /// Drops anything queued about `node`.
+    pub fn forget(&mut self, node: &str) {
+        self.queue.retain(|q| q.gossip.node() != node);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -174,10 +193,14 @@ impl Broadcasts {
         order
     }
 
-    /// Counts one more send of each entry in `sent`, dropping those that reached `limit`.
-    fn sent(&mut self, sent: &[usize], limit: u32) {
+    /// Counts one more send of each entry in `sent`, to a live member if `live`, dropping those
+    /// that reached `limit`.
+    fn sent(&mut self, sent: &[usize], limit: u32, live: bool) {
         for &i in sent {
-            self.queue[i].transmits += 1;
+            let q = &mut self.queue[i];
+            if live || !q.live_only {
+                q.transmits += 1;
+            }
         }
         self.queue.retain(|q| q.transmits < limit);
     }
@@ -185,6 +208,13 @@ impl Broadcasts {
 
 /// Bytes a payload's message count can take: counts stay below 2^14 in any packet.
 const COUNT_LEN: usize = 2;
+
+/// Bytes a datagram sealed by `codec` has for its messages, past their count.
+pub(crate) fn datagram_room(codec: &Codec) -> usize {
+    codec
+        .max_payload_len(PacketKind::Datagram)
+        .saturating_sub(COUNT_LEN)
+}
 
 /// Seals packets, piggybacking queued gossip, and holds them until the driver polls.
 pub(crate) struct Outbox {
@@ -220,10 +250,17 @@ impl Outbox {
     }
 
     /// Sends `head` to `to` in one datagram, filling the space left with queued gossip that
-    /// has been sent fewer than `limit` times (none if `limit` is `None`). Sends nothing if
-    /// there is nothing to send. Returns whether a datagram was queued.
-    pub fn send(&mut self, to: SocketAddr, head: &[Message<'_>], limit: Option<u32>) -> bool {
-        let max = self.codec.max_payload_len(PacketKind::Datagram) - COUNT_LEN;
+    /// has been sent fewer than `limit` times (none if `limit` is `None`). `live` says whether
+    /// `to` is a member this node holds live, Alive or Suspect. Sends nothing if there is
+    /// nothing to send. Returns whether a datagram was queued.
+    pub fn send(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        let max = datagram_room(&self.codec);
         let used: usize = head.iter().map(Message::encoded_len).sum();
         let picked = match limit {
             Some(_) => self.broadcasts.select(max.saturating_sub(used)),
@@ -251,7 +288,7 @@ impl Outbox {
             return false;
         }
         if let Some(limit) = limit {
-            self.broadcasts.sent(&picked, limit);
+            self.broadcasts.sent(&picked, limit, live);
         }
         self.transmits.push_back(Transmit::Datagram { to, payload });
         true
@@ -277,7 +314,28 @@ impl Outbox {
 impl Node {
     /// Queues a rumour for piggybacking and gossip.
     pub(crate) fn broadcast(&mut self, gossip: Gossip) {
-        self.out.broadcasts.push(gossip);
+        self.queue_gossip(gossip, false);
+    }
+
+    /// Queues a rumour like [`broadcast`](Self::broadcast), counting only sends to members this
+    /// node holds live towards its limit.
+    pub(crate) fn broadcast_to_live(&mut self, gossip: Gossip) {
+        self.queue_gossip(gossip, true);
+    }
+
+    /// A rumour too large for any datagram, even alone, could never be sent: it is dropped and
+    /// counted, together with anything older queued about the same member, rather than kept
+    /// forever. `Config::validate` refuses limits under which this node's own rumours or any it
+    /// accepts could be that large.
+    fn queue_gossip(&mut self, gossip: Gossip, live_only: bool) {
+        if gossip.message().encoded_len() > datagram_room(&self.out.codec) {
+            self.out.broadcasts.forget(gossip.node());
+            self.metrics.gossip_too_large += 1;
+        } else if live_only {
+            self.out.broadcasts.push_to_live(gossip);
+        } else {
+            self.out.broadcasts.push(gossip);
+        }
     }
 
     /// How many times each rumour is sent, for the current cluster size.
@@ -298,24 +356,36 @@ impl Node {
         }
     }
 
-    /// Sends queued rumours to `gossip_nodes` random members, the recently dead included, so a
-    /// member wrongly declared dead hears about it and can refute.
+    /// Whether this node holds `name` as a live member, Alive or Suspect.
+    pub(crate) fn holds_live(&self, name: &str) -> bool {
+        self.table
+            .get(name)
+            .is_some_and(|e| e.member.state.is_live())
+    }
+
+    /// Sends queued rumours to `gossip_nodes` random members, those declared dead less than
+    /// `gossip_to_the_dead` ago included, so a member wrongly declared dead hears about it and
+    /// can refute. Members that left are not sent to: they have closed.
     pub(crate) fn gossip(&mut self, now: Instant) {
         if self.out.broadcasts.is_empty() {
             return;
         }
         let window = self.cfg.gossip_to_the_dead;
-        let targets: Vec<SocketAddr> = self
+        let targets: Vec<(SocketAddr, bool)> = self
             .table
             .random(self.cfg.gossip_nodes, &mut self.rng, |e| {
-                e.member.state.is_live() || now - e.since < window
+                match e.member.state {
+                    State::Alive | State::Suspect => true,
+                    State::Dead => now - e.since < window,
+                    State::Left => false,
+                }
             })
             .into_iter()
-            .map(|e| e.member.addr)
+            .map(|e| (e.member.addr, e.member.state.is_live()))
             .collect();
         let limit = self.retransmit_limit();
-        for to in targets {
-            if !self.out.send(to, &[], Some(limit)) {
+        for (to, live) in targets {
+            if !self.out.send(to, live, &[], Some(limit)) {
                 break;
             }
         }
@@ -336,6 +406,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rumour_too_large_for_any_datagram_is_dropped_and_counted() {
+        use crate::{Config, Identity, Security};
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1));
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let mut n = Node::new(cfg, Identity::new("a", addr).unwrap(), Instant::ZERO, 1).unwrap();
+        n.broadcast(suspect("b", 1));
+        assert!(n.out.broadcasts.contains("b"));
+        let room = datagram_room(&n.out.codec);
+        let huge = Gossip::Alive {
+            inc: 2,
+            node: "b".to_owned(),
+            addr,
+            meta: vec![0; room],
+            vmin: 1,
+            vmax: 1,
+        };
+        n.broadcast(huge);
+        assert_eq!(n.metrics().gossip_too_large, 1);
+        assert!(!n.out.broadcasts.contains("b"), "nor is the older one kept");
+        // Anything that fits is queued as before.
+        n.broadcast(suspect("b", 2));
+        assert!(n.out.broadcasts.contains("b"));
+        assert_eq!(n.metrics().gossip_too_large, 1);
+    }
+
+    #[test]
     fn newer_gossip_replaces_older_about_the_same_member() {
         let mut b = Broadcasts::default();
         b.push(suspect("a", 1));
@@ -352,10 +448,10 @@ mod tests {
         b.push(suspect("b", 1));
         let first = b.select(usize::MAX);
         assert_eq!(b.queue[first[0]].gossip.node(), "b");
-        b.sent(&first[..1], 2);
+        b.sent(&first[..1], 2, true);
         let next = b.select(usize::MAX);
         assert_eq!(b.queue[next[0]].gossip.node(), "a");
-        b.sent(&next, 2);
+        b.sent(&next, 2, true);
         assert_eq!(b.len(), 1, "b reached its limit of 2");
         let one = b.queue[0].len;
         assert!(b.select(one - 1).is_empty());
@@ -375,7 +471,7 @@ mod tests {
         let to = SocketAddr::from(([127, 0, 0, 1], 1));
         let mut sends = 0;
         while !out.broadcasts.is_empty() {
-            assert!(out.send(to, &[], Some(1)));
+            assert!(out.send(to, true, &[], Some(1)));
             sends += 1;
         }
         assert!(sends > 1);
@@ -390,7 +486,7 @@ mod tests {
                 Codec::insecure_plaintext(b"t", limits).unwrap(),
                 Rng::new(1)
             )
-            .send(to, &[], Some(1))
+            .send(to, true, &[], Some(1))
         );
     }
 }

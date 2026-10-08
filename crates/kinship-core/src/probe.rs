@@ -140,7 +140,8 @@ impl Node {
             &[ping][..]
         };
         let limit = self.retransmit_limit();
-        self.out.send(addr, head, Some(limit));
+        // Only live members are probed.
+        self.out.send(addr, true, head, Some(limit));
         self.metrics.probes_sent += 1;
         self.probe = Some(Probe {
             seq,
@@ -180,7 +181,7 @@ impl Node {
         let limit = self.retransmit_limit();
         let asked = u32::try_from(relays.len()).unwrap_or(u32::MAX);
         for relay in relays {
-            self.out.send(relay, &[req], Some(limit));
+            self.out.send(relay, true, &[req], Some(limit));
             self.metrics.indirect_probes += 1;
         }
         if let Some(p) = &mut self.probe {
@@ -204,7 +205,8 @@ impl Node {
         }
         let limit = self.retransmit_limit();
         let ack = Message::Ack { seq: ping.seq };
-        self.out.send(ping.source_addr, &[ack], Some(limit));
+        let live = self.holds_live(ping.source.as_str());
+        self.out.send(ping.source_addr, live, &[ack], Some(limit));
     }
 
     /// Pings the target on the requester's behalf, unless this node knows the target left.
@@ -223,7 +225,9 @@ impl Node {
                 from: req.target,
             });
             let limit = self.retransmit_limit();
-            self.out.send(req.requester_addr, &[news], Some(limit));
+            // A PingReq names its requester by address only, so it is not counted as live.
+            self.out
+                .send(req.requester_addr, false, &[news], Some(limit));
             return;
         }
         let seq = self.next_seq();
@@ -234,7 +238,8 @@ impl Node {
             source_addr: self.local.member.addr,
         });
         let limit = self.retransmit_limit();
-        self.out.send(req.target_addr, &[ping], Some(limit));
+        let live = self.holds_live(req.target.as_str());
+        self.out.send(req.target_addr, live, &[ping], Some(limit));
         // The requester's indirect phase lasts at least probe_interval - probe_timeout; the
         // Nack must land inside it, whatever this node's own health, or it counts as missing.
         let (interval, timeout) = (self.cfg.probe_interval, self.cfg.probe_timeout);
@@ -260,7 +265,7 @@ impl Node {
         if let Some(relay) = self.relays.remove(&seq) {
             let limit = self.retransmit_limit();
             let ack = Message::Ack { seq: relay.seq };
-            self.out.send(relay.requester, &[ack], Some(limit));
+            self.out.send(relay.requester, false, &[ack], Some(limit));
         }
     }
 
@@ -283,7 +288,7 @@ impl Node {
             now < r.expires
         });
         for (to, seq) in nacks {
-            self.out.send(to, &[Message::Nack { seq }], None);
+            self.out.send(to, false, &[Message::Nack { seq }], None);
         }
     }
 

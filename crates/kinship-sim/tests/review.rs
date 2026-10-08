@@ -1,9 +1,9 @@
 //! Failing reproductions of the findings in `docs/review.md`, the review of kinship-core against
 //! SWIM (Das, Gupta and Motivala, 2002), Lifeguard (Dadgar et al., 2017) and `docs/design.md`.
 //!
-//! Each test asserts what should hold and fails today. It is ignored, with its finding's id in
-//! the reason, so the suite stays green until the finding is fixed and the fix removes the
-//! `#[ignore]`. Run them with
+//! Each test asserts what should hold, and failed when the review was written. A test whose
+//! finding is still open is ignored, with the finding's id in the reason, so the suite stays
+//! green; the fix removes the `#[ignore]`. Run the ignored ones with
 //! `cargo test --release -p kinship-sim --test review -- --ignored --nocapture`. A failure names
 //! its lowest failing seed, and `KINSHIP_SEED=<seed>` replays that one.
 
@@ -286,8 +286,6 @@ fn kp01(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-01, a new node that first hears another new node keeps its replay floor \
-            far behind cluster time"]
 fn kp01_a_restarted_node_refuses_recordings_older_than_the_window() {
     check_all(seeds(8), kp01);
 }
@@ -377,8 +375,6 @@ fn kp02(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-02, leave() counts sends to members that left, so nodes that leave in a \
-            scale-down are reported dead"]
 fn kp02_nodes_that_leave_one_after_another_are_never_reported_dead() {
     check_all(seeds(16), kp02);
 }
@@ -394,12 +390,25 @@ fn kp03(seed: u64) -> Result<(), String> {
     const NODES: usize = 10;
     const DATAGRAM: usize = 576;
     let mut cfg = config();
-    // A smaller datagram, as for a path with a 576-byte MTU; every other field is lan().
+    // A smaller datagram, as for a path with a 576-byte MTU; every other field is lan(). Such
+    // limits are refused, naming the field.
     cfg.limits.udp_max_payload = DATAGRAM;
-    if cfg.validate().is_err() {
-        // Refusing such limits is one fix, and then there is nothing to run.
-        return Ok(());
+    match cfg.validate() {
+        Err(e) if e.field == "udp_max_payload" => {}
+        other => {
+            return Err(format!(
+                "seed {seed}: a {DATAGRAM}-byte datagram, which cannot carry a full Alive, \
+                 validated as {other:?}"
+            ));
+        }
     }
+    // The smallest datagram the limits accept carries the member's Alive, so it survives.
+    let datagram = (DATAGRAM..)
+        .find(|&d| {
+            cfg.limits.udp_max_payload = d;
+            cfg.validate().is_ok()
+        })
+        .expect("the default datagram is valid");
     let meta = vec![b'x'; cfg.limits.max_meta_bytes];
     let name = name_of(KP03_FULL);
     let alive = Message::Alive(Alive {
@@ -418,12 +427,6 @@ fn kp03(seed: u64) -> Result<(), String> {
     .expect("valid limits");
     // Payload bytes a datagram has for its messages and their count.
     let room = codec.max_payload_len(PacketKind::Datagram);
-    if alive.encoded_len() < room {
-        return Err(format!(
-            "seed {seed}: setup: the Alive ({} bytes) fits a datagram ({room} bytes)",
-            alive.encoded_len()
-        ));
-    }
 
     let pause = secs(20);
     let scenario = Scenario::new(NODES)
@@ -457,9 +460,8 @@ fn kp03(seed: u64) -> Result<(), String> {
         let full = &sim.node(KP03_FULL).expect("never crashed").node;
         return Err(format!(
             "seed {seed}: {} declared {} dead at {t:?}, holding it at incarnation {}. {name} is \
-             at {} after its metadata update and {} refutations, but its Alive is {} bytes and a \
-             {DATAGRAM}-byte datagram has {room} for its messages and their count, so neither \
-             left it over UDP, and it ignores suspicions below its own incarnation (KP-04)",
+             at {} after its metadata update and {} refutations; its Alive is {} bytes and a \
+             {datagram}-byte datagram has {room} for its messages and their count",
             name_of(o),
             m.name,
             m.incarnation,
@@ -472,8 +474,6 @@ fn kp03(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-03, Config accepts limits in which a member's Alive cannot fit a datagram, \
-            so it cannot refute"]
 fn kp03_a_member_with_full_metadata_survives_a_pause() {
     check_all(seeds(8), kp03);
 }
@@ -628,8 +628,6 @@ fn kp04(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-04, a member ignores a stale rumour about itself, so a node that missed its \
-            refutation declares it dead though it answers"]
 fn kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead() {
     check_all(seeds(32), kp04);
 }
@@ -774,8 +772,6 @@ fn kp05(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-05, a push-pull merge signs the peer's suspicions as this node's own \
-            confirmations"]
 fn kp05_a_node_confirms_only_suspicions_its_own_probe_raised() {
     check_all(seeds(8), kp05);
 }

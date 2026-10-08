@@ -11,7 +11,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records, Suspect};
+use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records};
 
 use crate::broadcast::{Gossip, id};
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
@@ -199,6 +199,8 @@ impl Node {
                 if self.send_state(conn, false, true) {
                     self.metrics.push_pulls_served += 1;
                 }
+                // Answering a join completes it on this side too.
+                self.joined |= p.join;
                 true
             }
             Message::Ping(p) => {
@@ -278,11 +280,10 @@ impl Node {
 
     /// Merges a peer's member table with the precedence rules, as gossip would.
     ///
-    /// As in memberlist, a peer's Dead record becomes a suspicion rather than a death: this
-    /// node may have heard from the member more recently, and a suspicion gives the member the
-    /// chance to refute. Records about members this node does not know only add them if Alive.
+    /// As in memberlist, a peer's Dead record becomes a suspicion rather than a death, but not
+    /// one this node reports; see [`Node::on_merged_suspicion`]. Records about members this
+    /// node does not know only add them if Alive.
     fn merge(&mut self, now: Instant, records: Records<'_>) {
-        let me = self.local.member.name.clone();
         for r in records.iter() {
             let a = r.alive;
             match r.state {
@@ -295,14 +296,9 @@ impl Node {
                         from: a.node,
                     },
                 ),
-                kinship_proto::State::Suspect | kinship_proto::State::Dead => self.on_suspect(
-                    now,
-                    &Suspect {
-                        inc: a.inc,
-                        node: a.node,
-                        from: id(&me),
-                    },
-                ),
+                kinship_proto::State::Suspect | kinship_proto::State::Dead => {
+                    self.on_merged_suspicion(now, a.node.as_str(), a.inc);
+                }
             }
         }
     }
@@ -434,6 +430,7 @@ impl Node {
         if ok {
             s.state = SeedState::Answered;
             join.answered += 1;
+            self.joined = true;
         } else if s.attempts < retries {
             s.state = SeedState::Waiting(now + base * (1 << (s.attempts - 1).min(16)));
         } else {
@@ -465,7 +462,9 @@ impl Node {
             node: me.name.clone(),
             from: me.name.clone(),
         };
-        self.broadcast(gossip);
+        // Sends to members that are dead or gone do not count: a leave that reached only them
+        // has told nobody.
+        self.broadcast_to_live(gossip);
         // Tell the first few members now instead of at the next gossip tick, so that a caller
         // whose leave times out and who closes the node at once has still been heard; they pass
         // it on.
@@ -484,7 +483,8 @@ impl Node {
         self.check_leave();
     }
 
-    /// Finishes a pending Leave once the Left rumour is spread, or nobody is left to tell.
+    /// Finishes a pending Leave once the Left rumour has been sent `retransmit_limit` times to
+    /// members this node holds live, or none is left to tell.
     pub(crate) fn check_leave(&mut self) {
         let Some(id) = self.sync.leaving else {
             return;
@@ -583,6 +583,7 @@ mod tests {
     use crate::config::{Config, Security};
     use crate::event::Command;
     use crate::{Identity, Member};
+    use kinship_proto::Suspect;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -725,6 +726,7 @@ mod tests {
         assert_eq!(p.nodes[1].metrics().push_pulls_served, 1);
         assert!(p.conns.is_empty(), "both ends closed");
         assert!(p.nodes[0].sync.streams.is_empty());
+        assert!(p.nodes[0].joined && p.nodes[1].joined, "on both sides");
     }
 
     #[test]
@@ -1031,6 +1033,98 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::MemberSuspect(_)));
         assert!(!suspected);
+    }
+
+    #[test]
+    fn a_merged_suspicion_counts_no_reporter_and_is_not_gossiped() {
+        let t = Instant::ZERO;
+        let mut a = node("a", 1);
+        for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+            a.add_member(t, name, addr(port)).unwrap();
+        }
+        while a.poll_transmit().is_some() {}
+        let record = |name: &'static str, port, state| Record {
+            state,
+            alive: Alive {
+                inc: 0,
+                node: id(name),
+                addr: addr(port),
+                meta: b"",
+                vmin: 1,
+                vmax: 1,
+            },
+        };
+        // A peer holds b as Suspect and c as Dead.
+        let records = [
+            record("b", 2, kinship_proto::State::Suspect),
+            record("c", 3, kinship_proto::State::Dead),
+        ];
+        a.merge(t, Records::Slice(&records));
+        for name in ["b", "c"] {
+            assert_eq!(a.member(name).unwrap().state, State::Suspect);
+            assert_eq!(a.suspicions[name].confirmations(), 0);
+            assert!(!a.out.broadcasts.contains(name), "not gossiped");
+        }
+        // Only the suspects themselves hear of it, so they can refute.
+        let told: Vec<SocketAddr> = std::iter::from_fn(|| a.poll_transmit())
+            .filter_map(|t| match t {
+                Transmit::Datagram { to, .. } => Some(to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [addr(2), addr(3)]);
+
+        // The first member to report it is its first reporter, not a confirmation.
+        let full = a.suspicions["b"].deadline;
+        let from = |r| Suspect {
+            inc: 0,
+            node: id("b"),
+            from: id(r),
+        };
+        a.on_suspect(t, &from("d"));
+        assert_eq!(a.suspicions["b"].confirmations(), 0);
+        assert_eq!(a.suspicions["b"].deadline, full);
+        // A merge that repeats it leaves it as it is.
+        a.merge(t, Records::Slice(&records[..1]));
+        assert_eq!(a.suspicions["b"].confirmations(), 0);
+        a.on_suspect(t, &from("e"));
+        assert_eq!(a.suspicions["b"].confirmations(), 1);
+        assert!(a.suspicions["b"].deadline < full);
+    }
+
+    #[test]
+    fn a_leave_counts_only_sends_to_live_members() {
+        let t0 = Instant::ZERO;
+        let mut a = node("a", 1);
+        a.add_member(t0, "b", addr(2)).unwrap();
+        a.add_member(t0, "c", addr(3)).unwrap();
+        // c was declared dead a moment ago, so gossip still goes to it in case it refutes.
+        let dead = Dead {
+            inc: 0,
+            node: id("c"),
+            from: id("b"),
+        };
+        a.on_dead(t0, &dead);
+        let cmd = a.command(t0, Command::Leave);
+        let limit = a.retransmit_limit();
+        let (mut to_b, mut to_c) = (0, 0);
+        loop {
+            while let Some(t) = a.poll_transmit() {
+                if let Transmit::Datagram { to, .. } = t {
+                    to_b += usize::from(to == addr(2));
+                    to_c += usize::from(to == addr(3));
+                }
+            }
+            let ev: Vec<Event> = std::iter::from_fn(|| a.poll_event()).collect();
+            if done(&ev, cmd).is_some() {
+                break;
+            }
+            let t = a.poll_timeout().unwrap();
+            a.handle_timeout(t);
+        }
+        // Every gossip packet carries the Left rumour to both; only b's count.
+        assert_eq!(to_b, limit as usize);
+        assert!(to_c >= to_b, "{to_c} sends to the dead member");
     }
 
     #[test]

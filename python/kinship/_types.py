@@ -192,5 +192,6 @@ class Stats:
     push_pull_failures: int
     push_pulls_served: int
     state_too_large: int
+    gossip_too_large: int
     tcp_pings: int
     tcp_ping_acks: int

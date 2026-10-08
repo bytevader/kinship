@@ -38,6 +38,9 @@ pub struct Metrics {
     pub push_pulls_served: u64,
     /// Push-pull replies refused because this node's state does not fit in `max_stream_frame`.
     pub state_too_large: u64,
+    /// Rumours dropped because they do not fit a datagram even alone. Validated limits keep
+    /// every rumour small enough, so this stays at zero unless something is wrong.
+    pub gossip_too_large: u64,
     /// Fallback pings sent over TCP after a UDP probe went unanswered.
     pub tcp_pings: u64,
     /// Probe rounds saved by a TCP Ack: UDP to that member is failing while TCP works.

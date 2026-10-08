@@ -1,9 +1,12 @@
 //! Protocol configuration, with the `lan()`, `wan()` and `local()` presets.
 
 use core::fmt;
+use core::net::{Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
-use kinship_proto::{Codec, Key, Limits, MAX_LABEL_LEN};
+use kinship_proto::{Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, Ping};
+
+use crate::broadcast::{datagram_room, id};
 
 /// How packets are protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,8 +173,24 @@ impl Config {
         if self.join_retries == 0 {
             return fail("join_retries", "must be at least 1");
         }
-        if self.codec().is_err() {
+        let Ok(codec) = self.codec() else {
             return fail("limits", "too small to hold the packet overhead");
+        };
+        let room = datagram_room(&codec);
+        if largest_probe_and_alive(self.limits.max_meta_bytes, room) > room {
+            // A member whose own Alive never fits a datagram cannot refute over UDP. Name the
+            // limit that was moved from its default.
+            return if self.limits.udp_max_payload < Limits::DEFAULT_UDP_MAX_PAYLOAD {
+                fail(
+                    "udp_max_payload",
+                    "must fit an Alive with max_meta_bytes of metadata beside a Ping",
+                )
+            } else {
+                fail(
+                    "max_meta_bytes",
+                    "must leave an Alive that fits a udp_max_payload datagram beside a Ping",
+                )
+            };
         }
         Ok(())
     }
@@ -183,6 +202,30 @@ impl Config {
             Security::InsecurePlaintext => Codec::insecure_plaintext(label, self.limits),
         }
     }
+}
+
+/// Encoded size of the largest Ping and the largest Alive a node can hold: 64-byte names, an
+/// IPv6 address and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
+fn largest_probe_and_alive(max_meta: usize, cap: usize) -> usize {
+    let name = "n".repeat(NodeId::MAX_LEN);
+    let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+    // Metadata past the whole datagram can only fail too, and is not worth allocating.
+    let meta = vec![0; max_meta.min(cap.saturating_add(1))];
+    let ping = Message::Ping(Ping {
+        seq: u32::MAX,
+        target: id(&name),
+        source: id(&name),
+        source_addr: addr,
+    });
+    let alive = Message::Alive(Alive {
+        inc: u32::MAX,
+        node: id(&name),
+        addr,
+        meta: &meta,
+        vmin: u8::MAX,
+        vmax: u8::MAX,
+    });
+    ping.encoded_len() + alive.encoded_len()
 }
 
 /// A [`Config`] or [`Identity`](crate::Identity) field holds an unusable value.
@@ -232,5 +275,35 @@ mod tests {
         let mut cfg = Config::lan(Security::InsecurePlaintext);
         cfg.limits.udp_max_payload = 4;
         assert_eq!(cfg.validate().unwrap_err().field, "limits");
+    }
+
+    #[test]
+    fn the_largest_alive_must_fit_a_datagram_beside_a_ping() {
+        let key = Security::Keys(vec![Key::from_bytes([1; 32])]);
+        // An Alive with 512 bytes of metadata, a 64-byte name and an IPv6 address is 607
+        // bytes, the largest Ping 156; a sealed datagram adds 48 and the count reserve 2.
+        let mut cfg = Config::lan(key.clone());
+        cfg.limits.udp_max_payload = 813;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.limits.udp_max_payload = 812;
+        assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
+        cfg.limits.udp_max_payload = 576;
+        assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
+
+        // With the default datagram, metadata is the limit to blame.
+        let mut cfg = Config::lan(key);
+        cfg.limits.max_meta_bytes = 1_099;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.limits.max_meta_bytes = 1_100;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
+        cfg.limits.max_meta_bytes = usize::MAX;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
+
+        // Plaintext packets carry 12 bytes of header instead of 48.
+        let mut cfg = Config::lan(Security::InsecurePlaintext);
+        cfg.limits.udp_max_payload = 777;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.limits.udp_max_payload = 776;
+        assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
     }
 }
