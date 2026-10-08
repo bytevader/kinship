@@ -16,6 +16,7 @@ fn leave_sends_the_news_before_any_timer_fires() {
         me,
         Instant::ZERO,
         1,
+        &[1; 32],
     )
     .unwrap();
     for i in 2..7u8 {

@@ -38,6 +38,9 @@ pub struct Config {
     /// Set by [`Config::local`]: plaintext needs no opt-in while `bind` is loopback.
     loopback_plaintext: bool,
     max_inbound_streams: usize,
+    max_inbound_streams_per_ip: usize,
+    max_inbound_bytes_per_ip: Option<usize>,
+    tcp_header_timeout: Duration,
     event_buffer: usize,
 }
 
@@ -69,6 +72,9 @@ impl Config {
             insecure_plaintext: false,
             loopback_plaintext,
             max_inbound_streams: Settings::DEFAULT_MAX_INBOUND_STREAMS,
+            max_inbound_streams_per_ip: Settings::DEFAULT_MAX_INBOUND_STREAMS_PER_IP,
+            max_inbound_bytes_per_ip: None,
+            tcp_header_timeout: Settings::DEFAULT_TCP_HEADER_TIMEOUT,
             event_buffer: Settings::DEFAULT_EVENT_BUFFER,
         }
     }
@@ -175,9 +181,32 @@ impl Config {
         self
     }
 
-    /// Concurrent inbound TCP exchanges; a new one beyond this drops the oldest.
+    /// Concurrent inbound TCP exchanges; a new one beyond this drops the oldest of the source
+    /// address with the most.
     pub fn with_max_inbound_streams(mut self, n: usize) -> Self {
         self.max_inbound_streams = n;
+        self
+    }
+
+    /// Concurrent inbound TCP exchanges from one source address; a new one beyond this drops
+    /// that address's oldest.
+    pub fn with_max_inbound_streams_per_ip(mut self, n: usize) -> Self {
+        self.max_inbound_streams_per_ip = n;
+        self
+    }
+
+    /// Bytes of unauthenticated inbound frames one source address may hold at once, out of the
+    /// twice `max_stream_frame` all inbound connections share. Defaults to one largest frame,
+    /// `max_stream_frame` plus its 4-byte length prefix, which is also the least it may be.
+    pub fn with_max_inbound_bytes_per_ip(mut self, bytes: usize) -> Self {
+        self.max_inbound_bytes_per_ip = Some(bytes);
+        self
+    }
+
+    /// How long an inbound TCP connection has to start with the header of a frame for this
+    /// node, or `tcp_timeout` if that is shorter.
+    pub fn with_tcp_header_timeout(mut self, timeout: Duration) -> Self {
+        self.tcp_header_timeout = timeout;
         self
     }
 
@@ -276,6 +305,9 @@ impl Config {
             meta: self.meta,
             seeds: self.seeds,
             max_inbound_streams: self.max_inbound_streams,
+            max_inbound_streams_per_ip: self.max_inbound_streams_per_ip,
+            max_inbound_bytes_per_ip: self.max_inbound_bytes_per_ip,
+            tcp_header_timeout: self.tcp_header_timeout,
             event_buffer: self.event_buffer,
         };
         settings.validate()?;
@@ -337,6 +369,20 @@ mod tests {
         assert_eq!(cfg.build().unwrap_err().field, "udp_max_payload");
         let cfg = Config::local().with_max_meta_bytes(4096);
         assert_eq!(cfg.build().unwrap_err().field, "max_meta_bytes");
+        // An address must be able to send one largest frame.
+        let cfg = Config::local().with_max_inbound_streams_per_ip(0);
+        assert_eq!(cfg.build().unwrap_err().field, "max_inbound_streams_per_ip");
+        let frame = Config::local().core().limits.max_stream_frame;
+        let cfg = Config::local().with_max_inbound_bytes_per_ip(frame + 3);
+        assert_eq!(cfg.build().unwrap_err().field, "max_inbound_bytes_per_ip");
+        assert!(
+            Config::local()
+                .with_max_inbound_bytes_per_ip(frame + 4)
+                .build()
+                .is_ok()
+        );
+        let cfg = Config::local().with_tcp_header_timeout(Duration::ZERO);
+        assert_eq!(cfg.build().unwrap_err().field, "tcp_header_timeout");
     }
 
     #[test]

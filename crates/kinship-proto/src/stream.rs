@@ -79,6 +79,17 @@ impl FrameReader {
         e
     }
 
+    /// The first `n` bytes of the frame being read, once they have arrived. `None` before
+    /// then, and for a frame whose declared length is shorter than `n`.
+    pub fn head(&self, n: usize) -> Option<&[u8]> {
+        let pending = &self.buf[self.pos..];
+        let (prefix, rest) = pending.split_first_chunk::<4>()?;
+        if (u32::from_be_bytes(*prefix) as usize) < n {
+            return None;
+        }
+        rest.get(..n)
+    }
+
     /// Bytes buffered but not yet returned as a frame.
     pub fn buffered(&self) -> usize {
         self.buf.len() - self.pos
@@ -159,6 +170,22 @@ mod tests {
             r.push(&len.to_be_bytes());
             assert_eq!(r.next_frame(), Err(DecodeError::Truncated));
         }
+    }
+
+    #[test]
+    fn the_head_of_a_frame_is_readable_before_the_rest_arrives() {
+        let bytes = frame(b"abcdefgh-and-the-rest");
+        let mut r = FrameReader::new(64);
+        r.push(&bytes[..11]);
+        assert_eq!(r.head(8), None);
+        r.push(&bytes[11..12]);
+        assert_eq!(r.head(8), Some(&b"abcdefgh"[..]));
+        assert_eq!(r.next_frame(), Ok(None));
+        // A frame declared shorter than the head never has one.
+        let mut r = FrameReader::new(64);
+        r.push(&frame(b"abcd"));
+        r.push(&frame(b"efgh"));
+        assert_eq!(r.head(8), None);
     }
 
     #[test]

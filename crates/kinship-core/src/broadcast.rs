@@ -9,7 +9,7 @@ use crate::Node;
 use crate::io::{StreamId, Transmit};
 use crate::member::State;
 use crate::replay::STAMP_LEN;
-use crate::rng::Rng;
+use crate::rng::Nonces;
 use crate::suspicion::retransmit_limit;
 use crate::time::Instant;
 
@@ -221,14 +221,15 @@ pub(crate) struct Outbox {
     pub codec: Codec,
     pub broadcasts: Broadcasts,
     pub transmits: VecDeque<Transmit>,
-    /// Nonces only; kept apart from the protocol's RNG so sealing never shifts its choices.
-    nonces: Rng,
+    /// The random bytes of nonces, apart from the protocol's RNG, which they must not give away
+    /// and whose choices sealing must not shift.
+    nonces: Nonces,
     /// Cluster time in milliseconds, which leads every nonce; the node keeps it current.
     pub stamp: u64,
 }
 
 impl Outbox {
-    pub fn new(codec: Codec, nonces: Rng) -> Self {
+    pub fn new(codec: Codec, nonces: Nonces) -> Self {
         Self {
             codec,
             broadcasts: Broadcasts::default(),
@@ -385,10 +386,31 @@ impl Node {
             .collect();
         let limit = self.retransmit_limit();
         for (to, live) in targets {
-            if !self.out.send(to, live, &[], Some(limit)) {
+            if !self.send_to(to, live, &[], Some(limit)) {
                 break;
             }
         }
+    }
+
+    /// Whether this node may send a datagram to `to`. Always with encryption, where only members
+    /// can make it send. In plaintext mode, where anyone can forge the addresses inside messages,
+    /// only to the address of a member it knows, tombstones included, or one that an Alive in
+    /// the packet it is handling announces, so that a forged packet cannot make it send to an
+    /// address of the forger's choosing.
+    pub(crate) fn may_send(&self, to: SocketAddr) -> bool {
+        self.out.codec.is_encrypted() || self.table.has_addr(to) || self.announced.contains(&to)
+    }
+
+    /// Sends `head` to `to` in one datagram with queued gossip, as [`Outbox::send`] does, if
+    /// this node [may send](Self::may_send) to `to`. Returns whether a datagram was queued.
+    pub(crate) fn send_to(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        self.may_send(to) && self.out.send(to, live, head, limit)
     }
 }
 
@@ -410,7 +432,8 @@ mod tests {
         use crate::{Config, Identity, Security};
         let addr = SocketAddr::from(([127, 0, 0, 1], 1));
         let cfg = Config::lan(Security::InsecurePlaintext);
-        let mut n = Node::new(cfg, Identity::new("a", addr).unwrap(), Instant::ZERO, 1).unwrap();
+        let me = Identity::new("a", addr).unwrap();
+        let mut n = Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap();
         n.broadcast(suspect("b", 1));
         assert!(n.out.broadcasts.contains("b"));
         let room = datagram_room(&n.out.codec);
@@ -464,7 +487,7 @@ mod tests {
             ..Limits::default()
         };
         let codec = Codec::insecure_plaintext(b"t", limits).unwrap();
-        let mut out = Outbox::new(codec, Rng::new(1));
+        let mut out = Outbox::new(codec, Nonces::new(&[1; 32]));
         for i in 0..50 {
             out.broadcasts.push(suspect(&format!("node-{i:02}"), 7));
         }
@@ -484,7 +507,7 @@ mod tests {
         assert!(
             !Outbox::new(
                 Codec::insecure_plaintext(b"t", limits).unwrap(),
-                Rng::new(1)
+                Nonces::new(&[1; 32])
             )
             .send(to, true, &[], Some(1))
         );

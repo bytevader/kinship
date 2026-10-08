@@ -17,7 +17,8 @@
 //! BLAKE3(label), giving a 12-byte header and no tag.
 
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305};
-use zeroize::Zeroize;
+use ctutils::CtEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 use crate::limits::Limits;
@@ -57,19 +58,40 @@ pub enum PacketKind {
 }
 
 /// A 32-byte XChaCha20-Poly1305 key. Zeroized on drop and never printed.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Key([u8; 32]);
+///
+/// The bytes live on the heap, so moving a key, or growing a list of keys, moves a pointer and
+/// leaves no copy of the bytes behind. Keys compare in constant time.
+#[derive(Clone)]
+pub struct Key(Box<[u8; 32]>);
+
+impl PartialEq for Key {
+    /// Looks at every byte whatever it finds, so the time taken does not tell where two keys
+    /// differ.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&*other.0).to_bool()
+    }
+}
+
+impl Eq for Key {}
 
 impl Key {
     pub const LEN: usize = 32;
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+    /// A key holding `bytes`. Copies the caller still holds are the caller's to zeroize.
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
+        let key = Self(Box::new(bytes));
+        bytes.zeroize();
+        key
     }
 
     /// Returns `None` unless `bytes` is exactly 32 bytes long.
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
-        Some(Self(bytes.try_into().ok()?))
+        if bytes.len() != Self::LEN {
+            return None;
+        }
+        let mut key = Self(Box::new([0; 32]));
+        key.0.copy_from_slice(bytes);
+        Some(key)
     }
 
     /// A key written as standard base64, with or without `=` padding, as `kinship keygen`
@@ -80,7 +102,8 @@ impl Key {
         if text.len() - digits.len() > 2 {
             return Err(KeyError::NotBase64);
         }
-        let mut key = [0u8; 32];
+        // Decoded in place, and zeroized on drop if it is not a key after all.
+        let mut key = Self(Box::new([0; 32]));
         let mut len = 0;
         let mut acc = 0u32;
         let mut bits = 0;
@@ -101,11 +124,11 @@ impl Key {
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                if len == key.len() {
+                if len == Self::LEN {
                     result = Err(KeyError::WrongLength);
                     break;
                 }
-                key[len] = (acc >> bits) as u8;
+                key.0[len] = (acc >> bits) as u8;
                 len += 1;
                 acc &= (1 << bits) - 1;
             }
@@ -114,21 +137,20 @@ impl Key {
         if result.is_ok() && (bits >= 6 || acc != 0) {
             result = Err(KeyError::NotBase64);
         }
-        if result.is_ok() && len != key.len() {
+        if result.is_ok() && len != Self::LEN {
             result = Err(KeyError::WrongLength);
         }
-        let out = result.map(|()| Self(key));
-        key.zeroize();
         acc.zeroize();
-        out
+        result.map(|()| key)
     }
 
     /// The key as padded standard base64, the form [`from_base64`](Self::from_base64) reads and
-    /// `kinship keygen` prints. The text is the secret itself: never log it.
-    pub fn to_base64(&self) -> String {
+    /// `kinship keygen` prints. The text is the secret itself: never log it. It is zeroized when
+    /// dropped, and written into its final allocation, so no copy is left behind.
+    pub fn to_base64(&self) -> Zeroizing<String> {
         const DIGITS: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(44);
+        let mut out = Zeroizing::new(String::with_capacity(44));
         for chunk in self.0.chunks(3) {
             let b = [
                 chunk[0],
@@ -151,7 +173,7 @@ impl Key {
 
     /// First 4 bytes of BLAKE3(key), big-endian. Sent in the clear to pick the right key.
     pub fn id(&self) -> u32 {
-        let hash = blake3::hash(&self.0);
+        let hash = blake3::hash(&self.0[..]);
         let b = hash.as_bytes();
         u32::from_be_bytes([b[0], b[1], b[2], b[3]])
     }
@@ -202,8 +224,45 @@ impl core::fmt::Debug for Key {
 
 enum Security {
     Plaintext,
-    /// The first key seals; every key opens.
-    Encrypted(Vec<Key>),
+    Encrypted(Keys),
+}
+
+/// The context BLAKE3 derives the dummy key in; see [`Keys::dummy`].
+const DUMMY_KEY_CONTEXT: &str = "kinship 2026-10-08 key for packets with an unknown key id";
+
+/// The installed keys, with what is worked out from them once whenever they change rather than
+/// for every packet.
+struct Keys {
+    /// The first seals; every key opens.
+    keys: Vec<Key>,
+    /// The id of each key in `keys`.
+    ids: Vec<u32>,
+    /// Checks the tag of a packet whose key id no installed key has, so that refusing it costs
+    /// the one tag verification that a packet with an installed key's id and a bad tag costs.
+    /// Derived from the sealing key, so only a holder of that key could seal a packet it opens.
+    dummy: Key,
+}
+
+impl Keys {
+    /// `keys` must not be empty.
+    fn new(keys: Vec<Key>) -> Self {
+        let (ids, dummy) = Self::derive(&keys);
+        Self { keys, ids, dummy }
+    }
+
+    /// Works out the ids and the dummy key again; call after every change to `keys`.
+    fn changed(&mut self) {
+        (self.ids, self.dummy) = Self::derive(&self.keys);
+    }
+
+    /// The ids of `keys`, and the dummy key derived from the first of them.
+    fn derive(keys: &[Key]) -> (Vec<u32>, Key) {
+        let ids = keys.iter().map(Key::id).collect();
+        let mut dummy = blake3::derive_key(DUMMY_KEY_CONTEXT, &keys[0].0[..]);
+        let key = Key::from_bytes(dummy);
+        dummy.zeroize();
+        (ids, key)
+    }
 }
 
 /// Encodes and decodes packets for one cluster.
@@ -223,7 +282,7 @@ impl Codec {
         if keys.is_empty() {
             return Err(ConfigError::NoKeys);
         }
-        Self::new(label, limits, Security::Encrypted(keys))
+        Self::new(label, limits, Security::Encrypted(Keys::new(keys)))
     }
 
     /// A codec that sends and accepts unauthenticated, unencrypted packets. This is the
@@ -258,7 +317,7 @@ impl Codec {
         if keys.is_empty() {
             return Err(ConfigError::NoKeys);
         }
-        self.security = Security::Encrypted(keys);
+        self.security = Security::Encrypted(Keys::new(keys));
         Ok(())
     }
 
@@ -274,7 +333,21 @@ impl Codec {
     pub fn key_ids(&self) -> Vec<KeyId> {
         match &self.security {
             Security::Plaintext => Vec::new(),
-            Security::Encrypted(keys) => keys.iter().map(Key::key_id).collect(),
+            Security::Encrypted(keys) => keys.ids.iter().map(|&id| KeyId(id)).collect(),
+        }
+    }
+
+    /// What the first [`HeaderCheck::LEN`] bytes of a packet must hold for this codec, with
+    /// the keys installed now.
+    pub fn header_check(&self) -> HeaderCheck {
+        let mut label = [0; 4];
+        label.copy_from_slice(&self.label_hash[..4]);
+        HeaderCheck {
+            key_ids: match &self.security {
+                Security::Plaintext => None,
+                Security::Encrypted(keys) => Some(keys.ids.clone()),
+            },
+            label,
         }
     }
 
@@ -282,8 +355,9 @@ impl Codec {
     /// already installed.
     pub fn install_key(&mut self, key: Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
-        if !keys.contains(&key) {
-            keys.push(key);
+        if !keys.keys.contains(&key) {
+            keys.keys.push(key);
+            keys.changed();
         }
         Ok(())
     }
@@ -292,10 +366,12 @@ impl Codec {
     pub fn use_key(&mut self, key: &Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
         let at = keys
+            .keys
             .iter()
             .position(|k| k == key)
             .ok_or(KeyringError::NotInstalled)?;
-        keys[..=at].rotate_right(1);
+        keys.keys[..=at].rotate_right(1);
+        keys.changed();
         Ok(())
     }
 
@@ -303,18 +379,19 @@ impl Codec {
     /// already gone, so that succeeds.
     pub fn remove_key(&mut self, key: &Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
-        match keys.iter().position(|k| k == key) {
+        match keys.keys.iter().position(|k| k == key) {
             None => Ok(()),
-            Some(_) if keys.len() == 1 => Err(KeyringError::LastKey),
+            Some(_) if keys.keys.len() == 1 => Err(KeyringError::LastKey),
             Some(0) => Err(KeyringError::InUse),
             Some(at) => {
-                keys.remove(at);
+                keys.keys.remove(at);
+                keys.changed();
                 Ok(())
             }
         }
     }
 
-    fn keys_mut(&mut self) -> Result<&mut Vec<Key>, KeyringError> {
+    fn keys_mut(&mut self) -> Result<&mut Keys, KeyringError> {
         match &mut self.security {
             Security::Plaintext => Err(KeyringError::Plaintext),
             Security::Encrypted(keys) => Ok(keys),
@@ -422,14 +499,14 @@ impl Codec {
                 write_payload(out);
             }
             Security::Encrypted(keys) => {
-                let key = &keys[0];
+                let key = &keys.keys[0];
                 flags |= FLAG_ENCRYPTED;
                 out.put_u8(flags);
-                out.put(&key.id().to_be_bytes());
+                out.put(&keys.ids[0].to_be_bytes());
                 out.put(nonce);
                 write_payload(out);
                 let aad = Aad::new(&out[start..start + ENCRYPTED_HEADER_LEN], &self.label);
-                let cipher = XChaCha20Poly1305::new((&key.0).into());
+                let cipher = XChaCha20Poly1305::new((&*key.0).into());
                 let body = &mut out[start + ENCRYPTED_HEADER_LEN..];
                 let tag = cipher
                     .encrypt_inout_detached(nonce.into(), aad.as_slice(), (&mut *body).into())
@@ -451,8 +528,9 @@ impl Codec {
     /// Authenticates, decrypts in place and parses one packet.
     ///
     /// The size limit, magic, version, flags, packet kind and key id are all checked before any
-    /// cryptography runs, so unauthenticated traffic costs at most one tag verification per
-    /// matching key. The returned payload borrows the decrypted bytes of `buf`; on success the
+    /// cryptography runs, so unauthenticated traffic costs one tag verification per installed
+    /// key with the packet's key id, or, when no key has it, one with a dummy key, so that the
+    /// time taken does not tell which ids are installed. The returned payload borrows the decrypted bytes of `buf`; on success the
     /// ciphertext has been overwritten with plaintext, on failure `buf` is unchanged.
     pub fn open<'a>(
         &self,
@@ -462,22 +540,7 @@ impl Codec {
         if buf.len() > self.limit(kind) {
             return Err(DecodeError::TooLarge);
         }
-        let [m0, m1, version, flags, ..] = *buf else {
-            return Err(DecodeError::Truncated);
-        };
-        if [m0, m1] != MAGIC {
-            return Err(DecodeError::BadMagic);
-        }
-        if version == 0 || version > WIRE_VERSION {
-            return Err(DecodeError::UnsupportedVersion(version));
-        }
-        if flags & FLAGS_RESERVED != 0 {
-            return Err(DecodeError::ReservedFlags);
-        }
-        if (flags & FLAG_STREAM != 0) != (kind == PacketKind::Stream) {
-            return Err(DecodeError::WrongPacketKind);
-        }
-        let encrypted = flags & FLAG_ENCRYPTED != 0;
+        let encrypted = check_start(kind, buf)?;
         let range = match (&self.security, encrypted) {
             (Security::Plaintext, false) => {
                 let hash = buf
@@ -504,9 +567,10 @@ impl Codec {
                 let body = &mut buf[ENCRYPTED_HEADER_LEN..tag_at];
                 let mut matched = false;
                 let mut opened = false;
-                for key in keys.iter().filter(|k| k.id() == key_id) {
+                let installed = keys.keys.iter().zip(&keys.ids);
+                for (key, _) in installed.filter(|&(_, &id)| id == key_id) {
                     matched = true;
-                    let cipher = XChaCha20Poly1305::new((&key.0).into());
+                    let cipher = XChaCha20Poly1305::new((&*key.0).into());
                     if cipher
                         .decrypt_inout_detached(
                             (&nonce).into(),
@@ -521,6 +585,18 @@ impl Codec {
                     }
                 }
                 if !matched {
+                    // One tag verification all the same, so that refusing a packet whose key
+                    // id no key has takes as long as refusing one with an installed key's id and
+                    // a bad tag, and the time does not tell which ids are installed. Should the
+                    // tag pass, which only a holder of the sealing key could arrange, the packet
+                    // is refused anyway.
+                    let cipher = XChaCha20Poly1305::new((&*keys.dummy.0).into());
+                    let _ = cipher.decrypt_inout_detached(
+                        (&nonce).into(),
+                        aad.as_slice(),
+                        (&mut *body).into(),
+                        (&tag).into(),
+                    );
                     return Err(DecodeError::UnknownKey(key_id));
                 }
                 if !opened {
@@ -531,6 +607,66 @@ impl Codec {
             _ => return Err(DecodeError::EncryptionMismatch),
         };
         Payload::parse(&buf[range], &self.limits)
+    }
+}
+
+/// Checks the magic, version and flags that start every packet, and that the packet is of
+/// `kind`. Returns whether it is encrypted.
+fn check_start(kind: PacketKind, buf: &[u8]) -> Result<bool, DecodeError> {
+    let [m0, m1, version, flags, ..] = *buf else {
+        return Err(DecodeError::Truncated);
+    };
+    if [m0, m1] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    if version == 0 || version > WIRE_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    if flags & FLAGS_RESERVED != 0 {
+        return Err(DecodeError::ReservedFlags);
+    }
+    if (flags & FLAG_STREAM != 0) != (kind == PacketKind::Stream) {
+        return Err(DecodeError::WrongPacketKind);
+    }
+    Ok(flags & FLAG_ENCRYPTED != 0)
+}
+
+/// What the first [`LEN`](Self::LEN) bytes of a packet must hold for one [`Codec`]: magic,
+/// version, flags, and an installed key's id, or in plaintext mode the start of the cluster
+/// label's hash. These are the checks [`Codec::open`] makes before any cryptography that need
+/// nothing past the key id.
+///
+/// A driver uses it to drop a TCP connection that does not start like a frame for this node
+/// before the rest of the frame arrives. It is a copy: take a new one from
+/// [`Codec::header_check`] whenever the keys change. Like the header itself, passing it proves
+/// nothing about the sender: key ids are sent in the clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCheck {
+    /// Ids of the installed keys; `None` in plaintext mode.
+    key_ids: Option<Vec<u32>>,
+    /// The first bytes of BLAKE3(label), which a plaintext header carries after its flags.
+    label: [u8; 4],
+}
+
+impl HeaderCheck {
+    /// Bytes checked: magic, version, flags and key id.
+    pub const LEN: usize = 8;
+
+    /// Checks the first [`LEN`](Self::LEN) bytes of a packet of `kind`. Fewer bytes fail as
+    /// [`DecodeError::Truncated`]; bytes past them are ignored.
+    pub fn check(&self, kind: PacketKind, head: &[u8]) -> Result<(), DecodeError> {
+        let head = head.get(..Self::LEN).ok_or(DecodeError::Truncated)?;
+        let encrypted = check_start(kind, head)?;
+        let id = [head[4], head[5], head[6], head[7]];
+        match &self.key_ids {
+            None if encrypted => Err(DecodeError::EncryptionMismatch),
+            None if id != self.label => Err(DecodeError::WrongCluster),
+            Some(_) if !encrypted => Err(DecodeError::EncryptionMismatch),
+            Some(ids) if !ids.contains(&u32::from_be_bytes(id)) => {
+                Err(DecodeError::UnknownKey(u32::from_be_bytes(id)))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -563,5 +699,83 @@ impl Aad {
 
     fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u8) -> Key {
+        Key::from_bytes([n; 32])
+    }
+
+    fn keys(c: &Codec) -> &Keys {
+        match &c.security {
+            Security::Encrypted(keys) => keys,
+            Security::Plaintext => unreachable!("an encrypting codec"),
+        }
+    }
+
+    #[test]
+    fn keys_are_equal_only_when_every_byte_is() {
+        let a = key(7);
+        assert!(a == key(7));
+        for at in [0, 1, 16, 31] {
+            let mut bytes = [7; 32];
+            bytes[at] ^= 0x80;
+            assert!(a != Key::from_bytes(bytes), "byte {at}");
+        }
+    }
+
+    #[test]
+    fn key_bytes_stay_where_they_are_when_keys_move() {
+        let first = key(1);
+        let at = first.0.as_ptr();
+        let mut keys = vec![first];
+        // Growing the list moves its keys more than once.
+        keys.extend((2..40).map(key));
+        let moved = keys.swap_remove(0);
+        assert_eq!(moved.0.as_ptr(), at);
+        let text: Zeroizing<String> = moved.to_base64();
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "written into its final allocation"
+        );
+    }
+
+    #[test]
+    fn ids_and_the_dummy_key_follow_every_change_of_keys() {
+        let mut c = Codec::encrypted(b"c", Limits::default(), vec![key(1)]).unwrap();
+        let first = keys(&c).dummy.clone();
+        assert_eq!(keys(&c).ids, [key(1).id()]);
+        c.install_key(key(2)).unwrap();
+        assert_eq!(keys(&c).ids, [key(1).id(), key(2).id()]);
+        assert!(keys(&c).dummy == first, "the sealing key did not change");
+        c.use_key(&key(2)).unwrap();
+        assert_eq!(keys(&c).ids, [key(2).id(), key(1).id()]);
+        assert!(keys(&c).dummy != first, "derived from the new sealing key");
+        c.remove_key(&key(1)).unwrap();
+        assert_eq!(keys(&c).ids, [key(2).id()]);
+        c.set_keys(vec![key(3)]).unwrap();
+        assert_eq!(keys(&c).ids, [key(3).id()]);
+        assert_eq!(c.key_ids(), [key(3).key_id()]);
+    }
+
+    #[test]
+    fn a_packet_with_an_unknown_key_id_is_refused_even_when_the_dummy_key_opens_it() {
+        let c = Codec::encrypted(b"c", Limits::default(), vec![key(1)]).unwrap();
+        let dummy = keys(&c).dummy.clone();
+        let forger = Codec::encrypted(b"c", Limits::default(), vec![dummy]).unwrap();
+        let mut pkt = Vec::new();
+        let ack = Message::Ack { seq: 1 };
+        forger
+            .seal(PacketKind::Datagram, &[ack], &[0; 24], &mut pkt)
+            .unwrap();
+        let id = keys(&forger).ids[0];
+        assert!(!keys(&c).ids.contains(&id));
+        let opened = c.open(PacketKind::Datagram, &mut pkt).map(drop);
+        assert_eq!(opened, Err(DecodeError::UnknownKey(id)));
     }
 }

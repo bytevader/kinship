@@ -58,7 +58,9 @@ impl Arm {
     }
 
     fn config(self) -> Config {
-        // Plaintext keeps the sweep fast; sealing does not change what the protocol does.
+        // Plaintext keeps the sweep fast. Sealing does not change what the protocol does here:
+        // every node starts out knowing every other's address, so plaintext's rule of sending
+        // only to members' addresses never holds a packet back.
         let cfg = Config::lan(Security::InsecurePlaintext);
         match self {
             Arm::Lifeguard => cfg,

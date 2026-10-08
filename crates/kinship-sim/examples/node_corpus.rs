@@ -169,7 +169,7 @@ fn capture(security: &Security) -> Vec<Op> {
     let mut sim = Sim::new(7, scenario, move |spec: &NodeSpec| {
         let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
         let cfg = Config::lan(security.clone());
-        let mut node = Node::new(cfg, me, spec.now, spec.seed).unwrap();
+        let mut node = Node::new(cfg, me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
         // A restarted node knows nobody until it joins.
         if spec.now == Instant::ZERO {
             for j in (0..spec.nodes).filter(|&j| j != spec.index) {

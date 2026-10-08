@@ -9,20 +9,20 @@
 //! events, so replies leave at once even in the middle of a burst.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use kinship_core::{
-    Command, CommandError, CommandId, CommandOutput, Instant, Key, KeyId, Member, Node, State,
-    StreamEvent, StreamId, Transmit,
+    Command, CommandError, CommandId, CommandOutput, HeaderCheck, Instant, Key, KeyId, Member,
+    Node, State, StreamEvent, StreamId, Transmit,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use crate::conn::{self, Budget, Report, Reports, Write};
+use crate::conn::{self, Budget, Inbound, Report, Reports, Write};
 use crate::events::{Event, Hub};
 use crate::transport::Transport;
 use crate::{Error, Stats};
@@ -189,6 +189,9 @@ struct Conn {
 pub(crate) struct Options {
     pub limits: conn::Limits,
     pub max_inbound_streams: usize,
+    pub max_inbound_streams_per_ip: usize,
+    /// Bytes of unauthenticated inbound frames one source address may hold.
+    pub max_inbound_bytes_per_ip: usize,
     pub seeds: Vec<SocketAddr>,
     pub rejoin_interval: Duration,
 }
@@ -202,10 +205,12 @@ pub(crate) struct Actor<T: Transport> {
     reports_tx: Reports,
     reports: mpsc::UnboundedReceiver<(StreamId, Report)>,
     conns: HashMap<StreamId, Conn>,
-    /// Inbound connections still running, oldest first.
-    inbound: VecDeque<StreamId>,
+    /// Inbound connections still running and the address each came from, oldest first.
+    inbound: VecDeque<(StreamId, IpAddr)>,
     /// Bytes inbound connections may hold before their frames are handled.
     budget: Arc<Budget>,
+    /// What an inbound frame must start with, for the keys installed now.
+    header: Arc<ArcSwap<HeaderCheck>>,
     next_inbound: u64,
     tasks: JoinSet<()>,
     pending: HashMap<CommandId, Pending>,
@@ -239,6 +244,9 @@ impl<T: Transport> Actor<T> {
         let (reports_tx, reports) = mpsc::unbounded_channel();
         let next_rejoin = (!opts.rejoin_interval.is_zero() && !opts.seeds.is_empty())
             .then(|| clock.now() + opts.rejoin_interval);
+        let budget =
+            Budget::for_frames(opts.limits.max_stream_frame, opts.max_inbound_bytes_per_ip);
+        let header = Arc::new(ArcSwap::from_pointee(node.header_check()));
         Self {
             node,
             clock,
@@ -249,7 +257,8 @@ impl<T: Transport> Actor<T> {
             reports,
             conns: HashMap::new(),
             inbound: VecDeque::new(),
-            budget: Budget::for_frames(opts.limits.max_stream_frame),
+            budget,
+            header,
             next_inbound: 0,
             tasks: JoinSet::new(),
             pending: HashMap::new(),
@@ -410,12 +419,16 @@ impl<T: Transport> Actor<T> {
     fn report(&mut self, conn: StreamId, report: Report) {
         let ev = match &report {
             Report::Frame { frame, .. } => StreamEvent::Frame(frame),
+            Report::Refused(e) => {
+                self.node.count_refused(e);
+                return;
+            }
             Report::Closed => StreamEvent::Closed,
             Report::Failed => StreamEvent::Failed,
             Report::Done => {
                 self.conns.remove(&conn);
                 if conn.is_inbound() {
-                    self.inbound.retain(|&c| c != conn);
+                    self.inbound.retain(|&(c, _)| c != conn);
                 }
                 while self.tasks.try_join_next().is_some() {}
                 return;
@@ -427,28 +440,38 @@ impl<T: Transport> Actor<T> {
     }
 
     fn accept(&mut self, stream: T::Stream, from: SocketAddr) {
-        if self.inbound.len() >= self.opts.max_inbound_streams {
-            if let Some(oldest) = self.inbound.pop_front() {
-                if let Some(c) = self.conns.remove(&oldest) {
-                    c.abort.abort();
-                }
-                tracing::debug!(%from, "too many inbound connections; dropped the oldest");
+        let ip = from.ip().to_canonical();
+        let full = evict_for(
+            &self.inbound,
+            ip,
+            self.opts.max_inbound_streams_per_ip,
+            self.opts.max_inbound_streams,
+        );
+        if let Some(victim) = full {
+            self.inbound.retain(|&(c, _)| c != victim);
+            if let Some(c) = self.conns.remove(&victim) {
+                c.abort.abort();
             }
+            tracing::debug!(%from, "too many inbound connections; dropped one");
         }
         let conn = StreamId::inbound(self.next_inbound);
         self.next_inbound += 1;
         let (writes, rx) = mpsc::unbounded_channel();
+        let inbound = Inbound {
+            held: self.budget.open(conn, ip),
+            header: Arc::clone(&self.header),
+        };
         let task = conn::inbound(
             stream,
             conn,
             self.opts.limits,
-            Arc::clone(&self.budget),
+            inbound,
             rx,
             self.reports_tx.clone(),
         );
         let abort = self.tasks.spawn(task);
         self.conns.insert(conn, Conn { writes, abort });
-        self.inbound.push_back(conn);
+        self.inbound.push_back((conn, ip));
     }
 
     fn request(&mut self, req: Request) {
@@ -472,6 +495,7 @@ impl<T: Transport> Actor<T> {
         if keyring {
             // Before the flush answers the caller, so key_ids() is current when the call returns.
             self.shared.key_ids.store(Arc::new(self.node.key_ids()));
+            self.header.store(Arc::new(self.node.header_check()));
         }
         self.flush(false);
     }
@@ -592,5 +616,65 @@ impl<T: Transport> Drop for Actor<T> {
     /// learn whether it came from a panic.
     fn drop(&mut self) {
         self.shared.hub.close(std::thread::panicking());
+    }
+}
+
+/// The inbound connection to drop so that one more from `ip` fits, if one must go: the oldest
+/// from `ip` once that address has `per_ip`, otherwise, once there are `total`, the oldest of the
+/// address with the most, the one whose oldest connection is oldest among equals. `inbound` is
+/// oldest first.
+fn evict_for(
+    inbound: &VecDeque<(StreamId, IpAddr)>,
+    ip: IpAddr,
+    per_ip: usize,
+    total: usize,
+) -> Option<StreamId> {
+    let oldest_of = |a: IpAddr| inbound.iter().find(|&&(_, b)| b == a).map(|&(c, _)| c);
+    if inbound.iter().filter(|&&(_, a)| a == ip).count() >= per_ip {
+        return oldest_of(ip);
+    }
+    if inbound.len() < total {
+        return None;
+    }
+    // Addresses in the order of their oldest connection, with how many each has.
+    let mut counts: Vec<(IpAddr, usize)> = Vec::new();
+    for &(_, a) in inbound {
+        match counts.iter_mut().find(|(b, _)| *b == a) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((a, 1)),
+        }
+    }
+    let most = counts.iter().map(|&(_, n)| n).max()?;
+    let (richest, _) = counts.into_iter().find(|&(_, n)| n == most)?;
+    oldest_of(richest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(i: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, i])
+    }
+
+    #[test]
+    fn a_new_connection_evicts_its_own_address_first_then_the_address_with_the_most() {
+        let conns = |of: &[u8]| -> VecDeque<(StreamId, IpAddr)> {
+            of.iter()
+                .enumerate()
+                .map(|(i, &a)| (StreamId::inbound(i as u64), ip(a)))
+                .collect()
+        };
+        let c = StreamId::inbound;
+        // Room for everyone.
+        assert_eq!(evict_for(&conns(&[1, 1, 2]), ip(1), 3, 4), None);
+        // Address 1 has its share of 2: its own oldest goes, however much room is left.
+        assert_eq!(evict_for(&conns(&[2, 1, 1]), ip(1), 2, 64), Some(c(1)));
+        // Full: the oldest of address 1, which has the most, goes to make room for 3.
+        assert_eq!(evict_for(&conns(&[2, 1, 1, 2, 1]), ip(3), 4, 5), Some(c(1)));
+        // Equals: the address whose oldest connection is oldest.
+        assert_eq!(evict_for(&conns(&[2, 1, 1, 2]), ip(3), 4, 4), Some(c(0)));
+        // A newcomer from the address with the most evicts its own oldest.
+        assert_eq!(evict_for(&conns(&[2, 1, 1]), ip(1), 4, 3), Some(c(1)));
     }
 }

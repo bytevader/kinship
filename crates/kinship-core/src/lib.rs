@@ -4,7 +4,7 @@
 //! driver feeds it datagrams, stream events, timer expiries and commands, each with the current
 //! [`Instant`], and then drains what it should send ([`Node::poll_transmit`]), what the
 //! application should hear ([`Node::poll_event`]) and when to wake it next
-//! ([`Node::poll_timeout`]). The same seed and the same inputs always give the same outputs,
+//! ([`Node::poll_timeout`]). The same seed, nonce key and inputs always give the same outputs,
 //! byte for byte, which is what lets `kinship-sim` replay any run from its seed.
 //!
 //! Encryption happens inside the core: payloads in [`Transmit`] are already sealed, and inputs
@@ -38,11 +38,14 @@ mod time;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce};
+use kinship_proto::{
+    DecodeError, KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce,
+};
 
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
 use crate::replay::Replay;
+use crate::rng::Nonces;
 use crate::suspicion::Suspicion;
 use crate::sync::Sync;
 use crate::table::{Entry, Table};
@@ -50,7 +53,7 @@ use crate::table::{Entry, Table};
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
-pub use kinship_proto::{Key, KeyError, KeyId, Limits, WIRE_VERSION};
+pub use kinship_proto::{HeaderCheck, Key, KeyError, KeyId, Limits, WIRE_VERSION};
 pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;
@@ -135,13 +138,25 @@ pub struct Node {
     /// another node's, or it was handed its members with [`Node::add_member`]. Until then, and
     /// while a join is in flight, its replay floor moves at once with every time it adopts.
     joined: bool,
+    /// In plaintext mode, the addresses that Alives in the packet being handled announce, which
+    /// this node may answer as if they were members already; see [`Node::may_send`].
+    announced: Vec<SocketAddr>,
 }
 
 impl Node {
-    /// A node that starts at `now`, drawing every random choice from `seed`.
+    /// A node that starts at `now`, drawing every random protocol choice from `seed`, and the
+    /// random bytes of every nonce from ChaCha20 keyed with `nonce_key`.
     ///
-    /// Production drivers must take `seed` from the OS RNG, since nonces are drawn from it.
-    pub fn new(cfg: Config, me: Identity, now: Instant, seed: u64) -> Result<Self, ConfigError> {
+    /// The core reads no randomness of its own. Production drivers must take `nonce_key` from
+    /// the OS RNG, and `seed` too; the simulator derives both from the run's seed, so that a
+    /// run replays byte for byte.
+    pub fn new(
+        mut cfg: Config,
+        me: Identity,
+        now: Instant,
+        seed: u64,
+        nonce_key: &[u8; 32],
+    ) -> Result<Self, ConfigError> {
         cfg.validate()?;
         if me.meta.len() > cfg.limits.max_meta_bytes {
             return Err(ConfigError {
@@ -149,12 +164,16 @@ impl Node {
                 reason: "must be at most max_meta_bytes",
             });
         }
-        let codec = cfg.codec().map_err(|_| ConfigError {
+        // The keys move into the codec and live nowhere else: the config the node keeps has none.
+        let codec = cfg.take_codec().map_err(|_| ConfigError {
             field: "security",
             reason: "rejected by the codec",
         })?;
         let mut rng = Rng::new(seed);
-        let nonces = rng.fork();
+        // The draw that seeded the nonce generator before nonces had a key of their own, kept so
+        // that every seed still makes the protocol choices that recorded simulator results
+        // came from.
+        rng.next_u64();
         // Stagger the first probe and gossip tick so nodes started together do not move in
         // lockstep.
         let next_probe = now + jitter(&mut rng, cfg.probe_interval);
@@ -181,7 +200,7 @@ impl Node {
             me,
             local,
             table: Table::default(),
-            out: Outbox::new(codec, nonces),
+            out: Outbox::new(codec, Nonces::new(nonce_key)),
             rng,
             now,
             next_command: 0,
@@ -198,6 +217,7 @@ impl Node {
             health: 0,
             replay,
             joined: false,
+            announced: Vec::new(),
         };
         node.out.stamp = node.replay.stamp(now);
         node.broadcast(node.local_alive());
@@ -347,6 +367,20 @@ impl Node {
         self.out.codec.key_ids()
     }
 
+    /// What the first bytes of a packet must hold for this node with its keys now, so that a
+    /// driver can drop a connection that does not start like a frame for it before the rest
+    /// arrives. Take a new one after every keyring command.
+    pub fn header_check(&self) -> HeaderCheck {
+        self.out.codec.header_check()
+    }
+
+    /// Counts a packet the driver dropped before handing it over, because this node's
+    /// [`HeaderCheck`] refused it, as the node counts the packets it refuses itself: under
+    /// `decrypt_failures` when it names a key this node lacks, under `decode_errors` otherwise.
+    pub fn count_refused(&mut self, error: &DecodeError) {
+        self.count_error(error);
+    }
+
     fn finish_keyring(&mut self, id: CommandId, result: Result<(), KeyringError>) {
         let result = match result {
             Ok(()) => Ok(CommandOutput::Done),
@@ -389,6 +423,8 @@ impl Node {
         &self.me
     }
 
+    /// The config this node runs, without its keys: those live only in the codec, so on a node
+    /// that encrypts `security` holds an empty list. [`key_ids`](Self::key_ids) lists the keys.
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -471,7 +507,7 @@ impl Node {
         true
     }
 
-    fn count_error(&mut self, e: &kinship_proto::DecodeError) {
+    fn count_error(&mut self, e: &DecodeError) {
         if e.is_auth_failure() {
             self.metrics.decrypt_failures += 1;
         } else {
@@ -480,8 +516,20 @@ impl Node {
     }
 
     /// Handles every message of an authenticated payload, in order.
+    ///
+    /// In plaintext mode this node answers only members, and a member that is new to it, one
+    /// that just joined through another node, announces itself with an Alive in the packets it
+    /// sends. The addresses those announce count as members' while the packet is handled, so
+    /// that the Ping ahead of the Alive is answered as it would be with encryption.
     fn process(&mut self, payload: &Payload<'_>) {
         let now = self.now;
+        if !self.out.codec.is_encrypted() {
+            self.announced
+                .extend(payload.iter().filter_map(|msg| match msg {
+                    Message::Alive(a) => Some(a.addr),
+                    _ => None,
+                }));
+        }
         for msg in payload.iter() {
             match msg {
                 Message::Ping(p) => self.on_ping(&p),
@@ -495,6 +543,7 @@ impl Node {
                 Message::PushPull(_) => {}
             }
         }
+        self.announced.clear();
     }
 }
 
@@ -538,7 +587,14 @@ mod tests {
 
     fn node(security: Security) -> Node {
         let cfg = Config::local(security);
-        Node::new(cfg, Identity::new("a", addr(1)).unwrap(), Instant::ZERO, 7).unwrap()
+        Node::new(
+            cfg,
+            Identity::new("a", addr(1)).unwrap(),
+            Instant::ZERO,
+            7,
+            &[7; 32],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -554,7 +610,7 @@ mod tests {
         cfg.probe_timeout = cfg.probe_interval * 2;
         let me = Identity::new("a", addr(1)).unwrap();
         assert_eq!(
-            Node::new(cfg, me.clone(), Instant::ZERO, 0)
+            Node::new(cfg, me.clone(), Instant::ZERO, 0, &[0; 32])
                 .unwrap_err()
                 .field,
             "probe_timeout"
@@ -562,7 +618,9 @@ mod tests {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let me = me.with_meta(vec![0; 513]);
         assert_eq!(
-            Node::new(cfg, me, Instant::ZERO, 0).unwrap_err().field,
+            Node::new(cfg, me, Instant::ZERO, 0, &[0; 32])
+                .unwrap_err()
+                .field,
             "meta"
         );
     }
@@ -592,6 +650,12 @@ mod tests {
 
         n.handle_datagram(Instant::ZERO, addr(2), b"garbage");
         assert_eq!(n.metrics().decode_errors, 1);
+
+        // What a driver refused on the node's behalf is counted the same way.
+        n.count_refused(&DecodeError::UnknownKey(7));
+        n.count_refused(&DecodeError::BadMagic);
+        assert_eq!(n.metrics().decrypt_failures, 2);
+        assert_eq!(n.metrics().decode_errors, 2);
     }
 
     /// A Ping sealed at cluster time `stamp` (milliseconds), with random bytes `tail`.
@@ -921,6 +985,7 @@ mod tests {
     fn a_stale_rumour_about_this_node_queues_its_alive_again() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
+        n.add_member(t, "c", addr(3)).unwrap();
         deliver(&mut n, t, &[suspect("a", 0, "c")]);
         assert_eq!(n.local().incarnation, 1);
         // The refutation has finished spreading, and c missed it.
@@ -955,6 +1020,66 @@ mod tests {
         n.out.broadcasts.forget("a");
         deliver(&mut n, t, &[suspect("a", 0, "c"), dead("a", 0, "c")]);
         assert!(!n.out.broadcasts.contains("a"));
+    }
+
+    #[test]
+    fn in_plaintext_a_node_sends_only_to_members_it_knows_or_that_the_packet_announces() {
+        let t = Instant::ZERO;
+        let ping = |seq, source: &'static str, port| {
+            Message::Ping(Ping {
+                seq,
+                target: id("a"),
+                source: id(source),
+                source_addr: addr(port),
+            })
+        };
+        let req = |seq, target: &'static str, target_port, requester_port| {
+            Message::PingReq(kinship_proto::PingReq {
+                seq,
+                target: id(target),
+                target_addr: addr(target_port),
+                requester_addr: addr(requester_port),
+                want_nack: true,
+            })
+        };
+        let mut n = node(Security::InsecurePlaintext);
+        n.add_member(t, "b", addr(2)).unwrap();
+        // A Ping or a PingReq from an address no member has gets nothing back.
+        deliver(&mut n, t, &[ping(1, "x", 9)]);
+        deliver(&mut n, t, &[req(2, "b", 2, 9)]);
+        assert_eq!(sent(&mut n), []);
+        // A member's Ping gets its Ack, with gossip.
+        deliver(&mut n, t, &[ping(3, "b", 2)]);
+        let pkts = sent(&mut n);
+        assert!(contains(&pkts, addr(2), "Ack { seq: 3 }"), "{pkts:?}");
+        assert!(contains(
+            &pkts,
+            addr(2),
+            r#"Alive(Alive { inc: 0, node: "a""#
+        ));
+        // A member new to this node announces itself in the same packet, and is answered.
+        deliver(&mut n, t, &[ping(4, "c", 3), alive("c", 0, 3)]);
+        assert!(contains(&sent(&mut n), addr(3), "Ack { seq: 4 }"));
+        // A member's PingReq for an address no member has: no Ping, and the Nack in time.
+        deliver(&mut n, t, &[req(5, "y", 8, 2)]);
+        let timeout = n.config().probe_timeout;
+        let pkts = run_until(&mut n, t + timeout);
+        assert!(pkts.iter().all(|(to, _)| *to != addr(8)), "{pkts:?}");
+        assert!(contains(&pkts, addr(2), "Nack { seq: 5 }"), "{pkts:?}");
+
+        // With encryption only members can make a node send, and nothing changes: a Ping is
+        // answered at the address it names.
+        let key = Key::from_bytes([3; 32]);
+        let mut n = node(Security::Keys(vec![key.clone()]));
+        let codec = Codec::encrypted(b"default", Limits::default(), vec![key]).unwrap();
+        n.handle_datagram(t, addr(9), &stamped_ping(&codec, 0, 1));
+        let to: Vec<SocketAddr> = std::iter::from_fn(|| n.poll_transmit())
+            .filter_map(|t| match t {
+                Transmit::Datagram { to, .. } => Some(to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(to, [addr(2)]);
     }
 
     #[test]
@@ -1126,7 +1251,7 @@ mod tests {
     impl Rounds {
         fn new(cfg: Config) -> Self {
             let me = Identity::new("a", addr(1)).unwrap();
-            let mut n = Node::new(cfg, me, Instant::ZERO, 7).unwrap();
+            let mut n = Node::new(cfg, me, Instant::ZERO, 7, &[7; 32]).unwrap();
             for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
                 n.add_member(Instant::ZERO, name, addr(port)).unwrap();
             }
@@ -1259,6 +1384,8 @@ mod tests {
     fn relays_forward_acks_and_send_nacks() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        n.add_member(t, "c", addr(3)).unwrap();
         let req = |seq| {
             Message::PingReq(kinship_proto::PingReq {
                 seq,
@@ -1289,6 +1416,7 @@ mod tests {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
         n.add_member(t, "b", addr(2)).unwrap();
+        n.add_member(t, "c", addr(3)).unwrap();
         deliver(&mut n, t, &[dead("b", 3, "b")]);
         assert_eq!(n.member("b").unwrap().state, State::Left);
         sent(&mut n);

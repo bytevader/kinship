@@ -51,14 +51,27 @@ pub struct Settings {
     /// Joined on start, and every `rejoin_interval` each one that is not a live member is
     /// push-pulled with again.
     pub seeds: Vec<SocketAddr>,
-    /// Inbound TCP connections served at once; a new one beyond this drops the oldest.
+    /// Inbound TCP connections served at once. A new one beyond this drops the oldest of the
+    /// source address with the most.
     pub max_inbound_streams: usize,
+    /// Inbound TCP connections served at once from one source address. A new one beyond this
+    /// drops that address's oldest.
+    pub max_inbound_streams_per_ip: usize,
+    /// Bytes of unauthenticated inbound frames that connections from one source address may
+    /// hold at once, out of the twice `max_stream_frame` all inbound connections share. `None`
+    /// is one largest frame: `max_stream_frame` and its 4-byte length prefix.
+    pub max_inbound_bytes_per_ip: Option<usize>,
+    /// How long an inbound TCP connection has to send the length prefix and the first 8 header
+    /// bytes of its frame, or `tcp_timeout` if that is shorter.
+    pub tcp_header_timeout: Duration,
     /// Events each subscription holds before the oldest are dropped.
     pub event_buffer: usize,
 }
 
 impl Settings {
     pub const DEFAULT_MAX_INBOUND_STREAMS: usize = 64;
+    pub const DEFAULT_MAX_INBOUND_STREAMS_PER_IP: usize = 16;
+    pub const DEFAULT_TCP_HEADER_TIMEOUT: Duration = Duration::from_secs(1);
     pub const DEFAULT_EVENT_BUFFER: usize = 1024;
 
     /// Settings with no metadata, no seeds and the default limits.
@@ -70,27 +83,52 @@ impl Settings {
             meta: Vec::new(),
             seeds: Vec::new(),
             max_inbound_streams: Self::DEFAULT_MAX_INBOUND_STREAMS,
+            max_inbound_streams_per_ip: Self::DEFAULT_MAX_INBOUND_STREAMS_PER_IP,
+            max_inbound_bytes_per_ip: None,
+            tcp_header_timeout: Self::DEFAULT_TCP_HEADER_TIMEOUT,
             event_buffer: Self::DEFAULT_EVENT_BUFFER,
         }
     }
 
+    /// Bytes of unauthenticated inbound frames one source address may hold:
+    /// `max_inbound_bytes_per_ip`, or one largest frame.
+    pub fn inbound_bytes_per_ip(&self) -> usize {
+        self.max_inbound_bytes_per_ip.unwrap_or_else(|| {
+            self.core
+                .limits
+                .max_stream_frame
+                .saturating_add(FRAME_PREFIX_LEN)
+        })
+    }
+
     /// Checks the fields the core does not; [`Memberlist::start`] calls it too.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let fail = |field, reason| Err(ConfigError { field, reason });
         if self.max_inbound_streams == 0 {
-            return Err(ConfigError {
-                field: "max_inbound_streams",
-                reason: "must be at least 1",
-            });
+            return fail("max_inbound_streams", "must be at least 1");
+        }
+        if self.max_inbound_streams_per_ip == 0 {
+            return fail("max_inbound_streams_per_ip", "must be at least 1");
+        }
+        let frame = self.core.limits.max_stream_frame;
+        if self.inbound_bytes_per_ip() < frame.saturating_add(FRAME_PREFIX_LEN) {
+            return fail(
+                "max_inbound_bytes_per_ip",
+                "must hold one max_stream_frame frame and its 4-byte length prefix",
+            );
+        }
+        if self.tcp_header_timeout.is_zero() {
+            return fail("tcp_header_timeout", "must be positive");
         }
         if self.event_buffer == 0 {
-            return Err(ConfigError {
-                field: "event_buffer",
-                reason: "must be at least 1",
-            });
+            return fail("event_buffer", "must be at least 1");
         }
         Ok(())
     }
 }
+
+/// The `u32` length prefix in front of every stream frame.
+const FRAME_PREFIX_LEN: usize = 4;
 
 /// Counters from the protocol core and this node's Lifeguard local health score.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -253,20 +291,28 @@ impl Memberlist {
 
     fn spawn<T: Transport>(settings: Settings, transport: T) -> Result<Self, Error> {
         settings.validate()?;
+        let max_inbound_bytes_per_ip = settings.inbound_bytes_per_ip();
         let local_addr = transport.local_addr();
         let advertise = settings
             .advertise
             .unwrap_or_else(|| default_advertise(local_addr));
         let me = kinship_core::Identity::new(settings.name, advertise)?.with_meta(settings.meta);
-        // The core draws every nonce from this seed, so it must come from the OS.
-        let seed = getrandom::u64().map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+        // The core draws no randomness of its own: its protocol choices come from this seed and
+        // the random bytes of its nonces from ChaCha20 under this key, both from the OS.
+        let os = |e: getrandom::Error| Error::Io(io::Error::other(e.to_string()));
+        let seed = getrandom::u64().map_err(os)?;
+        let mut nonce_key = [0u8; 32];
+        getrandom::fill(&mut nonce_key).map_err(os)?;
         let clock = Clock::new();
         let limits = conn::Limits {
             tcp_timeout: settings.core.tcp_timeout,
             max_stream_frame: settings.core.limits.max_stream_frame,
+            header_timeout: settings.tcp_header_timeout,
         };
         let rejoin_interval = settings.core.rejoin_interval;
-        let node = kinship_core::Node::new(settings.core, me, clock.now(), seed)?;
+        let node = kinship_core::Node::new(settings.core, me, clock.now(), seed, &nonce_key);
+        zeroize::Zeroize::zeroize(&mut nonce_key);
+        let node = node?;
         tracing::info!(name = node.local().name, addr = %advertise, bind = %local_addr, "node started");
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(Snapshot::of(&node)),
@@ -278,6 +324,8 @@ impl Memberlist {
         let opts = actor::Options {
             limits,
             max_inbound_streams: settings.max_inbound_streams,
+            max_inbound_streams_per_ip: settings.max_inbound_streams_per_ip,
+            max_inbound_bytes_per_ip,
             seeds: settings.seeds,
             rejoin_interval,
         };

@@ -48,6 +48,9 @@ pub struct Fields {
     keys: Vec<Key>,
     insecure_plaintext: bool,
     max_inbound_streams: usize,
+    max_inbound_streams_per_ip: usize,
+    max_inbound_bytes_per_ip: Option<usize>,
+    tcp_header_timeout: Duration,
     event_buffer: usize,
     runtime_threads: usize,
 }
@@ -71,6 +74,9 @@ impl Fields {
             keys: Vec::new(),
             insecure_plaintext: false,
             max_inbound_streams: Settings::DEFAULT_MAX_INBOUND_STREAMS,
+            max_inbound_streams_per_ip: Settings::DEFAULT_MAX_INBOUND_STREAMS_PER_IP,
+            max_inbound_bytes_per_ip: None,
+            tcp_header_timeout: Settings::DEFAULT_TCP_HEADER_TIMEOUT,
             event_buffer: Settings::DEFAULT_EVENT_BUFFER,
             runtime_threads: DEFAULT_THREADS,
         }
@@ -120,6 +126,9 @@ impl Fields {
             meta,
             seeds: self.seeds.clone(),
             max_inbound_streams: self.max_inbound_streams,
+            max_inbound_streams_per_ip: self.max_inbound_streams_per_ip,
+            max_inbound_bytes_per_ip: self.max_inbound_bytes_per_ip,
+            tcp_header_timeout: self.tcp_header_timeout,
             event_buffer: self.event_buffer,
         };
         settings.validate()?;
@@ -279,6 +288,21 @@ impl Fields {
                 self.insecure_plaintext = flag(v).ok_or_else(|| bad("must be True or False"))?
             }
             "max_inbound_streams" => self.max_inbound_streams = count(v)?,
+            "max_inbound_streams_per_ip" => self.max_inbound_streams_per_ip = count(v)?,
+            "max_inbound_bytes_per_ip" => {
+                self.max_inbound_bytes_per_ip = if v.is_none() {
+                    None
+                } else {
+                    Some(
+                        integer::<usize>(v)
+                            .ok_or_else(|| bad("must be a non-negative integer or None"))?,
+                    )
+                }
+            }
+            "tcp_header_timeout" => {
+                self.tcp_header_timeout = duration(py, v)
+                    .ok_or_else(|| bad("must be seconds as a non-negative float, or a timedelta"))?
+            }
             "event_buffer" => self.event_buffer = count(v)?,
             "runtime_threads" => self.runtime_threads = count(v)?,
             _ => {
@@ -338,7 +362,10 @@ impl Fields {
             "max_stream_frame" => c.limits.max_stream_frame.into_py_any(py),
             "max_meta_bytes" => c.limits.max_meta_bytes.into_py_any(py),
             "tcp_timeout" => secs(c.tcp_timeout),
+            "tcp_header_timeout" => secs(self.tcp_header_timeout),
             "max_inbound_streams" => self.max_inbound_streams.into_py_any(py),
+            "max_inbound_streams_per_ip" => self.max_inbound_streams_per_ip.into_py_any(py),
+            "max_inbound_bytes_per_ip" => self.max_inbound_bytes_per_ip.into_py_any(py),
             "join_retries" => c.join_retries.into_py_any(py),
             "event_buffer" => self.event_buffer.into_py_any(py),
             "runtime_threads" => self.runtime_threads.into_py_any(py),
@@ -383,7 +410,10 @@ const FIELDS: &[&str] = &[
     "max_stream_frame",
     "max_meta_bytes",
     "tcp_timeout",
+    "tcp_header_timeout",
     "max_inbound_streams",
+    "max_inbound_streams_per_ip",
+    "max_inbound_bytes_per_ip",
     "join_retries",
     "event_buffer",
     "runtime_threads",

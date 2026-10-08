@@ -77,7 +77,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut now = Instant::ZERO;
     let me = Identity::new("n0", addr(0)).unwrap();
-    let mut node = Node::new(Config::lan(security), me, now, 0).unwrap();
+    let mut node = Node::new(Config::lan(security), me, now, 0, &[0; 32]).unwrap();
     for i in 1..=3 {
         node.add_member(now, &format!("n{i}"), addr(i)).unwrap();
     }

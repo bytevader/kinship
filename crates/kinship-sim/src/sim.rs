@@ -41,6 +41,17 @@ pub struct NodeSpec {
     pub now: Instant,
 }
 
+impl NodeSpec {
+    /// The key of this instance's nonces, derived from its seed and so from the run's. Nothing
+    /// in a simulation needs nonces nobody can predict, only ones that replay.
+    pub fn nonce_key(&self) -> [u8; 32] {
+        let mut key = [0; 32];
+        // "nonces" in ASCII, so that the key's stream is not the seed's own.
+        Rng::new(self.seed ^ 0x6e6f_6e63_6573).fill(&mut key);
+        key
+    }
+}
+
 /// Counters for a run, kept whatever the trace records.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[non_exhaustive]

@@ -264,7 +264,7 @@ fn run(cell: Cell, cfg: &Config, seed: u64) -> Run {
     let cfg = cfg.clone();
     let mut sim = Sim::new(seed, scenario, move |spec| {
         let me = Identity::new(&spec.name, spec.addr).unwrap();
-        let mut node = Node::new(cfg.clone(), me, spec.now, spec.seed).unwrap();
+        let mut node = Node::new(cfg.clone(), me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
         for j in (0..spec.nodes).filter(|&j| j != spec.index) {
             node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
         }

@@ -332,6 +332,7 @@ dependencies = [
 name = "kinship-core"
 version = "0.0.0"
 dependencies = [
+ "chacha20",
  "kinship-proto",
  "serde",
 ]
@@ -356,6 +357,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
+ "ctutils",
  "proptest",
  "zeroize",
 ]
