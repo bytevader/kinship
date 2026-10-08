@@ -4,7 +4,7 @@
 //! driver feeds it datagrams, stream events, timer expiries and commands, each with the current
 //! [`Instant`], and then drains what it should send ([`Node::poll_transmit`]), what the
 //! application should hear ([`Node::poll_event`]) and when to wake it next
-//! ([`Node::poll_timeout`]). The same seed and the same inputs always give the same outputs,
+//! ([`Node::poll_timeout`]). The same seed, nonce key and inputs always give the same outputs,
 //! byte for byte, which is what lets `kinship-sim` replay any run from its seed.
 //!
 //! Encryption happens inside the core: payloads in [`Transmit`] are already sealed, and inputs
@@ -45,6 +45,7 @@ use kinship_proto::{
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
 use crate::replay::Replay;
+use crate::rng::Nonces;
 use crate::suspicion::Suspicion;
 use crate::sync::Sync;
 use crate::table::{Entry, Table};
@@ -143,10 +144,19 @@ pub struct Node {
 }
 
 impl Node {
-    /// A node that starts at `now`, drawing every random choice from `seed`.
+    /// A node that starts at `now`, drawing every random protocol choice from `seed`, and the
+    /// random bytes of every nonce from ChaCha20 keyed with `nonce_key`.
     ///
-    /// Production drivers must take `seed` from the OS RNG, since nonces are drawn from it.
-    pub fn new(cfg: Config, me: Identity, now: Instant, seed: u64) -> Result<Self, ConfigError> {
+    /// The core reads no randomness of its own. Production drivers must take `nonce_key` from
+    /// the OS RNG, and `seed` too; the simulator derives both from the run's seed, so that a
+    /// run replays byte for byte.
+    pub fn new(
+        cfg: Config,
+        me: Identity,
+        now: Instant,
+        seed: u64,
+        nonce_key: &[u8; 32],
+    ) -> Result<Self, ConfigError> {
         cfg.validate()?;
         if me.meta.len() > cfg.limits.max_meta_bytes {
             return Err(ConfigError {
@@ -159,7 +169,10 @@ impl Node {
             reason: "rejected by the codec",
         })?;
         let mut rng = Rng::new(seed);
-        let nonces = rng.fork();
+        // The draw that seeded the nonce generator before nonces had a key of their own, kept so
+        // that every seed still makes the protocol choices that recorded simulator results
+        // came from.
+        rng.next_u64();
         // Stagger the first probe and gossip tick so nodes started together do not move in
         // lockstep.
         let next_probe = now + jitter(&mut rng, cfg.probe_interval);
@@ -186,7 +199,7 @@ impl Node {
             me,
             local,
             table: Table::default(),
-            out: Outbox::new(codec, nonces),
+            out: Outbox::new(codec, Nonces::new(nonce_key)),
             rng,
             now,
             next_command: 0,
@@ -571,7 +584,14 @@ mod tests {
 
     fn node(security: Security) -> Node {
         let cfg = Config::local(security);
-        Node::new(cfg, Identity::new("a", addr(1)).unwrap(), Instant::ZERO, 7).unwrap()
+        Node::new(
+            cfg,
+            Identity::new("a", addr(1)).unwrap(),
+            Instant::ZERO,
+            7,
+            &[7; 32],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -587,7 +607,7 @@ mod tests {
         cfg.probe_timeout = cfg.probe_interval * 2;
         let me = Identity::new("a", addr(1)).unwrap();
         assert_eq!(
-            Node::new(cfg, me.clone(), Instant::ZERO, 0)
+            Node::new(cfg, me.clone(), Instant::ZERO, 0, &[0; 32])
                 .unwrap_err()
                 .field,
             "probe_timeout"
@@ -595,7 +615,9 @@ mod tests {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let me = me.with_meta(vec![0; 513]);
         assert_eq!(
-            Node::new(cfg, me, Instant::ZERO, 0).unwrap_err().field,
+            Node::new(cfg, me, Instant::ZERO, 0, &[0; 32])
+                .unwrap_err()
+                .field,
             "meta"
         );
     }
@@ -1226,7 +1248,7 @@ mod tests {
     impl Rounds {
         fn new(cfg: Config) -> Self {
             let me = Identity::new("a", addr(1)).unwrap();
-            let mut n = Node::new(cfg, me, Instant::ZERO, 7).unwrap();
+            let mut n = Node::new(cfg, me, Instant::ZERO, 7, &[7; 32]).unwrap();
             for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
                 n.add_member(Instant::ZERO, name, addr(port)).unwrap();
             }

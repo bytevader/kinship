@@ -42,7 +42,7 @@ mod tests {
 
     fn node(cfg: Config) -> Node {
         let me = Identity::new("a", SocketAddr::from(([127, 0, 0, 1], 1))).unwrap();
-        Node::new(cfg, me, Instant::ZERO, 1).unwrap()
+        Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap()
     }
 
     #[test]

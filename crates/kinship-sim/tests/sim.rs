@@ -528,7 +528,7 @@ fn drives_the_core_node() {
     let mut sim = Sim::new(1, scenario, |spec| {
         let cfg = Config::local(Security::InsecurePlaintext);
         let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
-        Node::new(cfg, me, spec.now, spec.seed).unwrap()
+        Node::new(cfg, me, spec.now, spec.seed, &spec.nonce_key()).unwrap()
     });
     let json = sim.run().to_json();
     assert!(json.contains(r#""event":{"CommandDone":{"id":0,"result":{"Ok":"Done"}}}"#));

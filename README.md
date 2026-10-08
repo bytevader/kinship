@@ -370,7 +370,8 @@ cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 127.0.0.1:
 ```rust
 use kinship_core::{Command, Config, Event, Identity, Instant, Node, StreamEvent, Transmit};
 
-let mut node = Node::new(cfg, Identity::new("a", my_addr)?, Instant::ZERO, rng_seed)?;
+// Both from the OS RNG: the seed for protocol choices, 32 bytes for the nonces' ChaCha20 key.
+let mut node = Node::new(cfg, Identity::new("a", my_addr)?, Instant::ZERO, seed, &nonce_key)?;
 let join = node.command(now, Command::Join { seeds: vec![seed_addr] });   // a CommandId
 
 // Feed every input with the current time:
@@ -397,4 +398,4 @@ while let Some(event) = node.poll_event() {
 let wake_at: Option<Instant> = node.poll_timeout();
 ```
 
-The same seed and the same inputs always give the same outputs, byte for byte, which is how `kinship-sim` replays any failure from its seed. Encryption happens inside the core, so the bytes in `payload` and `frame` are already sealed.
+The same seed, nonce key and inputs always give the same outputs, byte for byte, which is how `kinship-sim` replays any failure from its seed, from which it derives both. Encryption happens inside the core, so the bytes in `payload` and `frame` are already sealed.

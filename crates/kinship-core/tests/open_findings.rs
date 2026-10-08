@@ -34,7 +34,7 @@ fn id(name: &str) -> NodeId<'_> {
 /// A node called `name` that knows the members `others`, all Alive at incarnation 0.
 fn node(name: &str, me: u8, others: &[(&str, u8)], security: Security) -> Node {
     let identity = Identity::new(name, addr(me)).unwrap();
-    let mut n = Node::new(Config::lan(security), identity, Instant::ZERO, 1).unwrap();
+    let mut n = Node::new(Config::lan(security), identity, Instant::ZERO, 1, &[1; 32]).unwrap();
     for (other, i) in others {
         n.add_member(Instant::ZERO, other, addr(*i)).unwrap();
     }
@@ -330,6 +330,149 @@ fn ks05_key_id_lookup_timing() {
     assert!((0.75..4.0 / 3.0).contains(&ratio), "{ratio:.2}");
 }
 
+/// KS-06, fixed: the random bytes of a nonce came from xoshiro256**, whose outputs are linear in
+/// its state. Each packet carries two consecutive outputs in nonce bytes 8 to 24, so a few
+/// packets gave away the generator's state and every nonce the node would use. They now come
+/// from ChaCha20 under a key of their own. The attack still recovers xoshiro, which drives
+/// protocol choices, from six outputs; from a node's nonce bytes it recovers nothing that
+/// predicts the next ones.
+#[test]
+fn ks06_nonce_bytes_do_not_give_away_the_generator() {
+    let mut rng = kinship_core::Rng::new(0x5eed);
+    let words: Vec<u64> = (0..8).map(|_| rng.next_u64()).collect();
+    assert_eq!(
+        xoshiro::predict(&words[..6]),
+        Some([words[6], words[7]]),
+        "the attack works"
+    );
+
+    let mut n = secure("o", 1, &[("b", 2), ("c", 3), ("d", 4)]);
+    let mut words = Vec::new();
+    let mut t = Instant::ZERO;
+    while words.len() < 8 {
+        t = n.poll_timeout().unwrap();
+        n.handle_timeout(t);
+        for transmit in drain(&mut n) {
+            let sealed = match &transmit {
+                Transmit::Datagram { payload, .. } => &payload[..],
+                Transmit::Stream { frame, .. } => &frame[4..],
+                _ => continue,
+            };
+            // Nonce bytes 8 to 24, after the 8 bytes of cluster time.
+            for at in [16, 24] {
+                words.push(u64::from_le_bytes(sealed[at..at + 8].try_into().unwrap()));
+            }
+        }
+    }
+    assert!(t < Instant::ZERO + Duration::from_secs(5));
+    let predicted = xoshiro::predict(&words[..6]);
+    assert_ne!(predicted, Some([words[6], words[7]]), "{words:x?}");
+}
+
+/// Recovering xoshiro256**'s state from its outputs: each output is an invertible function of
+/// one state word, and the state moves by a linear map over GF(2), so 256 bits of outputs give
+/// 256 linear equations in the 256 bits of the state.
+mod xoshiro {
+    /// A linear combination of the 256 bits of the starting state.
+    type Bits = [u64; 4];
+    /// A state word as 64 such combinations, bit 0 first.
+    type Word = [Bits; 64];
+
+    fn xor(a: &Word, b: &Word) -> Word {
+        core::array::from_fn(|i| core::array::from_fn(|j| a[i][j] ^ b[i][j]))
+    }
+
+    fn shl(a: &Word, k: usize) -> Word {
+        core::array::from_fn(|i| if i >= k { a[i - k] } else { [0; 4] })
+    }
+
+    fn rotl(a: &Word, k: usize) -> Word {
+        core::array::from_fn(|i| a[(i + 64 - k) % 64])
+    }
+
+    fn inverse(a: u64) -> u64 {
+        // Newton's iteration doubles the correct low bits of an odd number's inverse.
+        let mut x = a;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        }
+        x
+    }
+
+    /// The state word an output came from: `rotl(s1 * 5, 7) * 9`, undone.
+    fn s1_of(output: u64) -> u64 {
+        output
+            .wrapping_mul(inverse(9))
+            .rotate_right(7)
+            .wrapping_mul(inverse(5))
+    }
+
+    fn next(s: &mut [u64; 4]) -> u64 {
+        let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        result
+    }
+
+    /// The two outputs that follow `outputs`, if exactly one state gives `outputs`.
+    pub fn predict(outputs: &[u64]) -> Option<[u64; 2]> {
+        let mut s: [Word; 4] = core::array::from_fn(|w| {
+            core::array::from_fn(|i| {
+                let mut bits = [0; 4];
+                bits[w] = 1 << i;
+                bits
+            })
+        });
+        // Rows of coefficients, with the right-hand side in bit 0 of a fifth word.
+        let mut rows: Vec<[u64; 5]> = Vec::new();
+        for &out in outputs {
+            let s1 = s1_of(out);
+            for (i, bits) in s[1].iter().enumerate() {
+                rows.push([bits[0], bits[1], bits[2], bits[3], (s1 >> i) & 1]);
+            }
+            let t = shl(&s[1], 17);
+            s[2] = xor(&s[2], &s[0]);
+            s[3] = xor(&s[3], &s[1]);
+            s[1] = xor(&s[1], &s[2]);
+            s[0] = xor(&s[0], &s[3]);
+            s[2] = xor(&s[2], &t);
+            s[3] = rotl(&s[3], 45);
+        }
+        // Gaussian elimination over GF(2).
+        let mut state = [0u64; 4];
+        let mut rank = 0;
+        for col in 0..256 {
+            let (w, b) = (col / 64, 1u64 << (col % 64));
+            let pivot = (rank..rows.len()).find(|&r| rows[r][w] & b != 0)?;
+            rows.swap(rank, pivot);
+            let p = rows[rank];
+            for (r, row) in rows.iter_mut().enumerate() {
+                if r != rank && row[w] & b != 0 {
+                    for k in 0..5 {
+                        row[k] ^= p[k];
+                    }
+                }
+            }
+            rank += 1;
+        }
+        if rows[rank..].iter().any(|row| row[4] != 0) {
+            return None;
+        }
+        for (col, row) in rows[..256].iter().enumerate() {
+            state[col / 64] |= row[4] << (col % 64);
+        }
+        for _ in outputs {
+            next(&mut state);
+        }
+        Some([next(&mut state), next(&mut state)])
+    }
+}
+
 /// KS-07: a removed key stops opening packets but stays in memory: the node keeps the config
 /// it started with, keys included, for as long as it runs.
 #[test]
@@ -338,7 +481,7 @@ fn ks07_a_removed_key_stays_in_the_node_config() {
     let old = Key::from_bytes([10; 32]);
     let identity = Identity::new("o", addr(1)).unwrap();
     let cfg = Config::lan(Security::Keys(vec![key(), old.clone()]));
-    let mut o = Node::new(cfg, identity, Instant::ZERO, 1).unwrap();
+    let mut o = Node::new(cfg, identity, Instant::ZERO, 1, &[1; 32]).unwrap();
     o.command(Instant::ZERO, kinship_core::Command::RemoveKey(old.clone()));
     assert_eq!(o.key_ids(), vec![key().key_id()]);
     assert!(matches!(&o.config().security, Security::Keys(keys) if keys.contains(&old)));

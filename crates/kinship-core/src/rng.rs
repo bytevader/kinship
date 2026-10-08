@@ -1,14 +1,18 @@
-//! A small seeded RNG, so that every random choice the core makes is reproducible.
+//! The core's two sources of randomness, both seeded by the driver so that every run is
+//! reproducible: a small RNG for protocol choices, and a ChaCha20 keystream for nonces.
+
+use chacha20::ChaCha20Legacy;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 
 /// xoshiro256** seeded through SplitMix64.
 ///
-/// The core draws all its randomness (probe order, gossip targets, nonces) from one of these,
-/// seeded by the driver: production seeds it from the OS, the simulator from the run's seed.
-/// The output depends only on the seed and the sequence of calls, on every platform.
+/// The core draws every random protocol choice (probe order, gossip targets, timer jitter)
+/// from one of these, seeded by the driver: production seeds it from the OS, the simulator from
+/// the run's seed. The output depends only on the seed and the sequence of calls, on every
+/// platform.
 ///
-/// This is not a cryptographic RNG. Nonces drawn from it are unique per key with overwhelming
-/// probability as long as the seed itself is random, which is what XChaCha20's 192-bit nonce
-/// needs; production drivers must therefore seed it from the OS RNG.
+/// This is not a cryptographic RNG: its outputs are linear in its state, so a few of them give
+/// the state away and with it every later output. Nonces therefore come from [`Nonces`].
 #[derive(Clone)]
 pub struct Rng {
     s: [u64; 4],
@@ -109,6 +113,32 @@ impl core::fmt::Debug for Rng {
     }
 }
 
+/// The random bytes of nonces: the keystream of ChaCha20 keyed with 32 bytes of their own.
+///
+/// Nothing that can be read off the wire tells the key or the bytes still to come. The driver
+/// supplies the key, from the OS in production and from the run's seed in the simulator, so the
+/// core still draws no randomness itself and every simulator run replays. The variant with a
+/// 64-bit block counter never runs out.
+pub(crate) struct Nonces(ChaCha20Legacy);
+
+impl Nonces {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self(ChaCha20Legacy::new(key.into(), &[0; 8].into()))
+    }
+
+    /// Fills `out` with the next bytes of the keystream.
+    pub fn fill(&mut self, out: &mut [u8]) {
+        out.fill(0);
+        self.0.apply_keystream(out);
+    }
+}
+
+impl core::fmt::Debug for Nonces {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Nonces")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +182,21 @@ mod tests {
         }
         assert!(!r.chance(0.0));
         assert!(r.chance(1.0));
+    }
+
+    #[test]
+    fn nonces_are_the_chacha20_keystream_of_their_key() {
+        // The keystream of the all-zero key and nonce, from the ChaCha20 test vectors.
+        let mut n = Nonces::new(&[0; 32]);
+        let mut a = [0xff; 8];
+        let mut b = [0xff; 8];
+        n.fill(&mut a);
+        n.fill(&mut b);
+        assert_eq!(a, [0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90]);
+        assert_eq!(b, [0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28]);
+        let mut other = [0; 8];
+        Nonces::new(&[1; 32]).fill(&mut other);
+        assert_ne!(other, a);
     }
 
     #[test]

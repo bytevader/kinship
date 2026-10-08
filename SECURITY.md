@@ -48,7 +48,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KS-03 | Medium | no key | A connection flood evicted real inbound exchanges | Fixed |
 | KS-04 | Medium | no key | Plaintext mode accepts forgeries, and reflected them 46x | Fixed |
 | KS-05 | Low | no key | Key id lookup timing revealed installed keys | Fixed |
-| KS-06 | Low | no key | Nonce bytes come from a non-cryptographic generator | Open |
+| KS-06 | Low | no key | Nonce bytes came from a non-cryptographic generator | Fixed |
 | KS-07 | Low | local | Copies of keys outlive removal and drop | Open |
 | KS-08 | Low | local | Key comparison is not constant time | Open |
 | KS-09 | Info | no key | Traffic analysis | Accepted |
@@ -147,15 +147,17 @@ A packet whose key id matched no installed key was refused before any cryptograp
 - A TCP connection whose header names a key id that is not installed is dropped as soon as its first 12 bytes arrive, while one naming an installed id stays open until its frame is complete or `tcp_timeout` (KS-03). A peer can therefore still tell whether a key id it already knows is installed, such as the id of a key the cluster used before a rotation. It cannot discover ids it does not know: an id is 32 bits of a key's hash and each guess costs a connection. This is the price of the header check, which shuts out peers that have never seen the cluster's traffic.
 - A packet whose id several installed keys share, which happens only when two keys' hashes start with the same 4 bytes, costs one verification per such key.
 
-### KS-06 Nonce bytes come from a non-cryptographic generator
+### KS-06 Nonce bytes came from a non-cryptographic generator
 
-**Severity:** Low. **Status:** Open.
+**Severity:** Low. **Status:** Fixed.
 
-The random part of each nonce comes from xoshiro256** seeded with 64 bits from the operating system, the generator that also drives protocol choices (in a separate stream). AEAD needs nonces that never repeat under a key, not unpredictable ones, so this is not exploitable today, but uniqueness rests on 64 bits of entropy per process start rather than 128, and the generator's outputs are linear: the random bytes of a few packets give away its state and every nonce the node will use.
+The random part of each nonce came from xoshiro256** seeded with 64 bits from the operating system, the generator that also drives protocol choices (in a separate stream). AEAD needs nonces that never repeat under a key, not unpredictable ones, so this was not exploitable, but uniqueness rested on 64 bits of entropy per process start rather than 128, and the generator's outputs are linear: the random bytes of a few packets gave away its state and every nonce the node would use.
 
-**Reproduction:** each packet carries two consecutive outputs in nonce bytes 8 to 24. Inverting the output function (multiply by the inverse of 9, rotate right by 7, multiply by the inverse of 5) yields the generator's `s[1]` word for each, and a few of them determine the full state by linear algebra over GF(2), since its state transition is linear.
+**Reproduction:** `open_findings::ks06_nonce_bytes_do_not_give_away_the_generator`. Each packet carried two consecutive outputs in nonce bytes 8 to 24. Inverting the output function (multiply by the inverse of 9, rotate right by 7, multiply by the inverse of 5) yields the generator's `s[1]` word for each, and since its state transition is linear over GF(2), six of them determine the whole state by Gaussian elimination. The test runs that attack: it recovers a xoshiro generator from six outputs and predicts the next two, and against a node's first nonces it predicted the next ones exactly before the fix and predicts nothing since. Unit test: kinship-core `rng::tests::nonces_are_the_chacha20_keystream_of_their_key`.
 
-**Recommended fix:** take a separate 32-byte nonce seed from the operating system in `Node::new` and draw nonce bytes from ChaCha20 keyed with it, leaving xoshiro for protocol choices so that simulator runs stay reproducible.
+**Fix:** the random bytes of every nonce now come from ChaCha20, with a 64-bit block counter so the stream never runs out, keyed with 32 bytes of their own (`rng::Nonces` in kinship-core). The core stays sans-IO: `Node::new` takes the nonce key from the driver beside the seed, kinship-net draws it from the operating system with the seed and zeroizes its copy, and kinship-sim derives it from each node's seed and so from the run's (`NodeSpec::nonce_key`). xoshiro still drives protocol choices, and `Node::new` still makes the draw from it that used to seed nonces, so every simulator seed makes the same protocol choices as before and still replays byte for byte. Only the bytes of sealed packets differ: the trace of the pinned SWIM run changed in every packet hash and in nothing else, and its digest in `swim::swim_trace_is_pinned_across_platforms` was updated.
+
+**What remains:** nonces still carry the sender's cluster time in their first 8 bytes in the clear (KS-09). A process memory dump holds the nonce key along with the cluster keys.
 
 ### KS-07 Copies of keys outlive removal and drop
 

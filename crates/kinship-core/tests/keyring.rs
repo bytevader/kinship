@@ -18,7 +18,14 @@ fn key(n: u8) -> Key {
 
 fn node(security: Security, seed: u64) -> Node {
     let me = Identity::new("a", addr(1)).unwrap();
-    let mut node = Node::new(Config::lan(security), me, Instant::ZERO, seed).unwrap();
+    let mut node = Node::new(
+        Config::lan(security),
+        me,
+        Instant::ZERO,
+        seed,
+        &[seed as u8; 32],
+    )
+    .unwrap();
     node.add_member(Instant::ZERO, "b", addr(2)).unwrap();
     while node.poll_event().is_some() {}
     node

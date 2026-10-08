@@ -13,6 +13,7 @@ authors.workspace = true
 serde = ["dep:serde"]
 
 [dependencies]
+chacha20 = { version = "0.10.2", default-features = false, features = ["legacy", "zeroize"] }
 kinship-proto.workspace = true
 serde = { version = "1", default-features = false, features = ["std", "derive"], optional = true }
 

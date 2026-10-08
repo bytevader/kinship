@@ -592,7 +592,7 @@ mod tests {
     fn node(name: &str, port: u16) -> Node {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let me = Identity::new(name, addr(port)).unwrap();
-        Node::new(cfg, me, Instant::ZERO, u64::from(port)).unwrap()
+        Node::new(cfg, me, Instant::ZERO, u64::from(port), &[port as u8; 32]).unwrap()
     }
 
     fn key() -> crate::Key {
@@ -602,7 +602,7 @@ mod tests {
     fn secure_node(name: &str, port: u16) -> Node {
         let cfg = Config::lan(Security::Keys(vec![key()]));
         let me = Identity::new(name, addr(port)).unwrap();
-        Node::new(cfg, me, Instant::ZERO, u64::from(port)).unwrap()
+        Node::new(cfg, me, Instant::ZERO, u64::from(port), &[port as u8; 32]).unwrap()
     }
 
     /// Two nodes on a perfect network: datagrams to the other's address arrive, and
@@ -976,7 +976,7 @@ mod tests {
         let mut cfg = Config::lan(Security::InsecurePlaintext);
         cfg.limits.max_stream_frame = 256;
         let me = Identity::new("b", addr(2)).unwrap();
-        let mut b = Node::new(cfg, me, Instant::ZERO, 2).unwrap();
+        let mut b = Node::new(cfg, me, Instant::ZERO, 2, &[2; 32]).unwrap();
         for i in 0..20 {
             b.add_member(Instant::ZERO, &format!("member-{i:02}"), addr(100 + i))
                 .unwrap();

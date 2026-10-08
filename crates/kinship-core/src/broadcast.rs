@@ -9,7 +9,7 @@ use crate::Node;
 use crate::io::{StreamId, Transmit};
 use crate::member::State;
 use crate::replay::STAMP_LEN;
-use crate::rng::Rng;
+use crate::rng::Nonces;
 use crate::suspicion::retransmit_limit;
 use crate::time::Instant;
 
@@ -221,14 +221,15 @@ pub(crate) struct Outbox {
     pub codec: Codec,
     pub broadcasts: Broadcasts,
     pub transmits: VecDeque<Transmit>,
-    /// Nonces only; kept apart from the protocol's RNG so sealing never shifts its choices.
-    nonces: Rng,
+    /// The random bytes of nonces, apart from the protocol's RNG, which they must not give away
+    /// and whose choices sealing must not shift.
+    nonces: Nonces,
     /// Cluster time in milliseconds, which leads every nonce; the node keeps it current.
     pub stamp: u64,
 }
 
 impl Outbox {
-    pub fn new(codec: Codec, nonces: Rng) -> Self {
+    pub fn new(codec: Codec, nonces: Nonces) -> Self {
         Self {
             codec,
             broadcasts: Broadcasts::default(),
@@ -431,7 +432,8 @@ mod tests {
         use crate::{Config, Identity, Security};
         let addr = SocketAddr::from(([127, 0, 0, 1], 1));
         let cfg = Config::lan(Security::InsecurePlaintext);
-        let mut n = Node::new(cfg, Identity::new("a", addr).unwrap(), Instant::ZERO, 1).unwrap();
+        let me = Identity::new("a", addr).unwrap();
+        let mut n = Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap();
         n.broadcast(suspect("b", 1));
         assert!(n.out.broadcasts.contains("b"));
         let room = datagram_room(&n.out.codec);
@@ -485,7 +487,7 @@ mod tests {
             ..Limits::default()
         };
         let codec = Codec::insecure_plaintext(b"t", limits).unwrap();
-        let mut out = Outbox::new(codec, Rng::new(1));
+        let mut out = Outbox::new(codec, Nonces::new(&[1; 32]));
         for i in 0..50 {
             out.broadcasts.push(suspect(&format!("node-{i:02}"), 7));
         }
@@ -505,7 +507,7 @@ mod tests {
         assert!(
             !Outbox::new(
                 Codec::insecure_plaintext(b"t", limits).unwrap(),
-                Rng::new(1)
+                Nonces::new(&[1; 32])
             )
             .send(to, true, &[], Some(1))
         );

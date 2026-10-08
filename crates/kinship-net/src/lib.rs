@@ -297,8 +297,12 @@ impl Memberlist {
             .advertise
             .unwrap_or_else(|| default_advertise(local_addr));
         let me = kinship_core::Identity::new(settings.name, advertise)?.with_meta(settings.meta);
-        // The core draws every nonce from this seed, so it must come from the OS.
-        let seed = getrandom::u64().map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+        // The core draws no randomness of its own: its protocol choices come from this seed and
+        // the random bytes of its nonces from ChaCha20 under this key, both from the OS.
+        let os = |e: getrandom::Error| Error::Io(io::Error::other(e.to_string()));
+        let seed = getrandom::u64().map_err(os)?;
+        let mut nonce_key = [0u8; 32];
+        getrandom::fill(&mut nonce_key).map_err(os)?;
         let clock = Clock::new();
         let limits = conn::Limits {
             tcp_timeout: settings.core.tcp_timeout,
@@ -306,7 +310,9 @@ impl Memberlist {
             header_timeout: settings.tcp_header_timeout,
         };
         let rejoin_interval = settings.core.rejoin_interval;
-        let node = kinship_core::Node::new(settings.core, me, clock.now(), seed)?;
+        let node = kinship_core::Node::new(settings.core, me, clock.now(), seed, &nonce_key);
+        zeroize::Zeroize::zeroize(&mut nonce_key);
+        let node = node?;
         tracing::info!(name = node.local().name, addr = %advertise, bind = %local_addr, "node started");
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(Snapshot::of(&node)),
