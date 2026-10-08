@@ -468,7 +468,9 @@ impl Node {
             node: me.name.clone(),
             from: me.name.clone(),
         };
-        self.broadcast(gossip);
+        // Sends to members that are dead or gone do not count: a leave that reached only them
+        // has told nobody.
+        self.out.broadcasts.push_to_live(gossip);
         // Tell the first few members now instead of at the next gossip tick, so that a caller
         // whose leave times out and who closes the node at once has still been heard; they pass
         // it on.
@@ -487,7 +489,8 @@ impl Node {
         self.check_leave();
     }
 
-    /// Finishes a pending Leave once the Left rumour is spread, or nobody is left to tell.
+    /// Finishes a pending Leave once the Left rumour has been sent `retransmit_limit` times to
+    /// members this node holds live, or none is left to tell.
     pub(crate) fn check_leave(&mut self) {
         let Some(id) = self.sync.leaving else {
             return;
@@ -1035,6 +1038,41 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::MemberSuspect(_)));
         assert!(!suspected);
+    }
+
+    #[test]
+    fn a_leave_counts_only_sends_to_live_members() {
+        let t0 = Instant::ZERO;
+        let mut a = node("a", 1);
+        a.add_member(t0, "b", addr(2)).unwrap();
+        a.add_member(t0, "c", addr(3)).unwrap();
+        // c was declared dead a moment ago, so gossip still goes to it in case it refutes.
+        let dead = Dead {
+            inc: 0,
+            node: id("c"),
+            from: id("b"),
+        };
+        a.on_dead(t0, &dead);
+        let cmd = a.command(t0, Command::Leave);
+        let limit = a.retransmit_limit();
+        let (mut to_b, mut to_c) = (0, 0);
+        loop {
+            while let Some(t) = a.poll_transmit() {
+                if let Transmit::Datagram { to, .. } = t {
+                    to_b += usize::from(to == addr(2));
+                    to_c += usize::from(to == addr(3));
+                }
+            }
+            let ev: Vec<Event> = std::iter::from_fn(|| a.poll_event()).collect();
+            if done(&ev, cmd).is_some() {
+                break;
+            }
+            let t = a.poll_timeout().unwrap();
+            a.handle_timeout(t);
+        }
+        // Every gossip packet carries the Left rumour to both; only b's count.
+        assert_eq!(to_b, limit as usize);
+        assert!(to_c >= to_b, "{to_c} sends to the dead member");
     }
 
     #[test]

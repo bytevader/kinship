@@ -224,7 +224,7 @@ impl Config {
         with_gossip_interval => gossip_interval: Duration;
         /// Members each gossip packet goes to.
         with_gossip_nodes => gossip_nodes: usize;
-        /// How long dead members still receive gossip.
+        /// How long members declared dead still receive gossip; members that left receive none.
         with_gossip_to_the_dead => gossip_to_the_dead: Duration;
         /// Broadcast copies per log10(n + 1).
         with_retransmit_mult => retransmit_mult: u32;

@@ -23,7 +23,7 @@ A failure names its lowest failing seed, and `KINSHIP_SEED=<seed>` replays it. E
 | ID | Severity | Finding | Test | Status |
 | --- | --- | --- | --- | --- |
 | KP-01 | High | A new node that first hears another new node keeps its replay floor far behind cluster time | `kp01_a_restarted_node_refuses_recordings_older_than_the_window` | Fixed |
-| KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Open |
+| KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Fixed |
 | KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Open |
 | KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Open |
 | KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Open |
@@ -46,13 +46,15 @@ The simulator's restart hands a new instance the shared clock, so none of the ex
 
 ### KP-02 leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead
 
-**Severity:** Medium.
+**Severity:** Medium. **Status:** Fixed.
 
 `Node::gossip` (`broadcast.rs:311`) sends to live members and to every member whose state changed within `gossip_to_the_dead`, which includes members that left. design.md limits gossip to the dead, and memberlist sends only to alive, suspect and recently dead members: a dead member may be alive and need to refute, but one that left has closed. leave() (`sync.rs:472`) sends its Left rumour to `gossip_nodes` such targets at once, and `check_leave` (`sync.rs:488`) declares it done after `retransmit_limit` sends, counting sends to members that left, or are dead, like any other. When several nodes leave one after another, the last ones can spend every send on members that already left, return, and close having told no live member. The live members then probe them, suspect them and report MemberDead, which design.md's Failure modes table says a graceful leave never causes.
 
 **Reproduction:** ten nodes. n3 to n9 leave a second apart, each closing as soon as its leave() returns. 3 of 16 seeds fail, 44 of 200: a survivor reports one of the last nodes to leave dead. With members that left removed from the gossip targets, 200 of 200 pass.
 
 **Recommended fix:** gossip only to live members and to members dead for less than `gossip_to_the_dead`, as memberlist does. leave() should also count only the sends that went to members it holds alive, so that a leave whose sends all went to dead members is not done.
+
+**Fix:** as recommended. `Node::gossip` sends to Alive and Suspect members and to members declared Dead less than `gossip_to_the_dead` ago, never to members that left. leave() queues its Left rumour so that only sends to members it holds live, Alive or Suspect, count towards `retransmit_limit` (`Broadcasts::push_to_live`); sends to the dead still go out, in case one of them is alive and refutes, but do not finish the leave. Suspect counts as live because it is still a member and usually alive, and because the leave already ends when no live member is left to tell; counting only Alive would let one suspected member hold a leave until its timeout. Packets whose recipient this node can only name by address, such as the Ack a relay forwards to a PingReq's requester, count as not live. Unit tests: kinship-core `tests::gossip_goes_to_live_and_recently_dead_members_never_to_those_that_left` and `sync::tests::a_leave_counts_only_sends_to_live_members`.
 
 ### KP-03 Config accepts limits in which a member's own Alive never fits a datagram
 

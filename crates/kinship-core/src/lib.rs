@@ -855,6 +855,30 @@ mod tests {
     }
 
     #[test]
+    fn gossip_goes_to_live_and_recently_dead_members_never_to_those_that_left() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        for (name, port) in [("b", 2), ("c", 3), ("d", 4)] {
+            n.add_member(t, name, addr(port)).unwrap();
+        }
+        // c left, and d was declared dead.
+        deliver(&mut n, t, &[dead("c", 0, "c"), dead("d", 0, "b")]);
+        sent(&mut n);
+        let targets = |n: &mut Node, now| {
+            n.gossip(now);
+            let mut to: Vec<SocketAddr> = sent(n).into_iter().map(|(to, _)| to).collect();
+            to.sort();
+            to
+        };
+        assert_eq!(targets(&mut n, t), [addr(2), addr(4)]);
+        // Once d has been dead for gossip_to_the_dead, it is not sent to either.
+        let later = t + n.config().gossip_to_the_dead;
+        deliver(&mut n, later, &[alive("b", 1, 2)]);
+        sent(&mut n);
+        assert_eq!(targets(&mut n, later), [addr(2)]);
+    }
+
+    #[test]
     fn a_suspicion_at_a_newer_incarnation_restarts_the_timer() {
         let mut n = node(Security::InsecurePlaintext);
         let t0 = Instant::ZERO;

@@ -375,8 +375,6 @@ fn kp02(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-02, leave() counts sends to members that left, so nodes that leave in a \
-            scale-down are reported dead"]
 fn kp02_nodes_that_leave_one_after_another_are_never_reported_dead() {
     check_all(seeds(16), kp02);
 }
