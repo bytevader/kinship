@@ -240,11 +240,12 @@ impl Config {
         with_tcp_timeout => tcp_timeout: Duration;
         /// Attempts per seed in a join, with exponential backoff from the probe interval.
         with_join_retries => join_retries: u32;
-        /// Largest datagram sent, header and tag included.
+        /// Largest datagram sent, header and tag included. Must fit an Alive with
+        /// `max_meta_bytes` of metadata beside a Ping: 813 bytes encrypted with the default 512.
         with_udp_max_payload => limits.udp_max_payload: usize;
         /// Largest TCP frame accepted.
         with_max_stream_frame => limits.max_stream_frame: usize;
-        /// Metadata cap.
+        /// Metadata cap. An Alive carrying this much must fit a datagram beside a Ping.
         with_max_meta_bytes => limits.max_meta_bytes: usize;
     }
 
@@ -331,6 +332,11 @@ mod tests {
         assert_eq!(cfg.build().unwrap_err().field, "event_buffer");
         let cfg = Config::local().with_meta(vec![0; 513]);
         assert_eq!(cfg.build().unwrap_err().field, "meta");
+        // A member's own Alive must fit a datagram beside a Ping.
+        let cfg = Config::local().with_udp_max_payload(576);
+        assert_eq!(cfg.build().unwrap_err().field, "udp_max_payload");
+        let cfg = Config::local().with_max_meta_bytes(4096);
+        assert_eq!(cfg.build().unwrap_err().field, "max_meta_bytes");
     }
 
     #[test]

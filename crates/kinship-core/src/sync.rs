@@ -470,7 +470,7 @@ impl Node {
         };
         // Sends to members that are dead or gone do not count: a leave that reached only them
         // has told nobody.
-        self.out.broadcasts.push_to_live(gossip);
+        self.broadcast_to_live(gossip);
         // Tell the first few members now instead of at the next gossip tick, so that a caller
         // whose leave times out and who closes the node at once has still been heard; they pass
         // it on.

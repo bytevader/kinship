@@ -24,7 +24,7 @@ A failure names its lowest failing seed, and `KINSHIP_SEED=<seed>` replays it. E
 | --- | --- | --- | --- | --- |
 | KP-01 | High | A new node that first hears another new node keeps its replay floor far behind cluster time | `kp01_a_restarted_node_refuses_recordings_older_than_the_window` | Fixed |
 | KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Fixed |
-| KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Open |
+| KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Fixed |
 | KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Open |
 | KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Open |
 
@@ -58,7 +58,7 @@ The simulator's restart hands a new instance the shared clock, so none of the ex
 
 ### KP-03 Config accepts limits in which a member's own Alive never fits a datagram
 
-**Severity:** Medium: it needs a limit changed from its default, but then a live member is declared dead whenever it is suspected.
+**Severity:** Medium: it needs a limit changed from its default, but then a live member is declared dead whenever it is suspected. **Status:** Fixed.
 
 design.md says set_meta's 512-byte cap means "one Alive always fits in a datagram with room for a probe", but `Config::validate` (`config.rs:135`) only asks that a datagram hold the packet overhead and three bytes. An Alive with `max_meta_bytes` of metadata, a 64-byte name and an IPv6 address is 607 bytes, so with encryption any `udp_max_payload` below 657 (576, the IPv4 minimum, for one), or any `max_meta_bytes` above 1,255 with the default datagram, lets a member hold an Alive that no packet can carry. `Broadcasts::select` (`broadcast.rs:159`) skips it every time and `Broadcasts::sent` (`broadcast.rs:178`) never drops it, so the member's metadata never spreads by gossip, its refutations never leave it over UDP, and its gossip timer fires every `gossip_interval` for as long as it runs. Only push-pull carries its Alive.
 
@@ -67,6 +67,8 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 **Reproduction:** ten nodes with `udp_max_payload` 576 and every other field from `lan()`. n5 sets 512 bytes of metadata, then stalls for 3 s, as in a long GC pause. Its Alive is 533 bytes, and a 576-byte datagram has 528 for its messages and their count. In 8 of 8 seeds some node declares n5 dead within 10 s of the stall ending. The same run with the default 1,400-byte datagram passes 100 of 100 seeds.
 
 **Recommended fix:** refuse limits under which an Alive with `max_meta_bytes` of metadata, a 64-byte name and an IPv6 address does not fit a datagram beside a Ping (the test passes when the config does not validate), or cap set_meta at what fits. Either way, drop and count a queued rumour that can never fit, rather than keeping it forever.
+
+**Fix:** the first option. `Config::validate` measures the largest Alive the limits allow beside the largest Ping, both with 64-byte names and IPv6 addresses, against the room a sealed or plaintext datagram has for its messages, and refuses the limits otherwise. The error names `udp_max_payload` when it is below its default and `max_meta_bytes` otherwise, so with the default 512 bytes of metadata a sealed datagram needs at least 813 bytes, and with the default 1,400-byte datagram metadata can be at most 1,099 bytes. The kinship and Python configs call the same check, and no preset or existing test sets limits it refuses. A rumour too large for any datagram, which validated limits no longer allow, is dropped with anything older queued about its member and counted under the new `gossip_too_large` metric, which `stats()` reports in Rust and Python. The test now asserts that the 576-byte datagram is refused and runs its scenario at the smallest datagram that validates, where the member survives the pause. Unit tests: kinship-core `config::tests::the_largest_alive_must_fit_a_datagram_beside_a_ping` and `broadcast::tests::a_rumour_too_large_for_any_datagram_is_dropped_and_counted`; kinship `config::tests::bad_fields_are_named_before_binding`; Python `test_config.py::test_bad_fields_raise_config_error_naming_the_field`.
 
 ### KP-04 A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion
 

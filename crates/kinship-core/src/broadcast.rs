@@ -155,6 +155,11 @@ impl Broadcasts {
         self.next_id += 1;
     }
 
+    /// Drops anything queued about `node`.
+    pub fn forget(&mut self, node: &str) {
+        self.queue.retain(|q| q.gossip.node() != node);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -204,6 +209,13 @@ impl Broadcasts {
 /// Bytes a payload's message count can take: counts stay below 2^14 in any packet.
 const COUNT_LEN: usize = 2;
 
+/// Bytes a datagram sealed by `codec` has for its messages, past their count.
+pub(crate) fn datagram_room(codec: &Codec) -> usize {
+    codec
+        .max_payload_len(PacketKind::Datagram)
+        .saturating_sub(COUNT_LEN)
+}
+
 /// Seals packets, piggybacking queued gossip, and holds them until the driver polls.
 pub(crate) struct Outbox {
     pub codec: Codec,
@@ -248,7 +260,7 @@ impl Outbox {
         head: &[Message<'_>],
         limit: Option<u32>,
     ) -> bool {
-        let max = self.codec.max_payload_len(PacketKind::Datagram) - COUNT_LEN;
+        let max = datagram_room(&self.codec);
         let used: usize = head.iter().map(Message::encoded_len).sum();
         let picked = match limit {
             Some(_) => self.broadcasts.select(max.saturating_sub(used)),
@@ -302,7 +314,28 @@ impl Outbox {
 impl Node {
     /// Queues a rumour for piggybacking and gossip.
     pub(crate) fn broadcast(&mut self, gossip: Gossip) {
-        self.out.broadcasts.push(gossip);
+        self.queue_gossip(gossip, false);
+    }
+
+    /// Queues a rumour like [`broadcast`](Self::broadcast), counting only sends to members this
+    /// node holds live towards its limit.
+    pub(crate) fn broadcast_to_live(&mut self, gossip: Gossip) {
+        self.queue_gossip(gossip, true);
+    }
+
+    /// A rumour too large for any datagram, even alone, could never be sent: it is dropped and
+    /// counted, together with anything older queued about the same member, rather than kept
+    /// forever. `Config::validate` refuses limits under which this node's own rumours or any it
+    /// accepts could be that large.
+    fn queue_gossip(&mut self, gossip: Gossip, live_only: bool) {
+        if gossip.message().encoded_len() > datagram_room(&self.out.codec) {
+            self.out.broadcasts.forget(gossip.node());
+            self.metrics.gossip_too_large += 1;
+        } else if live_only {
+            self.out.broadcasts.push_to_live(gossip);
+        } else {
+            self.out.broadcasts.push(gossip);
+        }
     }
 
     /// How many times each rumour is sent, for the current cluster size.
@@ -370,6 +403,32 @@ mod tests {
             node: node.to_owned(),
             from: "x".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_rumour_too_large_for_any_datagram_is_dropped_and_counted() {
+        use crate::{Config, Identity, Security};
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1));
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let mut n = Node::new(cfg, Identity::new("a", addr).unwrap(), Instant::ZERO, 1).unwrap();
+        n.broadcast(suspect("b", 1));
+        assert!(n.out.broadcasts.contains("b"));
+        let room = datagram_room(&n.out.codec);
+        let huge = Gossip::Alive {
+            inc: 2,
+            node: "b".to_owned(),
+            addr,
+            meta: vec![0; room],
+            vmin: 1,
+            vmax: 1,
+        };
+        n.broadcast(huge);
+        assert_eq!(n.metrics().gossip_too_large, 1);
+        assert!(!n.out.broadcasts.contains("b"), "nor is the older one kept");
+        // Anything that fits is queued as before.
+        n.broadcast(suspect("b", 2));
+        assert!(n.out.broadcasts.contains("b"));
+        assert_eq!(n.metrics().gossip_too_large, 1);
     }
 
     #[test]

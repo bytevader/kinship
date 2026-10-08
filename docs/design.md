@@ -452,7 +452,7 @@ The queue in broadcast.rs holds Alive, Suspect and Dead messages that still need
 
 ### Limits
 
-- set_meta rejects metadata over max_meta_bytes (512) with ValueError, so one Alive always fits in a datagram with room for a probe.
+- set_meta rejects metadata over max_meta_bytes (512) with ValueError, and the config refuses limits under which an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address does not fit a datagram beside the largest Ping, so one Alive always fits with room for a probe. A rumour that still cannot fit any datagram is dropped and counted under gossip_too_large rather than kept forever.
 - Metadata is for small routing facts such as role, zone, version or a load hint. Larger application state belongs in the user's own channel, and user broadcasts are reserved for 0.2.
 - Metadata changes appear as MemberUpdated(member, previous_meta). Spread time is O(log n) gossip rounds, and push-pull bounds the worst case at push_pull_interval.
 
@@ -521,16 +521,16 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| udp_max_payload | 1,400 bytes | largest datagram sent |
+| udp_max_payload | 1,400 bytes | largest datagram sent; at least a full Alive beside a Ping, 813 bytes encrypted with 512 bytes of metadata |
 | max_stream_frame | 8 MiB | largest TCP frame accepted |
-| max_meta_bytes | 512 bytes | metadata cap |
+| max_meta_bytes | 512 bytes | metadata cap; at most 1,099 bytes encrypted with the default datagram |
 | tcp_timeout | 10 s | bound on each TCP exchange |
 | max_inbound_streams | 64 | concurrent TCP exchanges accepted |
 | join_retries | 3 | attempts per seed, with exponential backoff from probe_interval |
 | event_buffer | 1,024 | events held for Python before the oldest drop |
 | runtime_threads | 1 | tokio worker threads, set once per process |
 
-Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Invalid combinations fail construction with the field names in the message.
+Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. Invalid combinations fail construction with the field names in the message.
 
 ## Failure modes
 
@@ -553,7 +553,7 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | Recorded packets replayed by an attacker without the key | Packets stamped before the replay window are dropped before decryption, copies inside it after authentication, and a stale push-pull is answered with the node's own record only; both count as replays_dropped | kinship-sim `replay::a_replayed_alive_never_resurrects_a_member_that_left`, `replay::a_replayed_rumour_never_kills_a_member_that_restarted` and `review::kp01_a_restarted_node_refuses_recordings_older_than_the_window`, two seeds restarting together; kinship-core `tests::copies_and_stale_datagrams_are_dropped_as_replays`, `tests::until_it_has_joined_a_node_moves_its_floor_with_every_time_it_adopts`, `sync::tests::recorded_push_pulls_are_answered_with_no_more_than_one_record` and `sync::tests::a_node_behind_cluster_time_joins_in_two_exchanges` |
 | Partial stream frames from a peer without the key | Inbound connections share a budget of twice max_stream_frame; a read past it drops the connection | kinship-net `streams::inbound_connections_share_a_bounded_buffer` and `conn::tests::an_inbound_read_past_the_budget_drops_the_connection` |
 | Wall clock jumps (NTP, suspend) | Only monotonic time is used; a suspend looks like a long pause and is absorbed by LHM and refutation | kinship-sim `failure::a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds`, a jump alone or after a suspend; the `clippy.toml` of kinship-core, which reads no clock, and of kinship-net reject std::time::SystemTime and std::time::Instant::now |
-| Oversized metadata or member table | set_meta raises ValueError; push-pull frames over max_stream_frame are refused and counted | kinship-core `tests::new_rejects_invalid_config_and_meta`, `sync::tests::state_too_large_for_a_frame_is_refused` and `sync::tests::oversized_frames_are_dropped_before_they_are_copied`; kinship-net `streams::an_oversized_frame_is_refused_from_its_length_prefix`; `test_cluster.py::test_metadata_set_update_and_limits` |
+| Oversized metadata or member table | set_meta raises ValueError; limits under which a full Alive does not fit a datagram beside a Ping are refused at construction; a rumour that fits no datagram is dropped and counted; push-pull frames over max_stream_frame are refused and counted | kinship-core `tests::new_rejects_invalid_config_and_meta`, `config::tests::the_largest_alive_must_fit_a_datagram_beside_a_ping`, `broadcast::tests::a_rumour_too_large_for_any_datagram_is_dropped_and_counted`, `sync::tests::state_too_large_for_a_frame_is_refused` and `sync::tests::oversized_frames_are_dropped_before_they_are_copied`; kinship-sim `review::kp03_a_member_with_full_metadata_survives_a_pause`, at the smallest datagram accepted; kinship-net `streams::an_oversized_frame_is_refused_from_its_length_prefix`; `test_cluster.py::test_metadata_set_update_and_limits` and `test_config.py::test_bad_fields_raise_config_error_naming_the_field` |
 | Actor panic | The panic is caught, the node moves to closed, pending and later calls fail with Closed (KinshipClosed in Python), and the events iterator ends with that error | kinship-net `tests::an_actor_panic_fails_pending_and_later_calls_and_marks_events_failed`, through a hook behind the hidden test-hooks feature; `test_panic.py::test_an_actor_panic_ends_the_event_iterator_with_kinship_closed`, run in CI against a second wheel built with that feature, never the release one |
 | os.fork after start | The child raises on first use instead of hanging on a dead runtime | `test_blocking.py::test_a_forked_child_raises_instead_of_hanging` and `test_a_forked_child_can_start_its_own_cluster` |
 

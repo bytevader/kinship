@@ -78,6 +78,8 @@ def test_default_names_are_generated_once_per_config() -> None:
         ({"keys": KEY}, "keys"),
         ({"runtime_threads": 0}, "runtime_threads"),
         ({"cluster": "c" * 256}, "cluster"),
+        ({"udp_max_payload": 576}, "udp_max_payload"),
+        ({"max_meta_bytes": 4096}, "max_meta_bytes"),
     ],
 )
 def test_bad_fields_raise_config_error_naming_the_field(fields: dict, field: str) -> None:
