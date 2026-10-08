@@ -173,7 +173,7 @@ impl Config {
         if self.join_retries == 0 {
             return fail("join_retries", "must be at least 1");
         }
-        let Ok(codec) = self.codec() else {
+        let Ok(codec) = self.measuring_codec() else {
             return fail("limits", "too small to hold the packet overhead");
         };
         let room = datagram_room(&codec);
@@ -195,10 +195,22 @@ impl Config {
         Ok(())
     }
 
-    pub(crate) fn codec(&self) -> Result<Codec, kinship_proto::ConfigError> {
+    /// A codec in this config's mode, to measure packets with. It holds a copy of the sealing
+    /// key alone, which is zeroized when the codec is dropped at the end of validation.
+    fn measuring_codec(&self) -> Result<Codec, kinship_proto::ConfigError> {
         let label = self.cluster.as_bytes();
         match &self.security {
-            Security::Keys(keys) => Codec::encrypted(label, self.limits, keys.clone()),
+            Security::Keys(keys) => Codec::encrypted(label, self.limits, keys[..1].to_vec()),
+            Security::InsecurePlaintext => Codec::insecure_plaintext(label, self.limits),
+        }
+    }
+
+    /// The codec this config describes, with its keys moved into it: what is left in
+    /// `security` is an empty list of keys.
+    pub(crate) fn take_codec(&mut self) -> Result<Codec, kinship_proto::ConfigError> {
+        let label = self.cluster.as_bytes();
+        match &mut self.security {
+            Security::Keys(keys) => Codec::encrypted(label, self.limits, std::mem::take(keys)),
             Security::InsecurePlaintext => Codec::insecure_plaintext(label, self.limits),
         }
     }
@@ -275,6 +287,19 @@ mod tests {
         let mut cfg = Config::lan(Security::InsecurePlaintext);
         cfg.limits.udp_max_payload = 4;
         assert_eq!(cfg.validate().unwrap_err().field, "limits");
+    }
+
+    #[test]
+    fn taking_the_codec_moves_the_keys_out_of_the_config() {
+        let key = Key::from_bytes([1; 32]);
+        let mut cfg = Config::lan(Security::Keys(vec![key.clone()]));
+        assert_eq!(cfg.validate(), Ok(()));
+        let codec = cfg.take_codec().unwrap();
+        assert_eq!(codec.key_ids(), [key.key_id()]);
+        assert_eq!(cfg.security, Security::Keys(Vec::new()));
+        let mut plain = Config::lan(Security::InsecurePlaintext);
+        assert!(!plain.take_codec().unwrap().is_encrypted());
+        assert_eq!(plain.security, Security::InsecurePlaintext);
     }
 
     #[test]

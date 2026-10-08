@@ -473,18 +473,20 @@ mod xoshiro {
     }
 }
 
-/// KS-07: a removed key stops opening packets but stays in memory: the node keeps the config
-/// it started with, keys included, for as long as it runs.
+/// KS-07, fixed: a removed key stopped opening packets but stayed in memory, because the node
+/// kept the config it started with, keys included, for as long as it ran. The keys now move
+/// into the codec, the only place they live, and leave it when removed.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
-fn ks07_a_removed_key_stays_in_the_node_config() {
+fn ks07_a_removed_key_leaves_the_node() {
     let old = Key::from_bytes([10; 32]);
     let identity = Identity::new("o", addr(1)).unwrap();
     let cfg = Config::lan(Security::Keys(vec![key(), old.clone()]));
     let mut o = Node::new(cfg, identity, Instant::ZERO, 1, &[1; 32]).unwrap();
+    assert_eq!(o.config().security, Security::Keys(Vec::new()));
+    assert_eq!(o.key_ids(), [key().key_id(), old.key_id()]);
     o.command(Instant::ZERO, kinship_core::Command::RemoveKey(old.clone()));
-    assert_eq!(o.key_ids(), vec![key().key_id()]);
-    assert!(matches!(&o.config().security, Security::Keys(keys) if keys.contains(&old)));
+    assert_eq!(o.key_ids(), [key().key_id()]);
+    assert_eq!(o.config().security, Security::Keys(Vec::new()));
 }
 
 /// KI-06: a member that stamps a packet years ahead moves every node's cluster time with it,

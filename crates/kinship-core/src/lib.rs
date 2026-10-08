@@ -151,7 +151,7 @@ impl Node {
     /// the OS RNG, and `seed` too; the simulator derives both from the run's seed, so that a
     /// run replays byte for byte.
     pub fn new(
-        cfg: Config,
+        mut cfg: Config,
         me: Identity,
         now: Instant,
         seed: u64,
@@ -164,7 +164,8 @@ impl Node {
                 reason: "must be at most max_meta_bytes",
             });
         }
-        let codec = cfg.codec().map_err(|_| ConfigError {
+        // The keys move into the codec and live nowhere else: the config the node keeps has none.
+        let codec = cfg.take_codec().map_err(|_| ConfigError {
             field: "security",
             reason: "rejected by the codec",
         })?;
@@ -422,6 +423,8 @@ impl Node {
         &self.me
     }
 
+    /// The config this node runs, without its keys: those live only in the codec, so on a node
+    /// that encrypts `security` holds an empty list. [`key_ids`](Self::key_ids) lists the keys.
     pub fn config(&self) -> &Config {
         &self.cfg
     }

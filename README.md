@@ -184,6 +184,8 @@ print(cluster.keyring.key_ids())         # ['9f3a01c2', ...], safe to log
 
 Finish each step on every node before starting the next. A node that falls behind looks dead to the others until it catches up, and `cluster.stats().decrypt_failures` counts what it dropped. Changing `keys` in your config and restarting nodes one by one does the same thing.
 
+Inside the node, keys live in one place and are wiped from memory when removed or when the node closes. Python cannot wipe a `bytes` or `str`, so a key you hold as one stays in memory until Python reuses it: read it from a file or the environment just before you build the config, pass it straight in, and drop your references to it afterwards. The config keeps its keys until it is freed, and a cluster keeps its config.
+
 To run without encryption beyond loopback, set `insecure_plaintext=True`; kinship logs a warning at startup. Without encryption anyone who can reach the port can forge membership, so use it only where everything that can reach the port is trusted. A plaintext node sends only to members it knows, so a forged packet cannot make it send traffic to a third party.
 
 ## Logs, fork and threads

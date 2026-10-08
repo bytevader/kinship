@@ -17,7 +17,7 @@
 //! BLAKE3(label), giving a 12-byte header and no tag.
 
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 use crate::limits::Limits;
@@ -57,19 +57,30 @@ pub enum PacketKind {
 }
 
 /// A 32-byte XChaCha20-Poly1305 key. Zeroized on drop and never printed.
+///
+/// The bytes live on the heap, so moving a key, or growing a list of keys, moves a pointer and
+/// leaves no copy of the bytes behind.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Key([u8; 32]);
+pub struct Key(Box<[u8; 32]>);
 
 impl Key {
     pub const LEN: usize = 32;
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+    /// A key holding `bytes`. Copies the caller still holds are the caller's to zeroize.
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
+        let key = Self(Box::new(bytes));
+        bytes.zeroize();
+        key
     }
 
     /// Returns `None` unless `bytes` is exactly 32 bytes long.
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
-        Some(Self(bytes.try_into().ok()?))
+        if bytes.len() != Self::LEN {
+            return None;
+        }
+        let mut key = Self(Box::new([0; 32]));
+        key.0.copy_from_slice(bytes);
+        Some(key)
     }
 
     /// A key written as standard base64, with or without `=` padding, as `kinship keygen`
@@ -80,7 +91,8 @@ impl Key {
         if text.len() - digits.len() > 2 {
             return Err(KeyError::NotBase64);
         }
-        let mut key = [0u8; 32];
+        // Decoded in place, and zeroized on drop if it is not a key after all.
+        let mut key = Self(Box::new([0; 32]));
         let mut len = 0;
         let mut acc = 0u32;
         let mut bits = 0;
@@ -101,11 +113,11 @@ impl Key {
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                if len == key.len() {
+                if len == Self::LEN {
                     result = Err(KeyError::WrongLength);
                     break;
                 }
-                key[len] = (acc >> bits) as u8;
+                key.0[len] = (acc >> bits) as u8;
                 len += 1;
                 acc &= (1 << bits) - 1;
             }
@@ -114,21 +126,20 @@ impl Key {
         if result.is_ok() && (bits >= 6 || acc != 0) {
             result = Err(KeyError::NotBase64);
         }
-        if result.is_ok() && len != key.len() {
+        if result.is_ok() && len != Self::LEN {
             result = Err(KeyError::WrongLength);
         }
-        let out = result.map(|()| Self(key));
-        key.zeroize();
         acc.zeroize();
-        out
+        result.map(|()| key)
     }
 
     /// The key as padded standard base64, the form [`from_base64`](Self::from_base64) reads and
-    /// `kinship keygen` prints. The text is the secret itself: never log it.
-    pub fn to_base64(&self) -> String {
+    /// `kinship keygen` prints. The text is the secret itself: never log it. It is zeroized when
+    /// dropped, and written into its final allocation, so no copy is left behind.
+    pub fn to_base64(&self) -> Zeroizing<String> {
         const DIGITS: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(44);
+        let mut out = Zeroizing::new(String::with_capacity(44));
         for chunk in self.0.chunks(3) {
             let b = [
                 chunk[0],
@@ -151,7 +162,7 @@ impl Key {
 
     /// First 4 bytes of BLAKE3(key), big-endian. Sent in the clear to pick the right key.
     pub fn id(&self) -> u32 {
-        let hash = blake3::hash(&self.0);
+        let hash = blake3::hash(&self.0[..]);
         let b = hash.as_bytes();
         u32::from_be_bytes([b[0], b[1], b[2], b[3]])
     }
@@ -224,21 +235,22 @@ struct Keys {
 impl Keys {
     /// `keys` must not be empty.
     fn new(keys: Vec<Key>) -> Self {
-        let mut keys = Self {
-            keys,
-            ids: Vec::new(),
-            dummy: Key::from_bytes([0; 32]),
-        };
-        keys.changed();
-        keys
+        let (ids, dummy) = Self::derive(&keys);
+        Self { keys, ids, dummy }
     }
 
     /// Works out the ids and the dummy key again; call after every change to `keys`.
     fn changed(&mut self) {
-        self.ids = self.keys.iter().map(Key::id).collect();
-        let mut dummy = blake3::derive_key(DUMMY_KEY_CONTEXT, &self.keys[0].0);
-        self.dummy = Key::from_bytes(dummy);
+        (self.ids, self.dummy) = Self::derive(&self.keys);
+    }
+
+    /// The ids of `keys`, and the dummy key derived from the first of them.
+    fn derive(keys: &[Key]) -> (Vec<u32>, Key) {
+        let ids = keys.iter().map(Key::id).collect();
+        let mut dummy = blake3::derive_key(DUMMY_KEY_CONTEXT, &keys[0].0[..]);
+        let key = Key::from_bytes(dummy);
         dummy.zeroize();
+        (ids, key)
     }
 }
 
@@ -483,7 +495,7 @@ impl Codec {
                 out.put(nonce);
                 write_payload(out);
                 let aad = Aad::new(&out[start..start + ENCRYPTED_HEADER_LEN], &self.label);
-                let cipher = XChaCha20Poly1305::new((&key.0).into());
+                let cipher = XChaCha20Poly1305::new((&*key.0).into());
                 let body = &mut out[start + ENCRYPTED_HEADER_LEN..];
                 let tag = cipher
                     .encrypt_inout_detached(nonce.into(), aad.as_slice(), (&mut *body).into())
@@ -547,7 +559,7 @@ impl Codec {
                 let installed = keys.keys.iter().zip(&keys.ids);
                 for (key, _) in installed.filter(|&(_, &id)| id == key_id) {
                     matched = true;
-                    let cipher = XChaCha20Poly1305::new((&key.0).into());
+                    let cipher = XChaCha20Poly1305::new((&*key.0).into());
                     if cipher
                         .decrypt_inout_detached(
                             (&nonce).into(),
@@ -567,7 +579,7 @@ impl Codec {
                     // a bad tag, and the time does not tell which ids are installed. Should the
                     // tag pass, which only a holder of the sealing key could arrange, the packet
                     // is refused anyway.
-                    let cipher = XChaCha20Poly1305::new((&keys.dummy.0).into());
+                    let cipher = XChaCha20Poly1305::new((&*keys.dummy.0).into());
                     let _ = cipher.decrypt_inout_detached(
                         (&nonce).into(),
                         aad.as_slice(),
@@ -692,6 +704,23 @@ mod tests {
             Security::Encrypted(keys) => keys,
             Security::Plaintext => unreachable!("an encrypting codec"),
         }
+    }
+
+    #[test]
+    fn key_bytes_stay_where_they_are_when_keys_move() {
+        let first = key(1);
+        let at = first.0.as_ptr();
+        let mut keys = vec![first];
+        // Growing the list moves its keys more than once.
+        keys.extend((2..40).map(key));
+        let moved = keys.swap_remove(0);
+        assert_eq!(moved.0.as_ptr(), at);
+        let text: Zeroizing<String> = moved.to_base64();
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "written into its final allocation"
+        );
     }
 
     #[test]

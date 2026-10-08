@@ -232,7 +232,8 @@ impl Opts {
                 .get("memberlist-bin")
                 .map(|p| absolute(PathBuf::from(p)))
                 .transpose()?,
-            key: key.to_base64(),
+            // A key for this test fleet alone, which goes on its nodes' command lines anyway.
+            key: key.to_base64().as_str().to_owned(),
             preset: self.get("preset").unwrap_or("lan").to_owned(),
         })
     }

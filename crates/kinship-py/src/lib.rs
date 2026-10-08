@@ -12,6 +12,7 @@ mod node;
 mod runtime;
 
 use pyo3::prelude::*;
+use pyo3::types::PyString;
 
 /// Wire format version spoken by this build.
 #[pyfunction]
@@ -19,11 +20,12 @@ fn wire_version() -> u8 {
     kinship_net::WIRE_VERSION
 }
 
-/// A new random 32-byte key from the OS's secure random source, as padded base64.
+/// A new random 32-byte key from the OS's secure random source, as padded base64. The Rust
+/// copies are zeroized; the Python string, which Python cannot wipe, is the caller's to drop.
 #[pyfunction]
-fn generate_key(py: Python<'_>) -> PyResult<String> {
+fn generate_key(py: Python<'_>) -> PyResult<Bound<'_, PyString>> {
     kinship_net::generate_key()
-        .map(|k| k.to_base64())
+        .map(|k| PyString::new(py, &k.to_base64()))
         .map_err(|e| errors::KError::Net(e.into()).into_pyerr(py))
 }
 

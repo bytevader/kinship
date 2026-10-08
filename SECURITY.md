@@ -49,7 +49,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KS-04 | Medium | no key | Plaintext mode accepts forgeries, and reflected them 46x | Fixed |
 | KS-05 | Low | no key | Key id lookup timing revealed installed keys | Fixed |
 | KS-06 | Low | no key | Nonce bytes came from a non-cryptographic generator | Fixed |
-| KS-07 | Low | local | Copies of keys outlive removal and drop | Open |
+| KS-07 | Low | local | Copies of keys outlived removal and drop | Fixed |
 | KS-08 | Low | local | Key comparison is not constant time | Open |
 | KS-09 | Info | no key | Traffic analysis | Accepted |
 | KI-01 | High | member | Any member can declare any node dead, at once | Accepted |
@@ -159,15 +159,26 @@ The random part of each nonce came from xoshiro256** seeded with 64 bits from th
 
 **What remains:** nonces still carry the sender's cluster time in their first 8 bytes in the clear (KS-09). A process memory dump holds the nonce key along with the cluster keys.
 
-### KS-07 Copies of keys outlive removal and drop
+### KS-07 Copies of keys outlived removal and drop
 
-**Severity:** Low. **Status:** Open.
+**Severity:** Low. **Status:** Fixed.
 
-`Key` zeroizes itself on drop, but copies outlive it. The node keeps the `Config` it started with, keys included, for as long as it runs, so a key removed with `RemoveKey` is still in memory. Growing the key list reallocates without zeroizing the old buffer, moves by value leave stack copies, `Key::to_base64` and `generate_key()` hand out base64 in a plain `String`, and in Python keys arrive as `bytes` or `str` objects that cannot be zeroized at all. A process memory dump or a core file therefore holds every key the node has had.
+`Key` zeroized itself on drop, but copies outlived it. The node kept the `Config` it started with, keys included, for as long as it ran, so a key removed with `RemoveKey` was still in memory. Growing the key list reallocated without zeroizing the old buffer, moves by value left stack copies, `Key::to_base64` and `generate_key()` handed out base64 in a plain `String`, and in Python keys arrive as `bytes` or `str` objects that cannot be zeroized at all. A process memory dump or a core file therefore held every key the node had had.
 
-**Reproduction:** `open_findings::ks07_a_removed_key_stays_in_the_node_config`.
+**Reproduction:** `open_findings::ks07_a_removed_key_leaves_the_node`, which was the ignored `ks07_a_removed_key_stays_in_the_node_config`: the config the node keeps now holds no keys, before and after a `RemoveKey`, and the removed key is gone from the codec. Unit tests: kinship-proto `packet::tests::key_bytes_stay_where_they_are_when_keys_move` and kinship-core `config::tests::taking_the_codec_moves_the_keys_out_of_the_config`.
 
-**Recommended fix:** keep keys only in the codec, boxed so that moves do not copy them, strip them from the stored `Config`, and return base64 as `Zeroizing<String>`. In Python, read keys from a file or the environment just before building the config and drop the references afterwards.
+**Fix:**
+
+- `Key` keeps its 32 bytes in a heap allocation of their own, so moving a key, or growing a list of keys, moves a pointer and leaves no copy of the bytes. `Key::from_slice` and `Key::from_base64` decode straight into that allocation, and `Key::from_bytes` zeroizes its own copy of its argument.
+- `Node::new` moves the keys out of its `Config` into the codec, the only place they live from then on: the config the node keeps has an empty key list, and a key removed with `RemoveKey` is dropped, and zeroized, at once. `Config::validate` measures packets with a codec that holds a copy of the sealing key alone, zeroized as soon as validation ends.
+- `Key::to_base64` returns a `Zeroizing<String>` written into its final allocation, and the Python `generate_key()` zeroizes the Rust copy once Python has its string. kinship-net zeroizes its copy of the nonce key (KS-06) once the node has it.
+- README.md now tells Python applications to read keys from a file or the environment just before building the config, and to drop their references afterwards.
+
+**What remains:**
+
+- Python cannot zeroize `bytes` or `str`: a key passed in as one stays in the Python heap until that memory is reused. A Python `Config` also keeps the keys it was built with, zeroized only when the config is freed, and a `Cluster` keeps its config, so a key removed with `cluster.keyring.remove` stays in that config until both are gone.
+- The Rust `kinship::Config` builder and `kinship_net::Settings` hold the keys until the node starts, and an application's own copies are its to drop.
+- Keys are not locked in memory, so the operating system may write them to swap, and a dump of a running node still holds the keys installed at the time.
 
 ### KS-08 Key comparison is not constant time
 
