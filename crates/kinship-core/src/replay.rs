@@ -18,8 +18,15 @@
 //! reach them, and until a node has adopted it, everything it sends looks old to those that
 //! have. The floor therefore never jumps: it follows cluster time at up to twice the speed of
 //! this node's own clock, and moves at most half a window on any one input, so for a while
-//! after a jump, its own or another member's, packets from the old timeline still arrive. The nonces seen are kept down to
-//! the floor, so copies stay refused all the while.
+//! after a jump, its own or another member's, packets from the old timeline still arrive. The
+//! nonces seen are kept down to the floor, so copies stay refused all the while.
+//!
+//! A node that is still settling, one that has not completed a join or has a join in flight,
+//! has no old timeline to wait for: the first packets it hears may come from another node that
+//! has just started, and the cluster's real time arrives later, with a seed's reply. While it
+//! settles, every time it adopts moves the floor straight to the window behind it, so a
+//! recording older than that is refused as soon as the node hears the cluster. The node tells
+//! this module when it is settling.
 
 use core::time::Duration;
 use std::collections::BTreeSet;
@@ -67,6 +74,9 @@ pub(crate) struct Replay {
     ticked: Instant,
     /// Whether this node has read the cluster time from any packet yet.
     synced: bool,
+    /// Whether this node has yet to complete a join, or has one in flight: every time it
+    /// adopts then moves the floor at once.
+    settling: bool,
     /// Nonces accepted at or above the floor. Each starts with its big-endian stamp, so they
     /// sort by stamp.
     seen: BTreeSet<[u8; NONCE_LEN]>,
@@ -80,8 +90,14 @@ impl Replay {
             floor: 0,
             ticked: now,
             synced: false,
+            settling: false,
             seen: BTreeSet::new(),
         }
+    }
+
+    /// Whether this node has yet to complete a join, or has one in flight.
+    pub fn set_settling(&mut self, settling: bool) {
+        self.settling = settling;
     }
 
     pub fn window(&self) -> Duration {
@@ -137,12 +153,15 @@ impl Replay {
         }
         let stamp = stamp_of(nonce);
         let own = self.stamp(now);
-        if stamp > own {
+        let adopted = stamp > own;
+        if adopted {
             self.offset = self.offset.saturating_add(stamp - own);
         }
-        if !self.synced {
-            // The first time this node hears the cluster it was simply behind, not jumped
-            // over, so nothing older than the window is worth waiting for.
+        // The first time this node hears the cluster it was simply behind, not jumped over,
+        // so nothing older than the window is worth waiting for. Nor is it while the node
+        // settles: its first packet may have come from another node that had just started,
+        // and the time it adopts now, from a seed's reply, is the cluster's.
+        if !self.synced || (adopted && self.settling) {
             self.synced = true;
             let target = self.stamp(now).saturating_sub(self.window_ms());
             self.raise_floor(target);
@@ -202,6 +221,34 @@ mod tests {
         assert!(r.is_stale(3_000_000), "a recording from ten minutes before");
         assert!(r.accept(at(2), &nonce(3_590_000, 2)));
         assert_eq!(r.stamp(at(2)), 3_601_000, "never goes back");
+    }
+
+    #[test]
+    fn a_settling_node_moves_its_floor_with_every_time_it_adopts() {
+        // A node restarted together with a peer: the peer's join request reaches it first,
+        // sealed at the peer's own cluster time, two seconds.
+        let mut r = replay();
+        r.set_settling(true);
+        run(&mut r, 0, 1);
+        assert!(r.accept(at(1), &nonce(2_000, 1)));
+        // Then the seed's reply brings the cluster's time, an hour on.
+        assert!(r.accept(at(2), &nonce(3_600_000, 2)));
+        assert!(
+            r.is_stale(3_570_000 - 1),
+            "older than the window behind the cluster"
+        );
+        assert!(!r.is_stale(3_570_000));
+        // A later time, while it still settles, moves the floor at once too.
+        assert!(r.accept(at(3), &nonce(7_200_000, 3)));
+        assert!(r.is_stale(7_170_000 - 1));
+
+        // Settled, the same first packets leave the floor behind, to follow at the speed of
+        // this node's clock: what a member's clock jump needs.
+        let mut r = replay();
+        run(&mut r, 0, 1);
+        assert!(r.accept(at(1), &nonce(2_000, 1)));
+        assert!(r.accept(at(2), &nonce(3_600_000, 2)));
+        assert!(!r.is_stale(3_000));
     }
 
     #[test]

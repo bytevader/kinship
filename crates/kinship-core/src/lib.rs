@@ -131,6 +131,10 @@ pub struct Node {
     health: u32,
     /// Cluster time and the nonces seen inside the replay window.
     replay: Replay,
+    /// Whether this node has completed a join: a seed answered one of its own, it answered
+    /// another node's, or it was handed its members with [`Node::add_member`]. Until then, and
+    /// while a join is in flight, its replay floor moves at once with every time it adopts.
+    joined: bool,
 }
 
 impl Node {
@@ -193,6 +197,7 @@ impl Node {
             sync,
             health: 0,
             replay,
+            joined: false,
         };
         node.out.stamp = node.replay.stamp(now);
         node.broadcast(node.local_alive());
@@ -202,6 +207,10 @@ impl Node {
     /// Learns a member as Alive at incarnation 0 without contacting it, as a static member
     /// list would. Its metadata stays empty until it gossips a newer Alive. Does nothing if the
     /// name is this node's or already known.
+    ///
+    /// A node given its members this way counts as joined: it has no seed's reply to wait for,
+    /// so a later cluster time it hears is a member running ahead, and its replay floor
+    /// follows that gradually, as after a clock jump.
     pub fn add_member(
         &mut self,
         now: Instant,
@@ -215,6 +224,7 @@ impl Node {
                 reason: "must be 1 to 64 bytes",
             });
         }
+        self.joined = true;
         if name == self.local.member.name || self.table.get(name).is_some() {
             return Ok(());
         }
@@ -451,6 +461,8 @@ impl Node {
         let Stamp::Fresh(nonce) = stamp else {
             return true;
         };
+        self.replay
+            .set_settling(!self.joined || !self.sync.joins.is_empty());
         if !self.replay.accept(self.now, nonce) {
             self.metrics.replays_dropped += 1;
             return false;
@@ -606,7 +618,8 @@ mod tests {
         let codec = Codec::encrypted(b"default", Limits::default(), vec![key]).unwrap();
         let acks = |n: &mut Node| std::iter::from_fn(|| n.poll_transmit()).count();
         let secs = |s: u64| Instant::ZERO + core::time::Duration::from_secs(s);
-        // A node that has been running for a minute, waking every second.
+        // A member of a cluster that has been running for a minute, waking every second.
+        n.add_member(Instant::ZERO, "b", addr(2)).unwrap();
         let run = |n: &mut Node, from: u64, to: u64| {
             for s in from..=to {
                 n.handle_timeout(secs(s));
@@ -643,6 +656,40 @@ mod tests {
         n.handle_datagram(secs(180), addr(2), &stamped_ping(&codec, 61_000, 5));
         assert_eq!(acks(&mut n), 0);
         assert_eq!(n.metrics().replays_dropped, 3);
+    }
+
+    #[test]
+    fn until_it_has_joined_a_node_moves_its_floor_with_every_time_it_adopts() {
+        let key = Key::from_bytes([3; 32]);
+        let codec = Codec::encrypted(b"default", Limits::default(), vec![key.clone()]).unwrap();
+        let secs = |s: u64| Instant::ZERO + core::time::Duration::from_secs(s);
+        // Another node that has just started reaches this one first; then the cluster's time
+        // arrives, an hour on; then a recording from ten minutes before that.
+        let hear = |n: &mut Node| {
+            n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 2_000, 1));
+            n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 3_600_000, 2));
+            n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 3_000_000, 3));
+            n.metrics().replays_dropped
+        };
+        let mut new = node(Security::Keys(vec![key.clone()]));
+        assert_eq!(hear(&mut new), 1, "a node that has not joined refuses it");
+
+        // A node handed its members has joined: the hour looks like a member's clock jump,
+        // and the floor follows it gradually.
+        let mut listed = node(Security::Keys(vec![key.clone()]));
+        listed.add_member(Instant::ZERO, "b", addr(2)).unwrap();
+        assert_eq!(hear(&mut listed), 0);
+
+        // The same node with a join in flight takes the seed's time at once.
+        let mut joining = node(Security::Keys(vec![key]));
+        joining.add_member(Instant::ZERO, "b", addr(2)).unwrap();
+        joining.command(
+            Instant::ZERO,
+            Command::Join {
+                seeds: vec![addr(9)],
+            },
+        );
+        assert_eq!(hear(&mut joining), 1);
     }
 
     #[test]

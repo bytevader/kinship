@@ -1,9 +1,9 @@
 //! Failing reproductions of the findings in `docs/review.md`, the review of kinship-core against
 //! SWIM (Das, Gupta and Motivala, 2002), Lifeguard (Dadgar et al., 2017) and `docs/design.md`.
 //!
-//! Each test asserts what should hold and fails today. It is ignored, with its finding's id in
-//! the reason, so the suite stays green until the finding is fixed and the fix removes the
-//! `#[ignore]`. Run them with
+//! Each test asserts what should hold, and failed when the review was written. A test whose
+//! finding is still open is ignored, with the finding's id in the reason, so the suite stays
+//! green; the fix removes the `#[ignore]`. Run the ignored ones with
 //! `cargo test --release -p kinship-sim --test review -- --ignored --nocapture`. A failure names
 //! its lowest failing seed, and `KINSHIP_SEED=<seed>` replays that one.
 
@@ -286,8 +286,6 @@ fn kp01(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-01, a new node that first hears another new node keeps its replay floor \
-            far behind cluster time"]
 fn kp01_a_restarted_node_refuses_recordings_older_than_the_window() {
     check_all(seeds(8), kp01);
 }

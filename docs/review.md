@@ -1,6 +1,6 @@
 # Protocol review
 
-A review of `crates/kinship-core`, read line by line on 2026-10-07 against SWIM (Das, Gupta and Motivala, 2002), Lifeguard (Dadgar et al., 2017) and `docs/design.md`. It looked for incarnation bugs, timeout arithmetic, dissemination starvation, probe-order bias, Nack timing, tombstone and state leaks, the join and leave paths, and the replay window in `replay.rs`. Findings already open in SECURITY.md are not repeated, and nothing is fixed here.
+A review of `crates/kinship-core`, read line by line on 2026-10-07 against SWIM (Das, Gupta and Motivala, 2002), Lifeguard (Dadgar et al., 2017) and `docs/design.md`. It looked for incarnation bugs, timeout arithmetic, dissemination starvation, probe-order bias, Nack timing, tombstone and state leaks, the join and leave paths, and the replay window in `replay.rs`. Findings already open in SECURITY.md are not repeated. The review itself fixed nothing; the Status column records the fixes that followed, and each fixed finding says what changed.
 
 Every finding has a simulator test in `crates/kinship-sim/tests/review.rs` that asserts what should hold and fails today. The tests are ignored, with the finding's id in the reason, so CI stays green; a fix removes the `#[ignore]`. Run them with
 
@@ -20,17 +20,17 @@ A failure names its lowest failing seed, and `KINSHIP_SEED=<seed>` replays it. E
 
 ## Findings
 
-| ID | Severity | Finding | Test |
-| --- | --- | --- | --- |
-| KP-01 | High | A new node that first hears another new node keeps its replay floor far behind cluster time | `kp01_a_restarted_node_refuses_recordings_older_than_the_window` |
-| KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` |
-| KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` |
-| KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` |
-| KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` |
+| ID | Severity | Finding | Test | Status |
+| --- | --- | --- | --- | --- |
+| KP-01 | High | A new node that first hears another new node keeps its replay floor far behind cluster time | `kp01_a_restarted_node_refuses_recordings_older_than_the_window` | Fixed |
+| KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Open |
+| KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Open |
+| KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Open |
+| KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Open |
 
 ### KP-01 A new node that first hears another new node keeps its replay floor far behind cluster time
 
-**Severity:** High. **Attacker:** no key.
+**Severity:** High. **Attacker:** no key. **Status:** Fixed.
 
 `Replay::accept` (`crates/kinship-core/src/replay.rs:143`) moves the floor straight to the window behind cluster time only for the first packet a node authenticates. After that, `Replay::tick` (`replay.rs:102`) lets the floor follow cluster time at twice the node's own clock and half a window per input, which is what absorbs clock jumps. If the first packet comes from a node that is itself behind, such as another process that has just started, the floor stays near zero, and when the seed's reply then teaches the node the real cluster time T, the floor closes the gap only at real-time speed. Until it does, or until the 131,072 remembered nonces force it up (hours at ordinary packet rates), the node accepts every recording newer than its floor that it has not seen itself, which for a new process is every recording. The harm is KS-01's: phantom members, false deaths of members that restarted, and traffic the attacker drives.
 
@@ -41,6 +41,8 @@ The simulator's restart hands a new instance the shared clock, so none of the ex
 **Reproduction:** five nodes run for 600 s. An attacker records what n0 receives while n4 changes its metadata and leaves, around 300 s. At 600 s n0 and n1 restart as new processes and join through each other and n2. At 720 s, two minutes after n0 joined, the attacker replays the recording: n0 accepts every datagram, sealed 410 to 430 s earlier, and n4 joins again on all four running nodes. 8 of 8 seeds fail. With only n0 restarting, the same replay is dropped in 8 of 8 seeds. With only n0 restarting but one old recording delivered before its join, a replay 80 s after the join is accepted again in 8 of 8.
 
 **Recommended fix:** move the floor to the window behind cluster time on every adoption while the node is younger than the window or has not completed a join, not only on the first. A throwaway patch that keeps snapping while the node is younger than the window makes the test pass and keeps every other core and simulator test green. Then correct the first "What remains" bullet of KS-01.
+
+**Fix:** until a node has completed a join, and whenever a join of its own is in flight, every cluster time it adopts moves its floor straight to the window behind it (`Replay::accept`, told by `Node::accept_stamp`). A join is complete on both sides once a seed answers it, and a node handed its members with `add_member` counts as joined. In the test, n0's join is still waiting on n2 when n2's reply brings the cluster's time, so the floor follows it at once and the replay is dropped. The age condition was left out: it fails the clock-jump sweep in `failure.rs`, whose jumps land 5 to 15 s after start, in 2 of 1,000 seeds with a live node declared dead, because every node that adopts the jumped clock then drops the packets of those that have not adopted it yet. A node that has joined keeps the gradual floor at any age, and KS-01's first "What remains" bullet now describes what is left. Unit tests: kinship-core `replay::tests::a_settling_node_moves_its_floor_with_every_time_it_adopts` and `tests::until_it_has_joined_a_node_moves_its_floor_with_every_time_it_adopts`.
 
 ### KP-02 leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead
 

@@ -199,6 +199,8 @@ impl Node {
                 if self.send_state(conn, false, true) {
                     self.metrics.push_pulls_served += 1;
                 }
+                // Answering a join completes it on this side too.
+                self.joined |= p.join;
                 true
             }
             Message::Ping(p) => {
@@ -434,6 +436,7 @@ impl Node {
         if ok {
             s.state = SeedState::Answered;
             join.answered += 1;
+            self.joined = true;
         } else if s.attempts < retries {
             s.state = SeedState::Waiting(now + base * (1 << (s.attempts - 1).min(16)));
         } else {
@@ -725,6 +728,7 @@ mod tests {
         assert_eq!(p.nodes[1].metrics().push_pulls_served, 1);
         assert!(p.conns.is_empty(), "both ends closed");
         assert!(p.nodes[0].sync.streams.is_empty());
+        assert!(p.nodes[0].joined && p.nodes[1].joined, "on both sides");
     }
 
     #[test]
