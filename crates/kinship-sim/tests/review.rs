@@ -772,8 +772,6 @@ fn kp05(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-05, a push-pull merge signs the peer's suspicions as this node's own \
-            confirmations"]
 fn kp05_a_node_confirms_only_suspicions_its_own_probe_raised() {
     check_all(seeds(8), kp05);
 }

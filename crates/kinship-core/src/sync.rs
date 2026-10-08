@@ -11,7 +11,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records, Suspect};
+use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records};
 
 use crate::broadcast::{Gossip, id};
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
@@ -280,11 +280,10 @@ impl Node {
 
     /// Merges a peer's member table with the precedence rules, as gossip would.
     ///
-    /// As in memberlist, a peer's Dead record becomes a suspicion rather than a death: this
-    /// node may have heard from the member more recently, and a suspicion gives the member the
-    /// chance to refute. Records about members this node does not know only add them if Alive.
+    /// As in memberlist, a peer's Dead record becomes a suspicion rather than a death, but not
+    /// one this node reports; see [`Node::on_merged_suspicion`]. Records about members this
+    /// node does not know only add them if Alive.
     fn merge(&mut self, now: Instant, records: Records<'_>) {
-        let me = self.local.member.name.clone();
         for r in records.iter() {
             let a = r.alive;
             match r.state {
@@ -297,14 +296,9 @@ impl Node {
                         from: a.node,
                     },
                 ),
-                kinship_proto::State::Suspect | kinship_proto::State::Dead => self.on_suspect(
-                    now,
-                    &Suspect {
-                        inc: a.inc,
-                        node: a.node,
-                        from: id(&me),
-                    },
-                ),
+                kinship_proto::State::Suspect | kinship_proto::State::Dead => {
+                    self.on_merged_suspicion(now, a.node.as_str(), a.inc);
+                }
             }
         }
     }
@@ -589,6 +583,7 @@ mod tests {
     use crate::config::{Config, Security};
     use crate::event::Command;
     use crate::{Identity, Member};
+    use kinship_proto::Suspect;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -1038,6 +1033,63 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::MemberSuspect(_)));
         assert!(!suspected);
+    }
+
+    #[test]
+    fn a_merged_suspicion_counts_no_reporter_and_is_not_gossiped() {
+        let t = Instant::ZERO;
+        let mut a = node("a", 1);
+        for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+            a.add_member(t, name, addr(port)).unwrap();
+        }
+        while a.poll_transmit().is_some() {}
+        let record = |name: &'static str, port, state| Record {
+            state,
+            alive: Alive {
+                inc: 0,
+                node: id(name),
+                addr: addr(port),
+                meta: b"",
+                vmin: 1,
+                vmax: 1,
+            },
+        };
+        // A peer holds b as Suspect and c as Dead.
+        let records = [
+            record("b", 2, kinship_proto::State::Suspect),
+            record("c", 3, kinship_proto::State::Dead),
+        ];
+        a.merge(t, Records::Slice(&records));
+        for name in ["b", "c"] {
+            assert_eq!(a.member(name).unwrap().state, State::Suspect);
+            assert_eq!(a.suspicions[name].confirmations(), 0);
+            assert!(!a.out.broadcasts.contains(name), "not gossiped");
+        }
+        // Only the suspects themselves hear of it, so they can refute.
+        let told: Vec<SocketAddr> = std::iter::from_fn(|| a.poll_transmit())
+            .filter_map(|t| match t {
+                Transmit::Datagram { to, .. } => Some(to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [addr(2), addr(3)]);
+
+        // The first member to report it is its first reporter, not a confirmation.
+        let full = a.suspicions["b"].deadline;
+        let from = |r| Suspect {
+            inc: 0,
+            node: id("b"),
+            from: id(r),
+        };
+        a.on_suspect(t, &from("d"));
+        assert_eq!(a.suspicions["b"].confirmations(), 0);
+        assert_eq!(a.suspicions["b"].deadline, full);
+        // A merge that repeats it leaves it as it is.
+        a.merge(t, Records::Slice(&records[..1]));
+        assert_eq!(a.suspicions["b"].confirmations(), 0);
+        a.on_suspect(t, &from("e"));
+        assert_eq!(a.suspicions["b"].confirmations(), 1);
+        assert!(a.suspicions["b"].deadline < full);
     }
 
     #[test]

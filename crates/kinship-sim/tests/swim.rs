@@ -524,7 +524,7 @@ fn swim_trace_is_pinned_across_platforms() {
     });
     assert_eq!(
         sim.run().digest(),
-        0x4ee1_3473_dee3_f740,
+        0xcd5b_0a77_897a_c880,
         "trace digest changed"
     );
 }

@@ -32,13 +32,23 @@ pub(crate) struct Suspicion {
     /// Confirmations that bring the timeout down to `min`; 0 if it starts there.
     k: u32,
     /// Distinct members that reported the suspicion, the first reporter included; this node
-    /// counts too when its own probe of the member fails.
+    /// counts too when its own probe of the member fails. Empty for a suspicion learned from a
+    /// push-pull, which names no reporter.
     reporters: Vec<String>,
 }
 
 impl Suspicion {
     /// A suspicion first reported by `from` in a cluster of `n` live members.
     pub fn new(cfg: &Config, n: usize, now: Instant, from: &str) -> Self {
+        let mut s = Self::unreported(cfg, n, now);
+        s.reporters.push(from.to_owned());
+        s
+    }
+
+    /// A suspicion nobody has reported to this node: one a peer's push-pull carried, which
+    /// does not say who saw the member fail. It runs like one just reported, at the maximum
+    /// timeout, and the first member to report it later counts as its first reporter.
+    pub fn unreported(cfg: &Config, n: usize, now: Instant) -> Self {
         let min = min_timeout(cfg, n);
         let k = if cfg.dynamic_suspicion {
             let others = u32::try_from(n.saturating_sub(2)).unwrap_or(u32::MAX);
@@ -57,7 +67,7 @@ impl Suspicion {
             min,
             max,
             k,
-            reporters: vec![from.to_owned()],
+            reporters: Vec::new(),
         }
     }
 
@@ -74,7 +84,7 @@ impl Suspicion {
 
     /// Independent confirmations after the first report.
     pub fn confirmations(&self) -> u32 {
-        u32::try_from(self.reporters.len() - 1).unwrap_or(u32::MAX)
+        u32::try_from(self.reporters.len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
     /// `max(T_min, T_max - (T_max - T_min) x log(C + 1) / log(K + 1))`.

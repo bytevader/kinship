@@ -26,7 +26,7 @@ A failure names its lowest failing seed, and `KINSHIP_SEED=<seed>` replays it. E
 | KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Fixed |
 | KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Fixed |
 | KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Fixed |
-| KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Open |
+| KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Fixed |
 
 ### KP-01 A new node that first hears another new node keeps its replay floor far behind cluster time
 
@@ -84,13 +84,15 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 
 ### KP-05 Merging a push-pull counts this node as an independent confirmation of every suspicion in it
 
-**Severity:** Low.
+**Severity:** Low. **Status:** Fixed.
 
 `Node::merge` (`sync.rs:284`) turns a peer's Suspect or Dead record into a Suspect from this node (`sync.rs:303`). If this node already suspects the member, it counts itself as a fresh confirmation and gossips the Suspect under its own name; if not, it starts a suspicion with itself as the reporter and gossips that. Every other node then counts it as one more independent confirmation. Lifeguard shrinks the timeout only with independent suspicions, and design.md defines a confirmation as a Suspect "from a member that has not reported this suspicion yet, this node included when its own probe fails". A merge is not a probe, so anti-entropy alone can take a suspicion from the maximum timeout to the minimum and take away the time Lifeguard gives a slow member to refute. memberlist's merge does the same; it still diverges from the paper and from design.md.
 
 **Reproduction:** ten nodes; n9 crashes. The test reads every node's datagrams with the cluster key and flags a Suspect that a node signs with its own name, sends to anyone but the suspect, about a member it never sent a PingReq for, that is, never probed without an answer. 2 of 8 seeds fail, 53 of 100, and each flagged Suspect goes out at the instant its node merged a push-pull frame. With suspicions from merges turned off, 100 of 100 pass.
 
 **Recommended fix:** start a suspicion learned from a push-pull at the maximum timeout with no reporter that counts, and leave an existing suspicion as it is when a merge repeats it. Keep the conversion of Dead records into suspicions, which is what heals partitions.
+
+**Fix:** as recommended, in `Node::on_merged_suspicion`, which `Node::merge` now calls for Suspect and Dead records. A merged suspicion starts at the maximum timeout with no reporter (`Suspicion::unreported`), so the first member that reports it afterwards is its first reporter and only the second shortens it; one already running at the record's incarnation is left alone; and nothing is gossiped. That last part would have slowed the partition heal, which relied on the gossiped Suspect reaching the suspected member, so the merging node sends the Suspect to that member alone, as the buddy system would, and the member refutes at once. Against the code before these fixes, with KP-04's fix also in, the 1,000-seed SWIM sweep's suspicions of live nodes fall from 673 to 558 and its median detection rises from 9.3 to 10.0 s, since anti-entropy no longer shortens suspicions; the heal sweep reconverges at a median of 1.25 s rather than 2.5 s, and in the join sweep the slowest convergence after a node joins 200 falls from 27.9 to 1.1 s. Unit test: kinship-core `sync::tests::a_merged_suspicion_counts_no_reporter_and_is_not_gossiped`.
 
 ## Divergences that are not bugs
 
