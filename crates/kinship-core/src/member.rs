@@ -91,8 +91,8 @@ impl Node {
         }
         let was = old.state;
         let previous_meta = (old.meta != a.meta).then(|| old.meta.clone());
+        self.table.set_addr(name, a.addr);
         let entry = self.table.update(name, State::Alive, a.inc, now);
-        entry.member.addr = a.addr;
         entry.member.meta.clear();
         entry.member.meta.extend_from_slice(a.meta);
         entry.vmin = a.vmin;
@@ -236,7 +236,7 @@ impl Node {
             from: id(&me),
         });
         let limit = self.retransmit_limit();
-        self.out.send(addr, true, &[suspect], Some(limit));
+        self.send_to(addr, true, &[suspect], Some(limit));
     }
 
     /// A Suspect or Dead about this node at `inc`.

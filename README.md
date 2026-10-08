@@ -184,7 +184,7 @@ print(cluster.keyring.key_ids())         # ['9f3a01c2', ...], safe to log
 
 Finish each step on every node before starting the next. A node that falls behind looks dead to the others until it catches up, and `cluster.stats().decrypt_failures` counts what it dropped. Changing `keys` in your config and restarting nodes one by one does the same thing.
 
-To run without encryption beyond loopback, set `insecure_plaintext=True`; kinship logs a warning at startup.
+To run without encryption beyond loopback, set `insecure_plaintext=True`; kinship logs a warning at startup. Without encryption anyone who can reach the port can forge membership, so use it only where everything that can reach the port is trusted. A plaintext node sends only to members it knows, so a forged packet cannot make it send traffic to a third party.
 
 ## Logs, fork and threads
 

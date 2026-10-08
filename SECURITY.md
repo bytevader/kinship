@@ -46,7 +46,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KS-01 | High | no key | Recorded datagrams and push-pull frames were accepted again | Fixed |
 | KS-02 | High | no key | Unauthenticated stream frames could pin 512 MiB | Fixed |
 | KS-03 | Medium | no key | A connection flood evicted real inbound exchanges | Fixed |
-| KS-04 | Medium | no key | Plaintext mode accepts forgeries and reflects 46x | Open |
+| KS-04 | Medium | no key | Plaintext mode accepts forgeries, and reflected them 46x | Fixed |
 | KS-05 | Low | no key | Key id lookup timing reveals installed keys | Open |
 | KS-06 | Low | no key | Nonce bytes come from a non-cryptographic generator | Open |
 | KS-07 | Low | local | Copies of keys outlive removal and drop | Open |
@@ -117,15 +117,20 @@ The three new limits are fields of the kinship and Python configs, validated wit
 - The header check passes anyone who has seen a packet of the cluster, since key ids and the label's hash are sent in the clear (KS-09). It shuts out peers that have not, such as scanners and nodes of other clusters, and makes the rest send a valid header within a second.
 - Whether a connection survives its header tells a peer whether the node has a given key id installed. A peer can only ask about ids it already knows, since an id is 32 bits of a key's hash; see KS-05.
 
-### KS-04 Plaintext mode accepts forgeries and reflects 46x
+### KS-04 Plaintext mode accepts forgeries, and reflected them 46x
 
-**Severity:** Medium. **Status:** Open; plaintext stays opt-in.
+**Severity:** Medium. **Status:** Fixed; plaintext stays opt-in and unauthenticated.
 
-With `insecure_plaintext=True`, or `Config.local()` on loopback, there is no authentication: anyone who can send to the port forges any message, so KS-01 and every member finding apply to everyone who can reach it. On loopback that is every local process and user, and every container that shares the network namespace, such as the sidecars of a Kubernetes pod. Plaintext is also a reflector: replies go to the addresses inside messages, so a forged Ping naming a victim as its source makes the node send the victim an Ack with as much queued gossip as fits a datagram, and a forged PingReq sends the victim a Ping and a Nack.
+With `insecure_plaintext=True`, or `Config.local()` on loopback, there is no authentication: anyone who can send to the port forges any message, so KS-01 and every member finding apply to everyone who can reach it. On loopback that is every local process and user, and every container that shares the network namespace, such as the sidecars of a Kubernetes pod. Plaintext was also a reflector: replies went to the addresses inside messages, so a forged Ping naming a victim as its source made the node send the victim an Ack with as much queued gossip as fit a datagram, and a forged PingReq sent the victim a Ping and a Nack.
 
-**Reproduction:** `open_findings::ks04_plaintext_reflects_forged_pings_with_gossip`: a 30-byte forged Ping makes a node with news to spread send 1,381 bytes to a third party, 46 times as much.
+**Reproduction:** `open_findings::ks04_plaintext_sends_nothing_to_an_address_that_is_not_a_member`, which was `ks04_plaintext_reflects_forged_pings_with_gossip`: a 30-byte forged Ping made a node with news to spread send 1,381 bytes to a third party, 46 times as much. Now neither that Ping nor a forged PingReq naming the victim as its requester or its target sends the victim anything, while a member's Ping still gets its Ack and the gossip. Unit tests: kinship-core `tests::in_plaintext_a_node_sends_only_to_members_it_knows_or_that_the_packet_announces` and `table::tests::member_addresses_are_indexed_through_moves_replacements_and_reaping`.
 
-**Recommended fix:** in plaintext mode, piggyback gossip only on packets to known member addresses, and send nothing to an address that is not a member.
+**Fix:** in plaintext mode a node sends a datagram only to the address of a member it knows, tombstones included (`Node::may_send`, which every datagram passes). Gossip therefore rides only on packets to members, and an Ack, Nack, Ping or forwarded Ack for any other address is not sent. A PingReq from a requester it could not answer is ignored, and one for a target it may not ping gets only its Nack. A member that is new to the node, one that joined through another member a moment ago, announces itself with an Alive in the packets it sends, so while the node handles a packet, an address that an Alive in it announces counts as a member's, and the Ping ahead of that Alive is answered as it would be with encryption. The member table indexes addresses, so the check is one lookup. Encrypted mode is unchanged: only a member holding the key can make a node send.
+
+**What remains:**
+
+- Plaintext is still unauthenticated. A peer that first forges an Alive for an invented member at the victim's address makes that address a member's: the node then answers Pings naming it, with gossip, probes it and gossips it to the cluster, which probes it too, until the invented member is declared dead and its tombstone reaped. That costs a forged Alive for every invented member and shows on every node as a member that joined and died, but the reflection then runs at the forger's rate. KS-01 and every member finding (KI-01 to KI-06) still apply to anyone who can reach the port.
+- A new member whose own packets do not carry its Alive, as in a large plaintext cluster where its queue of fresh rumours fills its first datagrams, is not answered until the node has heard of it from others. Its first probes can then go unanswered, so it suspects members that are fine, which refute, and its local health rises for a round or two.
 
 ### KS-05 Key id lookup timing reveals installed keys
 
@@ -237,6 +242,6 @@ Every node adopts the latest cluster time it authenticates, and the replay floor
 - **Dropping and delaying traffic.** An attacker on the path that drops a member's packets makes it look dead, as a real failure would; that is what a failure detector reports. Partitions are healed when traffic flows again, not prevented.
 - **Floods.** A peer without a key can fill a node's UDP socket or CPU with traffic that fails authentication, and one with many addresses can fill its inbound connection slots and buffer (KS-03). Each packet costs at most one tag verification per installed key with its key id, and no reply.
 - **Traffic analysis.** Sizes, timing, addresses, key ids and the cluster time stamp are visible (KS-09).
-- **Plaintext mode.** `insecure_plaintext=True`, and `Config.local()` on loopback, trust everyone who can reach the port, have no replay protection, and reflect forged Pings with gossip (KS-04).
+- **Plaintext mode.** `insecure_plaintext=True`, and `Config.local()` on loopback, trust everyone who can reach the port and have no replay protection. A node sends only to members it knows, so a forged packet cannot aim it at a third party, but a forged member can (KS-04).
 - **The application's own decisions.** Split-brain decisions made during a partition, and a member that answers probes but is otherwise broken.
 - **Key handling outside kinship.** Keys given to kinship as Python objects, or stored in files and environment variables, are the application's to protect (KS-07).

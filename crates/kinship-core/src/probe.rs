@@ -120,7 +120,8 @@ impl Node {
             target.member.state == State::Suspect,
         );
         let seq = self.next_seq();
-        let me = id(&self.local.member.name);
+        let me = self.local.member.name.clone();
+        let me = id(&me);
         let ping = Message::Ping(Ping {
             seq,
             target: id(&name),
@@ -141,7 +142,7 @@ impl Node {
         };
         let limit = self.retransmit_limit();
         // Only live members are probed.
-        self.out.send(addr, true, head, Some(limit));
+        self.send_to(addr, true, head, Some(limit));
         self.metrics.probes_sent += 1;
         self.probe = Some(Probe {
             seq,
@@ -181,7 +182,7 @@ impl Node {
         let limit = self.retransmit_limit();
         let asked = u32::try_from(relays.len()).unwrap_or(u32::MAX);
         for relay in relays {
-            self.out.send(relay, true, &[req], Some(limit));
+            self.send_to(relay, true, &[req], Some(limit));
             self.metrics.indirect_probes += 1;
         }
         if let Some(p) = &mut self.probe {
@@ -206,11 +207,16 @@ impl Node {
         let limit = self.retransmit_limit();
         let ack = Message::Ack { seq: ping.seq };
         let live = self.holds_live(ping.source.as_str());
-        self.out.send(ping.source_addr, live, &[ack], Some(limit));
+        self.send_to(ping.source_addr, live, &[ack], Some(limit));
     }
 
-    /// Pings the target on the requester's behalf, unless this node knows the target left.
+    /// Pings the target on the requester's behalf, unless this node knows the target left. In
+    /// plaintext mode a requester this node could not answer is ignored, and a target it may not
+    /// send to is not pinged, so that its Nack answers for it.
     pub(crate) fn on_ping_req(&mut self, now: Instant, req: &PingReq<'_>) {
+        if !self.may_send(req.requester_addr) {
+            return;
+        }
         let left = self
             .table
             .get(req.target.as_str())
@@ -226,20 +232,20 @@ impl Node {
             });
             let limit = self.retransmit_limit();
             // A PingReq names its requester by address only, so it is not counted as live.
-            self.out
-                .send(req.requester_addr, false, &[news], Some(limit));
+            self.send_to(req.requester_addr, false, &[news], Some(limit));
             return;
         }
         let seq = self.next_seq();
+        let me = self.local.member.name.clone();
         let ping = Message::Ping(Ping {
             seq,
             target: req.target,
-            source: id(&self.local.member.name),
+            source: id(&me),
             source_addr: self.local.member.addr,
         });
         let limit = self.retransmit_limit();
         let live = self.holds_live(req.target.as_str());
-        self.out.send(req.target_addr, live, &[ping], Some(limit));
+        self.send_to(req.target_addr, live, &[ping], Some(limit));
         // The requester's indirect phase lasts at least probe_interval - probe_timeout; the
         // Nack must land inside it, whatever this node's own health, or it counts as missing.
         let (interval, timeout) = (self.cfg.probe_interval, self.cfg.probe_timeout);
@@ -265,7 +271,7 @@ impl Node {
         if let Some(relay) = self.relays.remove(&seq) {
             let limit = self.retransmit_limit();
             let ack = Message::Ack { seq: relay.seq };
-            self.out.send(relay.requester, false, &[ack], Some(limit));
+            self.send_to(relay.requester, false, &[ack], Some(limit));
         }
     }
 
@@ -288,7 +294,7 @@ impl Node {
             now < r.expires
         });
         for (to, seq) in nacks {
-            self.out.send(to, false, &[Message::Nack { seq }], None);
+            self.send_to(to, false, &[Message::Nack { seq }], None);
         }
     }
 

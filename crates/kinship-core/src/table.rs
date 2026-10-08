@@ -1,5 +1,6 @@
 //! The member table and the shuffled round-robin probe order.
 
+use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
@@ -24,6 +25,9 @@ pub(crate) struct Entry {
 #[derive(Debug, Default)]
 pub(crate) struct Table {
     entries: BTreeMap<String, Entry>,
+    /// How many entries have each address, so that whether an address is a member's is quick
+    /// to tell.
+    addrs: BTreeMap<SocketAddr, usize>,
     /// Members in Alive or Suspect.
     live: usize,
     /// Names to probe this pass, in shuffled order; `order[pos..]` are still to come.
@@ -52,13 +56,33 @@ impl Table {
     /// Adds a member that is not in the table.
     pub fn insert(&mut self, entry: Entry) {
         let live = entry.member.state.is_live();
+        *self.addrs.entry(entry.member.addr).or_default() += 1;
         if let Some(old) = self.entries.insert(entry.member.name.clone(), entry) {
             self.live -= usize::from(old.member.state.is_live());
+            unindex(&mut self.addrs, old.member.addr);
         }
         self.live += usize::from(live);
     }
 
-    /// Moves a known member to `state` at `inc`, and returns it for further changes.
+    /// Whether any member in the table, tombstones included, has the address `addr`.
+    pub fn has_addr(&self, addr: SocketAddr) -> bool {
+        self.addrs.contains_key(&addr)
+    }
+
+    /// Moves a known member to `addr`. Addresses change only here, which keeps them indexed.
+    pub fn set_addr(&mut self, name: &str, addr: SocketAddr) {
+        let Some(entry) = self.entries.get_mut(name) else {
+            return;
+        };
+        if entry.member.addr != addr {
+            unindex(&mut self.addrs, entry.member.addr);
+            *self.addrs.entry(addr).or_default() += 1;
+            entry.member.addr = addr;
+        }
+    }
+
+    /// Moves a known member to `state` at `inc`, and returns it for further changes; its
+    /// address changes only through [`set_addr`](Self::set_addr).
     ///
     /// # Panics
     ///
@@ -81,8 +105,14 @@ impl Table {
 
     /// Deletes tombstones that have been Dead or Left for at least `keep`.
     pub fn reap(&mut self, now: Instant, keep: Duration) {
-        self.entries
-            .retain(|_, e| e.member.state.is_live() || now - e.since < keep);
+        let addrs = &mut self.addrs;
+        self.entries.retain(|_, e| {
+            let kept = e.member.state.is_live() || now - e.since < keep;
+            if !kept {
+                unindex(addrs, e.member.addr);
+            }
+            kept
+        });
     }
 
     /// The next member to probe: each live member once per pass, in an order reshuffled every
@@ -126,5 +156,56 @@ impl Table {
         }
         pool.truncate(k);
         pool
+    }
+}
+
+/// Counts one entry fewer at `addr`.
+fn unindex(addrs: &mut BTreeMap<SocketAddr, usize>, addr: SocketAddr) {
+    if let Some(n) = addrs.get_mut(&addr) {
+        *n -= 1;
+        if *n == 0 {
+            addrs.remove(&addr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, port: u16, state: State) -> Entry {
+        Entry {
+            member: Member {
+                name: name.to_owned(),
+                addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                meta: Vec::new(),
+                state,
+                incarnation: 0,
+            },
+            since: Instant::ZERO,
+            vmin: 1,
+            vmax: 1,
+        }
+    }
+
+    #[test]
+    fn member_addresses_are_indexed_through_moves_replacements_and_reaping() {
+        let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut t = Table::default();
+        t.insert(entry("a", 1, State::Alive));
+        t.insert(entry("b", 1, State::Alive));
+        assert!(t.has_addr(at(1)) && !t.has_addr(at(2)));
+        // A move leaves the old address while another member still has it.
+        t.set_addr("a", at(2));
+        assert!(t.has_addr(at(1)) && t.has_addr(at(2)));
+        t.insert(entry("b", 3, State::Alive));
+        assert!(!t.has_addr(at(1)), "b's replacement took it away");
+        // Tombstones keep their address until they are reaped.
+        t.update("a", State::Dead, 0, Instant::ZERO);
+        let later = Instant::ZERO + Duration::from_secs(1);
+        t.reap(later, Duration::from_secs(2));
+        assert!(t.has_addr(at(2)));
+        t.reap(later, Duration::from_secs(1));
+        assert!(!t.has_addr(at(2)) && t.has_addr(at(3)));
     }
 }

@@ -385,10 +385,31 @@ impl Node {
             .collect();
         let limit = self.retransmit_limit();
         for (to, live) in targets {
-            if !self.out.send(to, live, &[], Some(limit)) {
+            if !self.send_to(to, live, &[], Some(limit)) {
                 break;
             }
         }
+    }
+
+    /// Whether this node may send a datagram to `to`. Always with encryption, where only members
+    /// can make it send. In plaintext mode, where anyone can forge the addresses inside messages,
+    /// only to the address of a member it knows, tombstones included, or one that an Alive in
+    /// the packet it is handling announces, so that a forged packet cannot make it send to an
+    /// address of the forger's choosing.
+    pub(crate) fn may_send(&self, to: SocketAddr) -> bool {
+        self.out.codec.is_encrypted() || self.table.has_addr(to) || self.announced.contains(&to)
+    }
+
+    /// Sends `head` to `to` in one datagram with queued gossip, as [`Outbox::send`] does, if
+    /// this node [may send](Self::may_send) to `to`. Returns whether a datagram was queued.
+    pub(crate) fn send_to(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        self.may_send(to) && self.out.send(to, live, head, limit)
     }
 }
 

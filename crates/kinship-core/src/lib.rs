@@ -137,6 +137,9 @@ pub struct Node {
     /// another node's, or it was handed its members with [`Node::add_member`]. Until then, and
     /// while a join is in flight, its replay floor moves at once with every time it adopts.
     joined: bool,
+    /// In plaintext mode, the addresses that Alives in the packet being handled announce, which
+    /// this node may answer as if they were members already; see [`Node::may_send`].
+    announced: Vec<SocketAddr>,
 }
 
 impl Node {
@@ -200,6 +203,7 @@ impl Node {
             health: 0,
             replay,
             joined: false,
+            announced: Vec::new(),
         };
         node.out.stamp = node.replay.stamp(now);
         node.broadcast(node.local_alive());
@@ -496,8 +500,20 @@ impl Node {
     }
 
     /// Handles every message of an authenticated payload, in order.
+    ///
+    /// In plaintext mode this node answers only members, and a member that is new to it, one
+    /// that just joined through another node, announces itself with an Alive in the packets it
+    /// sends. The addresses those announce count as members' while the packet is handled, so
+    /// that the Ping ahead of the Alive is answered as it would be with encryption.
     fn process(&mut self, payload: &Payload<'_>) {
         let now = self.now;
+        if !self.out.codec.is_encrypted() {
+            self.announced
+                .extend(payload.iter().filter_map(|msg| match msg {
+                    Message::Alive(a) => Some(a.addr),
+                    _ => None,
+                }));
+        }
         for msg in payload.iter() {
             match msg {
                 Message::Ping(p) => self.on_ping(&p),
@@ -511,6 +527,7 @@ impl Node {
                 Message::PushPull(_) => {}
             }
         }
+        self.announced.clear();
     }
 }
 
@@ -943,6 +960,7 @@ mod tests {
     fn a_stale_rumour_about_this_node_queues_its_alive_again() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
+        n.add_member(t, "c", addr(3)).unwrap();
         deliver(&mut n, t, &[suspect("a", 0, "c")]);
         assert_eq!(n.local().incarnation, 1);
         // The refutation has finished spreading, and c missed it.
@@ -977,6 +995,66 @@ mod tests {
         n.out.broadcasts.forget("a");
         deliver(&mut n, t, &[suspect("a", 0, "c"), dead("a", 0, "c")]);
         assert!(!n.out.broadcasts.contains("a"));
+    }
+
+    #[test]
+    fn in_plaintext_a_node_sends_only_to_members_it_knows_or_that_the_packet_announces() {
+        let t = Instant::ZERO;
+        let ping = |seq, source: &'static str, port| {
+            Message::Ping(Ping {
+                seq,
+                target: id("a"),
+                source: id(source),
+                source_addr: addr(port),
+            })
+        };
+        let req = |seq, target: &'static str, target_port, requester_port| {
+            Message::PingReq(kinship_proto::PingReq {
+                seq,
+                target: id(target),
+                target_addr: addr(target_port),
+                requester_addr: addr(requester_port),
+                want_nack: true,
+            })
+        };
+        let mut n = node(Security::InsecurePlaintext);
+        n.add_member(t, "b", addr(2)).unwrap();
+        // A Ping or a PingReq from an address no member has gets nothing back.
+        deliver(&mut n, t, &[ping(1, "x", 9)]);
+        deliver(&mut n, t, &[req(2, "b", 2, 9)]);
+        assert_eq!(sent(&mut n), []);
+        // A member's Ping gets its Ack, with gossip.
+        deliver(&mut n, t, &[ping(3, "b", 2)]);
+        let pkts = sent(&mut n);
+        assert!(contains(&pkts, addr(2), "Ack { seq: 3 }"), "{pkts:?}");
+        assert!(contains(
+            &pkts,
+            addr(2),
+            r#"Alive(Alive { inc: 0, node: "a""#
+        ));
+        // A member new to this node announces itself in the same packet, and is answered.
+        deliver(&mut n, t, &[ping(4, "c", 3), alive("c", 0, 3)]);
+        assert!(contains(&sent(&mut n), addr(3), "Ack { seq: 4 }"));
+        // A member's PingReq for an address no member has: no Ping, and the Nack in time.
+        deliver(&mut n, t, &[req(5, "y", 8, 2)]);
+        let timeout = n.config().probe_timeout;
+        let pkts = run_until(&mut n, t + timeout);
+        assert!(pkts.iter().all(|(to, _)| *to != addr(8)), "{pkts:?}");
+        assert!(contains(&pkts, addr(2), "Nack { seq: 5 }"), "{pkts:?}");
+
+        // With encryption only members can make a node send, and nothing changes: a Ping is
+        // answered at the address it names.
+        let key = Key::from_bytes([3; 32]);
+        let mut n = node(Security::Keys(vec![key.clone()]));
+        let codec = Codec::encrypted(b"default", Limits::default(), vec![key]).unwrap();
+        n.handle_datagram(t, addr(9), &stamped_ping(&codec, 0, 1));
+        let to: Vec<SocketAddr> = std::iter::from_fn(|| n.poll_transmit())
+            .filter_map(|t| match t {
+                Transmit::Datagram { to, .. } => Some(to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(to, [addr(2)]);
     }
 
     #[test]
@@ -1281,6 +1359,8 @@ mod tests {
     fn relays_forward_acks_and_send_nacks() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        n.add_member(t, "c", addr(3)).unwrap();
         let req = |seq| {
             Message::PingReq(kinship_proto::PingReq {
                 seq,
@@ -1311,6 +1391,7 @@ mod tests {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
         n.add_member(t, "b", addr(2)).unwrap();
+        n.add_member(t, "c", addr(3)).unwrap();
         deliver(&mut n, t, &[dead("b", 3, "b")]);
         assert_eq!(n.member("b").unwrap().state, State::Left);
         sent(&mut n);

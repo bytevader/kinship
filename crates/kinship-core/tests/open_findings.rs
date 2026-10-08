@@ -1,7 +1,9 @@
-//! Reproductions of the findings in SECURITY.md that are documented rather than fixed. Each
-//! test shows the behaviour as it is today and passes; it is ignored so that the suite does
-//! not read as a guarantee. Run them with
-//! `cargo test -p kinship-core --test open_findings -- --ignored --nocapture`.
+//! Reproductions of the findings in SECURITY.md. A finding that is documented rather than fixed
+//! has an ignored test that shows the behaviour as it is today and passes, ignored so that the
+//! suite does not read as a guarantee; run them with
+//! `cargo test -p kinship-core --test open_findings -- --ignored --nocapture`. A finding fixed
+//! since keeps its test here, turned into one that asserts the fixed behaviour and runs with
+//! the rest of the suite.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,7 +11,8 @@ use std::time::Duration;
 use kinship_core::{Config, Event, Identity, Instant, Key, Node, Security, State, StreamEvent};
 use kinship_core::{StreamId, Transmit};
 use kinship_proto::{
-    Alive, Codec, Dead, Limits, Message, NodeId, PacketKind, Ping, PushPull, Record, Records,
+    Alive, Codec, Dead, Limits, Message, NodeId, PacketKind, Ping, PingReq, PushPull, Record,
+    Records,
 };
 
 fn addr(i: u8) -> SocketAddr {
@@ -184,15 +187,23 @@ fn ki04_one_push_pull_floods_the_member_table() {
     assert_eq!(o.members().count(), FAKE + 1);
 }
 
-/// KS-04: in plaintext mode anyone can forge a Ping whose reply address is a third party's,
-/// and the reply carries queued gossip: the node reflects more bytes than it was sent.
+/// KS-04, fixed: in plaintext mode anyone can forge a Ping whose reply address is a third
+/// party's. The node used to answer it with an Ack carrying as much queued gossip as fit, 46
+/// times the bytes it was sent. It now sends nothing to an address that is not a member's, so
+/// neither a forged Ping nor a forged PingReq naming the victim reaches it.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
-fn ks04_plaintext_reflects_forged_pings_with_gossip() {
+fn ks04_plaintext_sends_nothing_to_an_address_that_is_not_a_member() {
     let others: Vec<(String, u8)> = (2..40).map(|i| (format!("member-{i:02}"), i)).collect();
     let refs: Vec<(&str, u8)> = others.iter().map(|(n, i)| (n.as_str(), *i)).collect();
     let mut o = node("o", 1, &refs, Security::InsecurePlaintext);
     let plain = Codec::insecure_plaintext(b"default", Limits::default()).unwrap();
+    let seal = |msgs: &[Message<'_>]| {
+        let mut pkt = Vec::new();
+        plain
+            .seal(PacketKind::Datagram, msgs, &[0; 24], &mut pkt)
+            .unwrap();
+        pkt
+    };
     // Some news to spread, as a busy cluster always has.
     for (name, i) in &others {
         let alive = Message::Alive(Alive {
@@ -203,11 +214,7 @@ fn ks04_plaintext_reflects_forged_pings_with_gossip() {
             vmin: 1,
             vmax: 1,
         });
-        let mut pkt = Vec::new();
-        plain
-            .seal(PacketKind::Datagram, &[alive], &[0; 24], &mut pkt)
-            .unwrap();
-        o.handle_datagram(Instant::ZERO, addr(200), &pkt);
+        o.handle_datagram(Instant::ZERO, addr(200), &seal(&[alive]));
     }
     drain(&mut o);
     let victim = SocketAddr::from(([203, 0, 113, 9], 53));
@@ -217,28 +224,54 @@ fn ks04_plaintext_reflects_forged_pings_with_gossip() {
         source: id("x"),
         source_addr: victim,
     });
-    let mut forged = Vec::new();
-    plain
-        .seal(PacketKind::Datagram, &[ping], &[0; 24], &mut forged)
-        .unwrap();
-    o.handle_datagram(
-        Instant::ZERO,
-        SocketAddr::from(([198, 51, 100, 1], 1)),
-        &forged,
+    let req = |target_addr, requester_addr| {
+        Message::PingReq(PingReq {
+            seq: 2,
+            target: id("member-02"),
+            target_addr,
+            requester_addr,
+            want_nack: true,
+        })
+    };
+    let forged = [
+        seal(&[ping]),
+        seal(&[req(addr(2), victim)]),
+        seal(&[req(victim, addr(3))]),
+    ];
+    let from = SocketAddr::from(([198, 51, 100, 1], 1));
+    let mut reflected = 0;
+    for pkt in &forged {
+        o.handle_datagram(Instant::ZERO, from, pkt);
+        reflected += drain(&mut o)
+            .iter()
+            .map(|t| match t {
+                Transmit::Datagram { to, payload } if *to == victim => payload.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+    }
+    println!(
+        "{} bytes in, {reflected} bytes to the victim",
+        forged.iter().map(Vec::len).sum::<usize>()
     );
-    let reflected: usize = drain(&mut o)
+    assert_eq!(reflected, 0);
+
+    // A member's Ping is still answered, with the gossip.
+    let ping = Message::Ping(Ping {
+        seq: 3,
+        target: id("o"),
+        source: id("member-02"),
+        source_addr: addr(2),
+    });
+    o.handle_datagram(Instant::ZERO, addr(2), &seal(&[ping]));
+    let answered: usize = drain(&mut o)
         .iter()
         .map(|t| match t {
-            Transmit::Datagram { to, payload } if *to == victim => payload.len(),
+            Transmit::Datagram { to, payload } if *to == addr(2) => payload.len(),
             _ => 0,
         })
         .sum();
-    println!(
-        "{} bytes in, {reflected} bytes to the victim ({:.1}x)",
-        forged.len(),
-        reflected as f64 / forged.len() as f64
-    );
-    assert!(reflected > forged.len() * 10);
+    assert!(answered > forged[0].len() * 10, "{answered} bytes");
 }
 
 /// KS-05: a packet whose key id no installed key has is refused before any cryptography, and
