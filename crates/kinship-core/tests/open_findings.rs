@@ -274,11 +274,11 @@ fn ks04_plaintext_sends_nothing_to_an_address_that_is_not_a_member() {
     assert!(answered > forged[0].len() * 10, "{answered} bytes");
 }
 
-/// KS-05: a packet whose key id no installed key has is refused before any cryptography, and
-/// one whose id matches costs a full tag check. The difference tells a peer without the key
-/// which key ids a node has installed. Prints the median time of each.
+/// KS-05, fixed: a packet whose key id no installed key had was refused before any
+/// cryptography, and one whose id matched cost a full tag check, so the time told a peer
+/// without the key which key ids a node had installed. Both now cost one tag verification, and
+/// their medians are within noise of each other. Prints the median time of each.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
 // The test measures how long the codec takes, so it reads the clock the core never does.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 fn ks05_key_id_lookup_timing() {
@@ -309,23 +309,25 @@ fn ks05_key_id_lookup_timing() {
     known[last] ^= 1;
     let mut unknown = known.clone();
     unknown[4] ^= 0xff;
-    let median = |pkt: &[u8]| {
-        let mut times: Vec<Duration> = (0..20_001)
-            .map(|_| {
-                let mut buf = pkt.to_vec();
-                let started = Clock::now();
-                let r = installed.open(PacketKind::Datagram, &mut buf);
-                let took = started.elapsed();
-                assert!(r.is_err());
-                took
-            })
-            .collect();
+    let time = |pkt: &[u8]| {
+        let mut buf = pkt.to_vec();
+        let started = Clock::now();
+        let r = installed.open(PacketKind::Datagram, &mut buf);
+        let took = started.elapsed();
+        assert!(r.is_err());
+        took
+    };
+    // Taken in turns, so that a change in the machine's load falls on both alike.
+    let (mut k, mut u): (Vec<Duration>, Vec<Duration>) =
+        (0..5_001).map(|_| (time(&known), time(&unknown))).unzip();
+    let median = |times: &mut Vec<Duration>| {
         times.sort_unstable();
         times[times.len() / 2]
     };
-    let (k, u) = (median(&known), median(&unknown));
+    let (k, u) = (median(&mut k), median(&mut u));
     println!("installed id: {k:?}, unknown id: {u:?}");
-    assert!(k > u * 2);
+    let ratio = k.as_secs_f64() / u.as_secs_f64();
+    assert!((0.75..4.0 / 3.0).contains(&ratio), "{ratio:.2}");
 }
 
 /// KS-07: a removed key stops opening packets but stays in memory: the node keeps the config

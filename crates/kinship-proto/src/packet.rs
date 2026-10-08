@@ -202,8 +202,44 @@ impl core::fmt::Debug for Key {
 
 enum Security {
     Plaintext,
-    /// The first key seals; every key opens.
-    Encrypted(Vec<Key>),
+    Encrypted(Keys),
+}
+
+/// The context BLAKE3 derives the dummy key in; see [`Keys::dummy`].
+const DUMMY_KEY_CONTEXT: &str = "kinship 2026-10-08 key for packets with an unknown key id";
+
+/// The installed keys, with what is worked out from them once whenever they change rather than
+/// for every packet.
+struct Keys {
+    /// The first seals; every key opens.
+    keys: Vec<Key>,
+    /// The id of each key in `keys`.
+    ids: Vec<u32>,
+    /// Checks the tag of a packet whose key id no installed key has, so that refusing it costs
+    /// the one tag verification that a packet with an installed key's id and a bad tag costs.
+    /// Derived from the sealing key, so only a holder of that key could seal a packet it opens.
+    dummy: Key,
+}
+
+impl Keys {
+    /// `keys` must not be empty.
+    fn new(keys: Vec<Key>) -> Self {
+        let mut keys = Self {
+            keys,
+            ids: Vec::new(),
+            dummy: Key::from_bytes([0; 32]),
+        };
+        keys.changed();
+        keys
+    }
+
+    /// Works out the ids and the dummy key again; call after every change to `keys`.
+    fn changed(&mut self) {
+        self.ids = self.keys.iter().map(Key::id).collect();
+        let mut dummy = blake3::derive_key(DUMMY_KEY_CONTEXT, &self.keys[0].0);
+        self.dummy = Key::from_bytes(dummy);
+        dummy.zeroize();
+    }
 }
 
 /// Encodes and decodes packets for one cluster.
@@ -223,7 +259,7 @@ impl Codec {
         if keys.is_empty() {
             return Err(ConfigError::NoKeys);
         }
-        Self::new(label, limits, Security::Encrypted(keys))
+        Self::new(label, limits, Security::Encrypted(Keys::new(keys)))
     }
 
     /// A codec that sends and accepts unauthenticated, unencrypted packets. This is the
@@ -258,7 +294,7 @@ impl Codec {
         if keys.is_empty() {
             return Err(ConfigError::NoKeys);
         }
-        self.security = Security::Encrypted(keys);
+        self.security = Security::Encrypted(Keys::new(keys));
         Ok(())
     }
 
@@ -274,7 +310,7 @@ impl Codec {
     pub fn key_ids(&self) -> Vec<KeyId> {
         match &self.security {
             Security::Plaintext => Vec::new(),
-            Security::Encrypted(keys) => keys.iter().map(Key::key_id).collect(),
+            Security::Encrypted(keys) => keys.ids.iter().map(|&id| KeyId(id)).collect(),
         }
     }
 
@@ -286,7 +322,7 @@ impl Codec {
         HeaderCheck {
             key_ids: match &self.security {
                 Security::Plaintext => None,
-                Security::Encrypted(keys) => Some(keys.iter().map(Key::id).collect()),
+                Security::Encrypted(keys) => Some(keys.ids.clone()),
             },
             label,
         }
@@ -296,8 +332,9 @@ impl Codec {
     /// already installed.
     pub fn install_key(&mut self, key: Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
-        if !keys.contains(&key) {
-            keys.push(key);
+        if !keys.keys.contains(&key) {
+            keys.keys.push(key);
+            keys.changed();
         }
         Ok(())
     }
@@ -306,10 +343,12 @@ impl Codec {
     pub fn use_key(&mut self, key: &Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
         let at = keys
+            .keys
             .iter()
             .position(|k| k == key)
             .ok_or(KeyringError::NotInstalled)?;
-        keys[..=at].rotate_right(1);
+        keys.keys[..=at].rotate_right(1);
+        keys.changed();
         Ok(())
     }
 
@@ -317,18 +356,19 @@ impl Codec {
     /// already gone, so that succeeds.
     pub fn remove_key(&mut self, key: &Key) -> Result<(), KeyringError> {
         let keys = self.keys_mut()?;
-        match keys.iter().position(|k| k == key) {
+        match keys.keys.iter().position(|k| k == key) {
             None => Ok(()),
-            Some(_) if keys.len() == 1 => Err(KeyringError::LastKey),
+            Some(_) if keys.keys.len() == 1 => Err(KeyringError::LastKey),
             Some(0) => Err(KeyringError::InUse),
             Some(at) => {
-                keys.remove(at);
+                keys.keys.remove(at);
+                keys.changed();
                 Ok(())
             }
         }
     }
 
-    fn keys_mut(&mut self) -> Result<&mut Vec<Key>, KeyringError> {
+    fn keys_mut(&mut self) -> Result<&mut Keys, KeyringError> {
         match &mut self.security {
             Security::Plaintext => Err(KeyringError::Plaintext),
             Security::Encrypted(keys) => Ok(keys),
@@ -436,10 +476,10 @@ impl Codec {
                 write_payload(out);
             }
             Security::Encrypted(keys) => {
-                let key = &keys[0];
+                let key = &keys.keys[0];
                 flags |= FLAG_ENCRYPTED;
                 out.put_u8(flags);
-                out.put(&key.id().to_be_bytes());
+                out.put(&keys.ids[0].to_be_bytes());
                 out.put(nonce);
                 write_payload(out);
                 let aad = Aad::new(&out[start..start + ENCRYPTED_HEADER_LEN], &self.label);
@@ -465,8 +505,9 @@ impl Codec {
     /// Authenticates, decrypts in place and parses one packet.
     ///
     /// The size limit, magic, version, flags, packet kind and key id are all checked before any
-    /// cryptography runs, so unauthenticated traffic costs at most one tag verification per
-    /// matching key. The returned payload borrows the decrypted bytes of `buf`; on success the
+    /// cryptography runs, so unauthenticated traffic costs one tag verification per installed
+    /// key with the packet's key id, or, when no key has it, one with a dummy key, so that the
+    /// time taken does not tell which ids are installed. The returned payload borrows the decrypted bytes of `buf`; on success the
     /// ciphertext has been overwritten with plaintext, on failure `buf` is unchanged.
     pub fn open<'a>(
         &self,
@@ -503,7 +544,8 @@ impl Codec {
                 let body = &mut buf[ENCRYPTED_HEADER_LEN..tag_at];
                 let mut matched = false;
                 let mut opened = false;
-                for key in keys.iter().filter(|k| k.id() == key_id) {
+                let installed = keys.keys.iter().zip(&keys.ids);
+                for (key, _) in installed.filter(|&(_, &id)| id == key_id) {
                     matched = true;
                     let cipher = XChaCha20Poly1305::new((&key.0).into());
                     if cipher
@@ -520,6 +562,18 @@ impl Codec {
                     }
                 }
                 if !matched {
+                    // One tag verification all the same, so that refusing a packet whose key
+                    // id no key has takes as long as refusing one with an installed key's id and
+                    // a bad tag, and the time does not tell which ids are installed. Should the
+                    // tag pass, which only a holder of the sealing key could arrange, the packet
+                    // is refused anyway.
+                    let cipher = XChaCha20Poly1305::new((&keys.dummy.0).into());
+                    let _ = cipher.decrypt_inout_detached(
+                        (&nonce).into(),
+                        aad.as_slice(),
+                        (&mut *body).into(),
+                        (&tag).into(),
+                    );
                     return Err(DecodeError::UnknownKey(key_id));
                 }
                 if !opened {
@@ -622,5 +676,55 @@ impl Aad {
 
     fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u8) -> Key {
+        Key::from_bytes([n; 32])
+    }
+
+    fn keys(c: &Codec) -> &Keys {
+        match &c.security {
+            Security::Encrypted(keys) => keys,
+            Security::Plaintext => unreachable!("an encrypting codec"),
+        }
+    }
+
+    #[test]
+    fn ids_and_the_dummy_key_follow_every_change_of_keys() {
+        let mut c = Codec::encrypted(b"c", Limits::default(), vec![key(1)]).unwrap();
+        let first = keys(&c).dummy.clone();
+        assert_eq!(keys(&c).ids, [key(1).id()]);
+        c.install_key(key(2)).unwrap();
+        assert_eq!(keys(&c).ids, [key(1).id(), key(2).id()]);
+        assert!(keys(&c).dummy == first, "the sealing key did not change");
+        c.use_key(&key(2)).unwrap();
+        assert_eq!(keys(&c).ids, [key(2).id(), key(1).id()]);
+        assert!(keys(&c).dummy != first, "derived from the new sealing key");
+        c.remove_key(&key(1)).unwrap();
+        assert_eq!(keys(&c).ids, [key(2).id()]);
+        c.set_keys(vec![key(3)]).unwrap();
+        assert_eq!(keys(&c).ids, [key(3).id()]);
+        assert_eq!(c.key_ids(), [key(3).key_id()]);
+    }
+
+    #[test]
+    fn a_packet_with_an_unknown_key_id_is_refused_even_when_the_dummy_key_opens_it() {
+        let c = Codec::encrypted(b"c", Limits::default(), vec![key(1)]).unwrap();
+        let dummy = keys(&c).dummy.clone();
+        let forger = Codec::encrypted(b"c", Limits::default(), vec![dummy]).unwrap();
+        let mut pkt = Vec::new();
+        let ack = Message::Ack { seq: 1 };
+        forger
+            .seal(PacketKind::Datagram, &[ack], &[0; 24], &mut pkt)
+            .unwrap();
+        let id = keys(&forger).ids[0];
+        assert!(!keys(&c).ids.contains(&id));
+        let opened = c.open(PacketKind::Datagram, &mut pkt).map(drop);
+        assert_eq!(opened, Err(DecodeError::UnknownKey(id)));
     }
 }

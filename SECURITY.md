@@ -25,7 +25,7 @@ Other processes on the same host count as network attackers, except in plaintext
 - It cannot read traffic or forge, alter or truncate a packet: every datagram and stream frame is sealed with XChaCha20-Poly1305 over the header and the cluster label, the tag is checked in constant time, and nothing is decrypted or parsed before it verifies.
 - A recording is useless once it is older than the replay window (30 s, or twice `tcp_timeout` if that is longer), and a copy of a packet is useless at once (KS-01). Tombstones outlive the window, so no recording can bring back a member that left or died.
 - No reply goes to an address it chooses: replies go to addresses inside authenticated messages, never to a datagram's source address. A packet that does not authenticate gets no reply at all, and a stale push-pull that does gets at most the answering node's own record.
-- What it sends costs bounded work and memory: header checks before any cryptography, at most one tag verification per installed key with the packet's key id, frame lengths checked from their prefix, and at most twice `max_stream_frame` held for unauthenticated stream frames across all connections (KS-02).
+- What it sends costs bounded work and memory: header checks before any cryptography, one tag verification whether or not an installed key has the packet's key id (one per such key in the rare case that several share an id), frame lengths checked from their prefix, and at most twice `max_stream_frame` held for unauthenticated stream frames across all connections (KS-02).
 - From one address it cannot keep a node from serving others over TCP: it gets at most 16 of the node's inbound connections and one largest frame's worth of the inbound buffer, a new connection when all are taken displaces the address with the most, and a connection that does not start with a header for this node within a second is dropped (KS-03).
 
 A compromised member is outside these guarantees: see "What kinship does not protect against".
@@ -47,7 +47,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KS-02 | High | no key | Unauthenticated stream frames could pin 512 MiB | Fixed |
 | KS-03 | Medium | no key | A connection flood evicted real inbound exchanges | Fixed |
 | KS-04 | Medium | no key | Plaintext mode accepts forgeries, and reflected them 46x | Fixed |
-| KS-05 | Low | no key | Key id lookup timing reveals installed keys | Open |
+| KS-05 | Low | no key | Key id lookup timing revealed installed keys | Fixed |
 | KS-06 | Low | no key | Nonce bytes come from a non-cryptographic generator | Open |
 | KS-07 | Low | local | Copies of keys outlive removal and drop | Open |
 | KS-08 | Low | local | Key comparison is not constant time | Open |
@@ -132,15 +132,20 @@ With `insecure_plaintext=True`, or `Config.local()` on loopback, there is no aut
 - Plaintext is still unauthenticated. A peer that first forges an Alive for an invented member at the victim's address makes that address a member's: the node then answers Pings naming it, with gossip, probes it and gossips it to the cluster, which probes it too, until the invented member is declared dead and its tombstone reaped. That costs a forged Alive for every invented member and shows on every node as a member that joined and died, but the reflection then runs at the forger's rate. KS-01 and every member finding (KI-01 to KI-06) still apply to anyone who can reach the port.
 - A new member whose own packets do not carry its Alive, as in a large plaintext cluster where its queue of fresh rumours fills its first datagrams, is not answered until the node has heard of it from others. Its first probes can then go unanswered, so it suspects members that are fine, which refute, and its local health rises for a round or two.
 
-### KS-05 Key id lookup timing reveals installed keys
+### KS-05 Key id lookup timing revealed installed keys
 
-**Severity:** Low. **Status:** Open.
+**Severity:** Low. **Status:** Fixed.
 
-A packet whose key id matches no installed key is refused before any cryptography; one whose id matches costs a tag verification. A peer without a key can therefore tell which key ids a node has installed, including a key installed for rotation and not yet used to send, which no sealed packet has revealed yet. The tag comparison itself is constant time, and decryption only runs after it. The lookup also hashes every installed key with BLAKE3 for every packet.
+A packet whose key id matched no installed key was refused before any cryptography; one whose id matched cost a tag verification. A peer without a key could therefore tell which key ids a node had installed, including a key installed for rotation and not yet used to send, which no sealed packet had revealed yet. The tag comparison itself was constant time, and decryption only ran after it. The lookup also hashed every installed key with BLAKE3 for every packet.
 
-**Reproduction:** `open_findings::ks05_key_id_lookup_timing`: the median `Codec::open` takes 2.2 µs for an installed key id and 300 ns for an unknown one.
+**Reproduction:** `open_findings::ks05_key_id_lookup_timing`, no longer ignored: in a release build the median `Codec::open` took 2.2 µs for an installed key id and 300 ns for an unknown one. Both now take 1.2 µs, timed in turns so that load falls on both alike, and the test fails if the two medians differ by a third. Unit tests: kinship-proto `packet::tests::ids_and_the_dummy_key_follow_every_change_of_keys` and `packet::tests::a_packet_with_an_unknown_key_id_is_refused_even_when_the_dummy_key_opens_it`.
 
-**Recommended fix:** compute key ids once when keys change, and run one tag verification with a dummy key when no installed key has the id.
+**Fix:** the codec works out its keys' ids once, whenever its keys change, and keeps them beside the keys (`Keys` in `crates/kinship-proto/src/packet.rs`). A packet whose id no installed key has gets one tag verification all the same, with a dummy key that BLAKE3 derives from the sealing key, and is refused whatever the result, so it costs what a packet with an installed key's id and a bad tag costs. Only a holder of the sealing key could make a packet the dummy key opens.
+
+**What remains:**
+
+- A TCP connection whose header names a key id that is not installed is dropped as soon as its first 12 bytes arrive, while one naming an installed id stays open until its frame is complete or `tcp_timeout` (KS-03). A peer can therefore still tell whether a key id it already knows is installed, such as the id of a key the cluster used before a rotation. It cannot discover ids it does not know: an id is 32 bits of a key's hash and each guess costs a connection. This is the price of the header check, which shuts out peers that have never seen the cluster's traffic.
+- A packet whose id several installed keys share, which happens only when two keys' hashes start with the same 4 bytes, costs one verification per such key.
 
 ### KS-06 Nonce bytes come from a non-cryptographic generator
 
@@ -240,7 +245,7 @@ Every node adopts the latest cluster time it authenticates, and the replay floor
 
 - **A compromised member.** A node that holds a valid key can forge any rumour about any member (KI-01 to KI-06). Remove it by rotating the key on every other node: install a new key, use it, remove the old one.
 - **Dropping and delaying traffic.** An attacker on the path that drops a member's packets makes it look dead, as a real failure would; that is what a failure detector reports. Partitions are healed when traffic flows again, not prevented.
-- **Floods.** A peer without a key can fill a node's UDP socket or CPU with traffic that fails authentication, and one with many addresses can fill its inbound connection slots and buffer (KS-03). Each packet costs at most one tag verification per installed key with its key id, and no reply.
+- **Floods.** A peer without a key can fill a node's UDP socket or CPU with traffic that fails authentication, and one with many addresses can fill its inbound connection slots and buffer (KS-03). Each packet costs one tag verification and no reply.
 - **Traffic analysis.** Sizes, timing, addresses, key ids and the cluster time stamp are visible (KS-09).
 - **Plaintext mode.** `insecure_plaintext=True`, and `Config.local()` on loopback, trust everyone who can reach the port and have no replay protection. A node sends only to members it knows, so a forged packet cannot aim it at a third party, but a forged member can (KS-04).
 - **The application's own decisions.** Split-brain decisions made during a partition, and a member that answers probes but is otherwise broken.
