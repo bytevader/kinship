@@ -11,7 +11,7 @@ This file holds kinship's threat model and the findings of the security audit of
 - **Membership integrity.** Which members are alive, suspect, dead or gone, their addresses and their metadata, as every node sees them.
 - **Failure detection.** Live members stay members, and dead ones are declared dead within the Lifeguard timeouts.
 - **Confidentiality of membership traffic.** Names, addresses, metadata and protocol state are encrypted on the wire.
-- **The keys.** 32-byte XChaCha20-Poly1305 keys, which never leave the process and are never logged.
+- **The keys.** 32-byte XChaCha20-Poly1305 keys, which never leave the process, are never logged, and inside a node live only in its codec (KS-07).
 
 ### Attackers
 
@@ -50,7 +50,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KS-05 | Low | no key | Key id lookup timing revealed installed keys | Fixed |
 | KS-06 | Low | no key | Nonce bytes came from a non-cryptographic generator | Fixed |
 | KS-07 | Low | local | Copies of keys outlived removal and drop | Fixed |
-| KS-08 | Low | local | Key comparison is not constant time | Open |
+| KS-08 | Low | local | Key comparison was not constant time | Fixed |
 | KS-09 | Info | no key | Traffic analysis | Accepted |
 | KI-01 | High | member | Any member can declare any node dead, at once | Accepted |
 | KI-02 | Medium | member | Incarnation u32::MAX evicts a name past the attacker's eviction | Open |
@@ -59,7 +59,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KI-05 | Low | member | Names and metadata are attacker-controlled strings | Open |
 | KI-06 | Medium | member | A stamp far ahead stretches the replay window | Open |
 
-Reproductions of open findings are ignored tests that pass while the finding stands: `cargo test --release -p kinship-core --test open_findings -- --ignored --nocapture`.
+Reproductions of open findings are ignored tests that pass while the finding stands: `cargo test --release -p kinship-core --test open_findings -- --ignored --nocapture`. A finding fixed since keeps its test, turned into one that asserts the fix and runs with the rest of the suite.
 
 ### KS-01 Recorded datagrams and push-pull frames were accepted again
 
@@ -180,15 +180,17 @@ The random part of each nonce came from xoshiro256** seeded with 64 bits from th
 - The Rust `kinship::Config` builder and `kinship_net::Settings` hold the keys until the node starts, and an application's own copies are its to drop.
 - Keys are not locked in memory, so the operating system may write them to swap, and a dump of a running node still holds the keys installed at the time.
 
-### KS-08 Key comparison is not constant time
+### KS-08 Key comparison was not constant time
 
-**Severity:** Low. **Status:** Open.
+**Severity:** Low. **Status:** Fixed.
 
-`Key` derives `PartialEq`, a byte comparison that returns at the first difference. It runs only when the local caller installs, uses or removes a key, against keys that caller supplies, so nobody else can time it.
+`Key` derived `PartialEq`, a byte comparison that returns at the first difference. It ran only when the local caller installed, used or removed a key, against keys that caller supplied, so nobody else could time it.
 
-**Reproduction:** none from the network; it is visible in `Key`'s derive.
+**Reproduction:** none from the network; it was visible in `Key`'s derive. Unit test: kinship-proto `packet::tests::keys_are_equal_only_when_every_byte_is`.
 
-**Recommended fix:** compare keys with a constant-time equality, for example `subtle::ConstantTimeEq`.
+**Fix:** `Key` implements `PartialEq` with `ctutils::CtEq`, which looks at every byte whatever it finds and turns the result into a `bool` only at the end. ctutils is RustCrypto's successor to `subtle` and was already in the dependency tree, through poly1305, so the fix adds no crate; `cargo deny check advisories bans sources` passes.
+
+**What remains:** finding a key in the codec's list, to install, use or remove it, stops at the first key that matches, so the time can tell the position of a matching key in the list, though not anything about its bytes. Only the local caller can time it.
 
 ### KS-09 Traffic analysis
 

@@ -17,6 +17,7 @@
 //! BLAKE3(label), giving a 12-byte header and no tag.
 
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305};
+use ctutils::CtEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
@@ -59,9 +60,19 @@ pub enum PacketKind {
 /// A 32-byte XChaCha20-Poly1305 key. Zeroized on drop and never printed.
 ///
 /// The bytes live on the heap, so moving a key, or growing a list of keys, moves a pointer and
-/// leaves no copy of the bytes behind.
-#[derive(Clone, PartialEq, Eq)]
+/// leaves no copy of the bytes behind. Keys compare in constant time.
+#[derive(Clone)]
 pub struct Key(Box<[u8; 32]>);
+
+impl PartialEq for Key {
+    /// Looks at every byte whatever it finds, so the time taken does not tell where two keys
+    /// differ.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&*other.0).to_bool()
+    }
+}
+
+impl Eq for Key {}
 
 impl Key {
     pub const LEN: usize = 32;
@@ -703,6 +714,17 @@ mod tests {
         match &c.security {
             Security::Encrypted(keys) => keys,
             Security::Plaintext => unreachable!("an encrypting codec"),
+        }
+    }
+
+    #[test]
+    fn keys_are_equal_only_when_every_byte_is() {
+        let a = key(7);
+        assert!(a == key(7));
+        for at in [0, 1, 16, 31] {
+            let mut bytes = [7; 32];
+            bytes[at] ^= 0x80;
+            assert!(a != Key::from_bytes(bytes), "byte {at}");
         }
     }
 
