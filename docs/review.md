@@ -25,7 +25,7 @@ A failure names its lowest failing seed, and `KINSHIP_SEED=<seed>` replays it. E
 | KP-01 | High | A new node that first hears another new node keeps its replay floor far behind cluster time | `kp01_a_restarted_node_refuses_recordings_older_than_the_window` | Fixed |
 | KP-02 | Medium | leave() spends its sends on members that left, so nodes leaving in a scale-down are reported dead | `kp02_nodes_that_leave_one_after_another_are_never_reported_dead` | Fixed |
 | KP-03 | Medium | Config accepts limits in which a member's own Alive never fits a datagram | `kp03_a_member_with_full_metadata_survives_a_pause` | Fixed |
-| KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Open |
+| KP-04 | Low | A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion | `kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead` | Fixed |
 | KP-05 | Low | Merging a push-pull counts this node as an independent confirmation of every suspicion in it | `kp05_a_node_confirms_only_suspicions_its_own_probe_raised` | Open |
 
 ### KP-01 A new node that first hears another new node keeps its replay floor far behind cluster time
@@ -72,13 +72,15 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 
 ### KP-04 A rumour about a node below its incarnation is dropped silently, so the buddy system cannot clear a stale suspicion
 
-**Severity:** Low: a node has to miss a refutation entirely, and no push-pull may reach it before its suspicion runs out.
+**Severity:** Low: a node has to miss a refutation entirely, and no push-pull may reach it before its suspicion runs out. **Status:** Fixed.
 
 `Node::on_suspect` and `Node::on_dead` (`member.rs:128` and `member.rs:179`) ignore a Suspect or Dead about this node below its incarnation. A node that still holds such a suspicion missed the refutation, and nothing tells it now. The buddy system puts the Suspect first in the Ping (`probe.rs:137`), the member ignores it, and its Ack carries nothing, so the prober declares dead a member that answers its Pings. design.md says the buddy system's Ack "already carries the refutation"; for a stale suspicion it does not. In SWIM the successful probe would clear the suspicion; with incarnations only the member can, so it has to refute again.
 
 **Reproduction:** six nodes; n0 hears nothing for 3.5 s. Its probe round in progress fails and it suspects the target, which refutes at once, and the refutation has finished spreading before n0 hears again. n0 then pings the member with the suspicion first, gets direct Acks, and declares it dead when the suspicion runs out 24 s after it began, unless a push-pull repairs n0 first. 2 of 32 seeds fail, 11 of 200. With the member queuing its own Alive again when it hears a stale suspicion, 200 of 200 pass.
 
 **Recommended fix:** when a node that has not left hears a Suspect or Dead about itself below its incarnation, queue its Alive at its current incarnation again, without raising local health. The Ack to a buddy Ping then carries the refutation.
+
+**Fix:** as recommended, in `Node::on_suspect` and `Node::on_dead` (`Node::reassert`). The Alive replaces whatever is queued about the node with a fresh entry, so it goes first into the Ack's packet, and neither the incarnation, local health nor the `refutations` counter moves. Unit test: kinship-core `tests::a_stale_rumour_about_this_node_queues_its_alive_again`.
 
 ### KP-05 Merging a push-pull counts this node as an independent confirmation of every suspicion in it
 
@@ -94,7 +96,7 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 
 - A probe round whose end passes while the node is not running, after a clock jump or a pause past the round, ends without its indirect phase (`probe.rs:71`): the target is suspected without a PingReq, and local health rises by one rather than by one per relay. SWIM suspects only after indirect probes fail. `crates/kinship-sim/tests/failure.rs` documents and tests this as the effect of a clock jump; design.md does not mention it.
 - Members that join during a pass of the probe list wait for the next pass (`table.rs:90`), where SWIM inserts them at a random position. The worst case stays at 2n - 1 rounds, and only a comment in table.rs records the choice.
-- A successful probe of a suspected member does not clear the suspicion; only an Alive at a higher incarnation does, as design.md's state diagram and incarnation table say and as memberlist does. KP-04 is the case where that lets a live member die.
+- A successful probe of a suspected member does not clear the suspicion; only an Alive at a higher incarnation does, as design.md's state diagram and incarnation table say and as memberlist does. KP-04 was the case where that let a live member die; since its fix the member sends its Alive again.
 - A Dead loses to an Alive at a higher incarnation, where SWIM's Confirm overrides everything; local health follows memberlist's rules rather than adding one for every failed round; and K is capped at n - 2 where memberlist sets it to 0. design.md documents all three.
 - design.md's transport table sends the TCP fallback ping "when the UDP probe and all indirect probes fail"; the code sends it alongside the indirect probes, as the sequence diagram above that table shows and as memberlist does.
 - Every node advertises vmin and vmax, but nothing reads them: packets always go out at `WIRE_VERSION`, where design.md says a node sends the highest version every live member speaks. This is harmless while there is one version.

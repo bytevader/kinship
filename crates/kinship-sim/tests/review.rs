@@ -628,8 +628,6 @@ fn kp04(seed: u64) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "fails: KP-04, a member ignores a stale rumour about itself, so a node that missed its \
-            refutation declares it dead though it answers"]
 fn kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead() {
     check_all(seeds(32), kp04);
 }

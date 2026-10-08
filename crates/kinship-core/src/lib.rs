@@ -918,6 +918,46 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_rumour_about_this_node_queues_its_alive_again() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        deliver(&mut n, t, &[suspect("a", 0, "c")]);
+        assert_eq!(n.local().incarnation, 1);
+        // The refutation has finished spreading, and c missed it.
+        n.out.broadcasts.forget("a");
+        let before = (n.local_health(), n.metrics().refutations);
+        // c's buddy Ping: the stale suspicion first, then the Ping.
+        let ping = Message::Ping(Ping {
+            seq: 7,
+            target: id("a"),
+            source: id("c"),
+            source_addr: addr(3),
+        });
+        deliver(&mut n, t, &[suspect("a", 0, "c"), ping]);
+        let pkts = sent(&mut n);
+        assert!(contains(&pkts, addr(3), "Ack { seq: 7 }"), "{pkts:?}");
+        assert!(
+            contains(&pkts, addr(3), r#"Alive(Alive { inc: 1, node: "a""#),
+            "the Ack carries the refutation again: {pkts:?}"
+        );
+        assert_eq!(n.local().incarnation, 1);
+        assert_eq!(
+            (n.local_health(), n.metrics().refutations),
+            before,
+            "not a refutation"
+        );
+        // A stale Dead too.
+        n.out.broadcasts.forget("a");
+        deliver(&mut n, t, &[dead("a", 0, "c")]);
+        assert!(n.out.broadcasts.contains("a"));
+        // A node that left stays gone.
+        n.command(t, Command::Leave);
+        n.out.broadcasts.forget("a");
+        deliver(&mut n, t, &[suspect("a", 0, "c"), dead("a", 0, "c")]);
+        assert!(!n.out.broadcasts.contains("a"));
+    }
+
+    #[test]
     fn a_second_live_node_cannot_take_a_name() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;

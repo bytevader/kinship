@@ -115,7 +115,7 @@ Incarnation is a u32 per member. A node starts at 0, or at the value it learns a
 | Dead(i) or Left(i) | Alive or Suspect(j) | i ≥ j |
 | any | Dead or Left(j) | only Alive(i) with i > j |
 
-When a node receives Suspect(i) or Dead(i) naming itself with i ≥ its own incarnation, it sets its incarnation to i + 1, broadcasts Alive, and raises its local health score. Dead and Left members stay as tombstones for dead_reclaim (30 s by default), or the replay window if that is longer, so that late rumours and recorded packets cannot resurrect them, then are deleted.
+When a node receives Suspect(i) or Dead(i) naming itself with i ≥ its own incarnation, it sets its incarnation to i + 1, broadcasts Alive, and raises its local health score. With i below its incarnation, the sender missed an earlier refutation and only the node itself can repair that, so it broadcasts its Alive again at the incarnation it has, without raising local health or counting a refutation; a node that left does neither. Dead and Left members stay as tombstones for dead_reclaim (30 s by default), or the replay window if that is longer, so that late rumours and recorded packets cannot resurrect them, then are deleted.
 
 ### Probe round
 
@@ -169,7 +169,7 @@ T(C) &= \max\left(T_{min},\; T_{max} - (T_{max} - T_{min}) \frac{\log(C+1)}{\log
 \end{aligned}
 ```
 
-- **Buddy system.** When a node probes a member it currently suspects, a Suspect from the prober goes in the Ping's packet ahead of the Ping itself, so the suspected member applies it first and its Ack already carries the refutation.
+- **Buddy system.** When a node probes a member it currently suspects, a Suspect from the prober goes in the Ping's packet ahead of the Ping itself, so the suspected member applies it first and its Ack already carries the refutation. That holds for a stale suspicion too, one the member already refuted while the prober was not listening: the member queues its Alive again and the Ack carries it.
 
 Each mechanism has its own flag (local_health, nacks, dynamic_suspicion, buddy_system), all on by default; `Config::without_lifeguard()` turns all four off for plain SWIM. Sim results comparing the two are in `docs/results/lifeguard.md`. One consequence to know: on the minority side of a partition most relays are unreachable, so the LHM climbs to its ceiling and that side detects the other more slowly, up to awareness_max + 1 times the probe interval per round. The majority side is unaffected.
 
@@ -538,7 +538,7 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 
 | Failure | What kinship does | How it is tested |
 | --- | --- | --- |
-| Random packet loss, 1 to 5% | Indirect probes through 3 relays and the TCP fallback ping keep false suspicions rare; refutation clears the rest | kinship-sim `swim::thousand_seeds_fifty_nodes`, loss up to 5%, and `lifeguard::lifeguard_against_swim_grid` against a no-Lifeguard baseline (week 10 gate); chaos scenario `loss` in `tools/chaos`: 1 to 5% netem loss with delay, jitter and reordering on every node, and no node may declare any member dead |
+| Random packet loss, 1 to 5% | Indirect probes through 3 relays and the TCP fallback ping keep false suspicions rare; refutation clears the rest, and a member answers a suspicion it already refuted by sending its Alive again | kinship-sim `review::kp04_a_member_that_answers_the_buddy_ping_is_not_declared_dead`, a prober deaf long enough to miss a refutation; kinship-core `tests::a_stale_rumour_about_this_node_queues_its_alive_again`; kinship-sim `swim::thousand_seeds_fifty_nodes`, loss up to 5%, and `lifeguard::lifeguard_against_swim_grid` against a no-Lifeguard baseline (week 10 gate); chaos scenario `loss` in `tools/chaos`: 1 to 5% netem loss with delay, jitter and reordering on every node, and no node may declare any member dead |
 | Overloaded or paused local node (GC, CPU starvation, VM steal) | Missed acks and nacks raise LHM, which stretches its own timeouts, so the sick node stops accusing healthy ones | kinship-sim `lifeguard::lifeguard_beats_swim_with_a_starved_node` and the starved cells of `lifeguard::lifeguard_against_swim_grid`; slow and paused nodes in `swim::thousand_seeds_fifty_nodes` |
 | Blocked asyncio loop | No effect on the protocol thread; events queue up, then drop oldest with EventsLost(n) | `test_cluster.py::test_blocked_event_loop_causes_no_false_deaths`: a 10 s time.sleep in a handler, zero false deaths (week 10 gate) |
 | Process crash or kill -9 | Probes fail, Suspect spreads, Dead after the Lifeguard timeout; on lan() at 100 nodes under netem, 9.5 s from the kill to a node's Dead at the median, 12.5 s at the 99th percentile and 12.6 s at most, against 9.9, 12.0 and 12.1 s for memberlist (`docs/results/detection.md`) | kinship-sim `swim::thousand_seeds_fifty_nodes`, every crash detected within an analytic bound; kinship `cluster::an_aborted_node_is_declared_dead`; `test_cluster.py::test_quickstart_join_crash_and_leave`; chaos scenario `kill` in `tools/chaos`: kill -9 of one node under 1 to 5% netem loss, declared dead by every live node within the analytic bound; `chaos bench` against memberlist at 100 nodes in the weekly `Detection latency` workflow |

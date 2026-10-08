@@ -4,7 +4,8 @@
 //! incarnation, a Suspect wins over Alive at the same incarnation, Dead and Left win over Alive
 //! and Suspect at the same incarnation, and tombstones yield only to a newer Alive. A rumour
 //! about this node at or above its own incarnation is refuted by raising the incarnation past it
-//! and gossiping Alive.
+//! and gossiping Alive; one below it is answered by gossiping the same Alive again, since its
+//! sender missed the refutation.
 
 use core::net::SocketAddr;
 
@@ -129,6 +130,8 @@ impl Node {
                 // Others missed our Acks: likely this node is the slow one.
                 self.health_delta(1);
                 self.refute(s.inc);
+            } else {
+                self.reassert();
             }
             return;
         }
@@ -179,6 +182,8 @@ impl Node {
             if d.inc >= self.local.member.incarnation {
                 self.health_delta(1);
                 self.refute(d.inc);
+            } else {
+                self.reassert();
             }
             return;
         }
@@ -214,6 +219,17 @@ impl Node {
         me.incarnation = me.incarnation.max(seen.saturating_add(1));
         self.metrics.refutations += 1;
         self.broadcast(self.local_alive());
+    }
+
+    /// Answers a Suspect or Dead about this node below its incarnation: the sender missed the
+    /// refutation, and only this node can repair that, so its Alive is queued again at the
+    /// incarnation it already has, to ride the next packets, the Ack to a buddy Ping first.
+    /// Not a refutation: the incarnation stays, local health does not move and nothing is
+    /// counted. A node that left stays gone.
+    fn reassert(&mut self) {
+        if !self.has_left() {
+            self.broadcast(self.local_alive());
+        }
     }
 
     fn name_conflict(&mut self, member: Member, other_addr: SocketAddr) {
