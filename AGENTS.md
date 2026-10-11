@@ -11,7 +11,7 @@ Feature-complete for 0.1 and in hardening.
 - Protocol review fixes KP-01..KP-05 (`docs/review.md`) and security fixes KS-01..KS-08 (`SECURITY.md`) are merged.
 - Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
 - `CHANGELOG.md` covers 0.1.0, still unreleased; versions stay at 0.0.0 until the release.
-- Timing preset tuning is parked on `feature/tuned-presets`; `docs/results/tuning.md` lists what is left.
+- Timing preset tuning is done: no variant beats `lan()` at every cluster size without false deaths or more than 10% bandwidth, so `lan()` keeps memberlist's values; see `docs/results/tuning.md`.
 - Before 0.1, run the `Detection latency` workflow (`.github/workflows/detection.yml`) by hand and check its tail against `docs/results/detection.md`.
 
 ## Where to look
