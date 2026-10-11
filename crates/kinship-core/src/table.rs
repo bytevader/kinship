@@ -33,6 +33,8 @@ pub(crate) struct Table {
     /// Names to probe this pass, in shuffled order; `order[pos..]` are still to come.
     order: Vec<String>,
     pos: usize,
+    /// Members that became live since the pass began, still to be slotted into it.
+    joined: Vec<String>,
 }
 
 impl Table {
@@ -57,11 +59,19 @@ impl Table {
     pub fn insert(&mut self, entry: Entry) {
         let live = entry.member.state.is_live();
         *self.addrs.entry(entry.member.addr).or_default() += 1;
-        if let Some(old) = self.entries.insert(entry.member.name.clone(), entry) {
-            self.live -= usize::from(old.member.state.is_live());
-            unindex(&mut self.addrs, old.member.addr);
-        }
+        let name = entry.member.name.clone();
+        let was_live = match self.entries.insert(name.clone(), entry) {
+            Some(old) => {
+                self.live -= usize::from(old.member.state.is_live());
+                unindex(&mut self.addrs, old.member.addr);
+                old.member.state.is_live()
+            }
+            None => false,
+        };
         self.live += usize::from(live);
+        if live && !was_live {
+            self.joined.push(name);
+        }
     }
 
     /// Whether any member in the table, tombstones included, has the address `addr`.
@@ -81,7 +91,10 @@ impl Table {
         let m = &mut entry.member;
         match (m.state.is_live(), state.is_live()) {
             (true, false) => self.live -= 1,
-            (false, true) => self.live += 1,
+            (false, true) => {
+                self.live += 1;
+                self.joined.push(name.to_owned());
+            }
             _ => {}
         }
         if m.state != state {
@@ -105,8 +118,22 @@ impl Table {
     }
 
     /// The next member to probe: each live member once per pass, in an order reshuffled every
-    /// pass. Members that joined during a pass wait for the next one.
+    /// pass. A member that becomes live during a pass takes a random place among the members
+    /// still to come in it, as memberlist inserts one at a random offset: a pass lasts as many
+    /// probe intervals as it had members, so one that began while this node knew few of them
+    /// would otherwise leave every later joiner unprobed by it until the pass ends, and a crash
+    /// of one of them would wait that long for its first suspicion and its confirmations.
     pub fn next_probe(&mut self, rng: &mut Rng) -> Option<&Entry> {
+        let joined = std::mem::take(&mut self.joined);
+        // An ended pass is rebuilt below from every live member.
+        if self.pos < self.order.len() {
+            for name in joined {
+                if !self.order[self.pos..].contains(&name) {
+                    let at = self.pos + rng.index(self.order.len() - self.pos + 1);
+                    self.order.insert(at, name);
+                }
+            }
+        }
         for _ in 0..2 {
             while let Some(name) = self.order.get(self.pos) {
                 self.pos += 1;
@@ -125,6 +152,7 @@ impl Table {
             );
             rng.shuffle(&mut self.order);
             self.pos = 0;
+            self.joined.clear();
         }
         None
     }
@@ -175,6 +203,42 @@ mod tests {
             vmin: 1,
             vmax: 1,
         }
+    }
+
+    #[test]
+    fn members_that_join_mid_pass_are_probed_in_it() {
+        let mut rng = Rng::new(1);
+        let mut t = Table::default();
+        for (i, name) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            t.insert(entry(name, i as u16, State::Alive));
+        }
+        let mut probe = |t: &mut Table| t.next_probe(&mut rng).unwrap().member.name.clone();
+        let mut pass = |t: &mut Table, first: Vec<String>, n: usize| {
+            let mut p = first;
+            p.extend((0..n).map(|_| probe(t)));
+            p.sort();
+            p
+        };
+        let all = ["a", "b", "c", "d", "e"];
+        // A pass of four is under way when "e" joins: it is probed before that pass ends.
+        let first = pass(&mut t, vec![], 1);
+        t.insert(entry("e", 10, State::Alive));
+        assert_eq!(pass(&mut t, first, 4), all);
+        // The next pass has all five, each once.
+        assert_eq!(pass(&mut t, vec![], 5), all);
+        // A pass that began while "e" was dead takes it back when it revives.
+        t.update("e", State::Dead, 0, Instant::ZERO);
+        let first = pass(&mut t, vec![], 1);
+        t.update("e", State::Alive, 1, Instant::ZERO);
+        assert_eq!(pass(&mut t, first, 4), all);
+        // Every member dies and revives one probe into a pass: those still to come keep their
+        // one slot, and the one already probed gets another.
+        pass(&mut t, vec![], 1);
+        for name in all {
+            t.update(name, State::Dead, 1, Instant::ZERO);
+            t.update(name, State::Alive, 2, Instant::ZERO);
+        }
+        assert_eq!(pass(&mut t, vec![], 5), all);
     }
 
     #[test]

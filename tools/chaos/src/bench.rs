@@ -156,11 +156,21 @@ async fn one(
         rows.push(format!("{},{cell},{false_deaths}", name(o)));
     }
     detected.sort_by(f64::total_cmp);
+    // memberlist reports no suspicions, so this stays empty for it.
+    let first_suspect = fleet
+        .log
+        .iter()
+        .filter(|r| r.member == victim && r.kind == Kind::Suspect && r.at >= killed)
+        .map(|r| r.at - killed)
+        .min()
+        .map_or(String::new(), |d| {
+            format!(", first suspected after {:.2}s", d.as_secs_f64())
+        });
     let summary = if detected.is_empty() {
         format!("no node declared {} dead", name(victim))
     } else {
         format!(
-            "converged in {:.1}s, {} of {} detected, p50 {:.2}s max {:.2}s, {false_deaths} false deaths",
+            "converged in {:.1}s, {} of {} detected, p50 {:.2}s max {:.2}s, {false_deaths} false deaths{first_suspect}",
             took.as_secs_f64(),
             detected.len(),
             rows.len(),
