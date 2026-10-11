@@ -8,7 +8,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use kinship_core::{Config, Event, Identity, Instant, Key, Node, Security, State, StreamEvent};
+use kinship_core::{
+    Command, Config, Event, Identity, Instant, Key, Node, Security, State, StreamEvent,
+};
 use kinship_core::{StreamId, Transmit};
 use kinship_proto::{
     Alive, Codec, Dead, Limits, Message, NodeId, PacketKind, Ping, PingReq, PushPull, Record,
@@ -80,40 +82,90 @@ fn ki01_a_member_declares_any_node_dead_at_once() {
     );
 }
 
-/// KI-02: a Dead at incarnation u32::MAX can never be refuted. The victim saturates at
-/// u32::MAX, its Alive never beats the tombstone, and from then on no suspicion of it can be
-/// refuted either, long after the attacker's key is gone.
+/// KI-02, fixed: a Dead at incarnation u32::MAX could never be refuted. The victim saturated at
+/// u32::MAX, its Alive never beat the tombstone, and from then on no suspicion of it could be
+/// refuted either, long after the attacker's key was gone. Incarnations now compare as serial
+/// numbers and wrap: the victim refutes at 0, which beats u32::MAX, and after the key rotation
+/// that removes the attacker, it refutes an ordinary suspicion as any member does.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
-fn ki02_incarnation_max_cannot_be_refuted() {
+fn ki02_a_rumour_at_incarnation_max_is_refuted() {
     let mut victim = secure("v", 2, &[("o", 1)]);
     let mut o = secure("o", 1, &[("v", 2)]);
-    let forged = Message::Dead(Dead {
-        inc: u32::MAX,
-        node: id("v"),
-        from: id("m"),
-    });
-    let pkt = sealed(&[forged], 1);
-    o.handle_datagram(Instant::ZERO, addr(3), &pkt);
-    victim.handle_datagram(Instant::ZERO, addr(3), &pkt);
-    assert_eq!(victim.local().incarnation, u32::MAX);
-    // The victim's refutation reaches o and changes nothing.
-    victim.handle_timeout(Instant::ZERO + Duration::from_millis(250));
-    for t in drain(&mut victim) {
-        if let Transmit::Datagram { to, payload } = t {
-            if to == addr(1) {
-                o.handle_datagram(Instant::ZERO, addr(2), &payload);
+    let relay = |victim: &mut Node, o: &mut Node, at: &mut Instant| {
+        *at = *at + Duration::from_millis(250);
+        victim.handle_timeout(*at);
+        for t in drain(victim) {
+            if let Transmit::Datagram { to, payload } = t {
+                if to == addr(1) {
+                    o.handle_datagram(*at, addr(2), &payload);
+                }
             }
         }
+    };
+    // The attacker kills the victim at an incarnation just under 2^31 ahead, the most one
+    // rumour can move it, and again once it has refuted, which lands it on u32::MAX.
+    let mut at = Instant::ZERO;
+    for (inc, tail) in [((1 << 31) - 1, 1), (u32::MAX, 2)] {
+        let forged = Message::Dead(Dead {
+            inc,
+            node: id("v"),
+            from: id("m"),
+        });
+        let pkt = sealed(&[forged], tail);
+        o.handle_datagram(at, addr(3), &pkt);
+        victim.handle_datagram(at, addr(3), &pkt);
+        assert_eq!(
+            o.member("v").map(|m| (m.state, m.incarnation)),
+            Some((State::Dead, inc))
+        );
+        assert_eq!(victim.local().incarnation, inc.wrapping_add(1));
+        // The victim's refutation reaches o and brings it back.
+        relay(&mut victim, &mut o, &mut at);
+        let v = o.member("v").unwrap();
+        assert_eq!(
+            (v.state, v.incarnation),
+            (State::Alive, inc.wrapping_add(1))
+        );
     }
-    assert_eq!(o.member("v").map(|m| m.state), Some(State::Dead));
+    assert_eq!(victim.local().incarnation, 0, "past u32::MAX");
+
+    // Both rotate to a key the attacker does not hold.
+    let fresh = Key::from_bytes([11; 32]);
+    for n in [&mut victim, &mut o] {
+        n.command(at, Command::InstallKey(fresh.clone()));
+        n.command(at, Command::UseKey(fresh.clone()));
+        n.command(at, Command::RemoveKey(key()));
+        while n.poll_event().is_some() {}
+    }
+    // An ordinary suspicion from a member holding the new key: refuted, and o hears it.
+    let codec = Codec::encrypted(b"default", Limits::default(), vec![fresh]).unwrap();
+    let suspect = Message::Suspect(kinship_proto::Suspect {
+        inc: 0,
+        node: id("v"),
+        from: id("w"),
+    });
+    let mut nonce = [4; 24];
+    nonce[..8].copy_from_slice(&0u64.to_be_bytes());
+    let mut pkt = Vec::new();
+    codec
+        .seal(PacketKind::Datagram, &[suspect], &nonce, &mut pkt)
+        .unwrap();
+    o.handle_datagram(at, addr(4), &pkt);
+    victim.handle_datagram(at, addr(4), &pkt);
+    assert_eq!(o.member("v").map(|m| m.state), Some(State::Suspect));
+    assert_eq!(victim.local().incarnation, 1);
+    relay(&mut victim, &mut o, &mut at);
+    let v = o.member("v").unwrap();
+    assert_eq!((v.state, v.incarnation), (State::Alive, 1));
 }
 
-/// KI-03: Alive at a higher incarnation, from any member, moves a dead or left member's name to
-/// the sender's address of choice. The real node, when it comes back, is the one in conflict.
+/// KI-03, fixed in part: an Alive at a higher incarnation, from any member, moved a dead or left
+/// member's name to the sender's address of choice, and the real node, when it came back, was
+/// the one in conflict. A tombstone now keeps its name at its address until it is reaped: the
+/// takeover is a NameConflict, and the real node comes back at its own address. Once the
+/// tombstone is reaped the name is free again, as a name never seen is.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
-fn ki03_a_member_takes_over_the_name_of_a_dead_node() {
+fn ki03_a_member_cannot_move_a_dead_node_to_another_address() {
     let mut o = secure("o", 1, &[("b", 2)]);
     let dead = Message::Dead(Dead {
         inc: 0,
@@ -121,30 +173,88 @@ fn ki03_a_member_takes_over_the_name_of_a_dead_node() {
         from: id("o2"),
     });
     let evil = SocketAddr::from(([192, 0, 2, 66], 7946));
-    let alive = Message::Alive(Alive {
-        inc: 1,
-        node: id("b"),
-        addr: evil,
-        meta: b"",
-        vmin: 1,
-        vmax: 1,
-    });
-    o.handle_datagram(Instant::ZERO, addr(3), &sealed(&[dead, alive], 1));
+    let alive = |inc, addr| {
+        Message::Alive(Alive {
+            inc,
+            node: id("b"),
+            addr,
+            meta: b"",
+            vmin: 1,
+            vmax: 1,
+        })
+    };
+    o.handle_datagram(Instant::ZERO, addr(3), &sealed(&[dead, alive(1, evil)], 1));
     let b = o.member("b").unwrap();
-    assert_eq!((b.state, b.addr), (State::Alive, evil));
+    assert_eq!((b.state, b.addr), (State::Dead, addr(2)));
+    let events: Vec<Event> = std::iter::from_fn(|| o.poll_event()).collect();
+    assert!(
+        matches!(&events[..], [Event::MemberDead(_), Event::NameConflict { member, other_addr }]
+            if member.name == "b" && *other_addr == evil),
+        "{events:?}"
+    );
+    // The real b refutes at its own address and is back.
+    o.handle_datagram(Instant::ZERO, addr(2), &sealed(&[alive(2, addr(2))], 2));
+    let b = o.member("b").unwrap();
+    assert_eq!((b.state, b.addr), (State::Alive, addr(2)));
 }
 
-/// KI-04: one push-pull frame of fake Alive records grows the member table by as many members,
-/// and every one of them is gossiped on and probed. Prints how long the merge took.
+/// KI-04, fixed: one push-pull frame of 20,000 invented members used to be merged whole, in
+/// 7.8 s of a release build's CPU, because every new rumour scanned the whole broadcast queue.
+/// By default one frame now adds at most 1,024 new members, and a cluster configured for 20,000
+/// honest members merges them all in milliseconds, since the queue is indexed by member.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
 // The test measures how long the core takes, so it reads the clock the core never does.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 fn ki04_one_push_pull_floods_the_member_table() {
-    use std::time::Instant as Clock;
     const FAKE: usize = 20_000;
-    let mut o = secure("o", 1, &[]);
-    let names: Vec<String> = (0..FAKE).map(|i| format!("fake-{i:06}")).collect();
+    let frame = push_pull_of(FAKE);
+    let (joined, took) = merge_timed(secure("o", 1, &[]), &frame, 1_024);
+    println!(
+        "default limits: {joined} of {FAKE} members from a {} KiB frame admitted in {took:?}",
+        frame.len() / 1024
+    );
+
+    // A cluster that expects that many members says so, and admits them all, fast.
+    let identity = Identity::new("o", addr(1)).unwrap();
+    let mut cfg = Config::lan(Security::Keys(vec![key()]));
+    cfg.max_members = FAKE + 1;
+    cfg.max_new_members_per_packet = FAKE;
+    let o = Node::new(cfg, identity, Instant::ZERO, 1, &[1; 32]).unwrap();
+    let (_, took) = merge_timed(o, &frame, FAKE);
+    println!("configured for {FAKE}: all admitted in {took:?} (7.828420274 s before the fix)");
+    if !cfg!(debug_assertions) {
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+}
+
+/// Merges `frame` into `o` as one inbound push-pull, and checks that it admitted `expected`
+/// new members. Returns how many joined and how long the merge took.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+fn merge_timed(mut o: Node, frame: &[u8], expected: usize) -> (usize, Duration) {
+    use std::time::Instant as Clock;
+    let started = Clock::now();
+    o.handle_stream(
+        Instant::ZERO,
+        StreamId::inbound(0),
+        StreamEvent::Frame(frame),
+    );
+    let took = started.elapsed();
+    let joined = std::iter::from_fn(|| o.poll_event())
+        .filter(|e| matches!(e, Event::MemberJoined(_)))
+        .count();
+    assert_eq!(joined, expected);
+    assert_eq!(o.members().count(), expected + 1);
+    assert_eq!(
+        o.metrics().push_pulls_served,
+        1,
+        "and the frame is answered"
+    );
+    (joined, took)
+}
+
+/// A push-pull frame from a member holding the key, with `n` invented members.
+fn push_pull_of(n: usize) -> Vec<u8> {
+    let names: Vec<String> = (0..n).map(|i| format!("fake-{i:06}")).collect();
     let records: Vec<Record<'_>> = names
         .iter()
         .enumerate()
@@ -169,22 +279,7 @@ fn ki04_one_push_pull_floods_the_member_table() {
     codec()
         .seal(PacketKind::Stream, &[msg], &[0; 24], &mut frame)
         .unwrap();
-    let started = Clock::now();
-    o.handle_stream(
-        Instant::ZERO,
-        StreamId::inbound(0),
-        StreamEvent::Frame(&frame),
-    );
-    let took = started.elapsed();
-    let joined = std::iter::from_fn(|| o.poll_event())
-        .filter(|e| matches!(e, Event::MemberJoined(_)))
-        .count();
-    println!(
-        "{FAKE} fake members from a {} KiB frame merged in {took:?}",
-        frame.len() / 1024
-    );
-    assert_eq!(joined, FAKE);
-    assert_eq!(o.members().count(), FAKE + 1);
+    frame
 }
 
 /// KS-04, fixed: in plaintext mode anyone can forge a Ping whose reply address is a third
@@ -489,12 +584,13 @@ fn ks07_a_removed_key_leaves_the_node() {
     assert_eq!(o.config().security, Security::Keys(Vec::new()));
 }
 
-/// KI-06: a member that stamps a packet years ahead moves every node's cluster time with it,
-/// and the replay floor then takes as long to catch up: until the nonces kept reach their cap,
-/// a recording made after the jump stays acceptable for hours.
+/// KI-06, fixed: a member that stamps a packet years ahead moves every node's cluster time with
+/// it, and the replay floor used to take as long to catch up: until the nonces kept reached
+/// their cap, a recording made after the jump stayed acceptable for hours. The floor now never
+/// lags more than ten windows behind the window, so the recording is refused, and no packet
+/// may jump cluster time more than 2^40 ms, nor past the lag limit twice in a window.
 #[test]
-#[ignore = "reproduces an open finding in SECURITY.md"]
-fn ki06_a_member_far_ahead_stretches_the_replay_window() {
+fn ki06_a_member_far_ahead_stretches_the_replay_window_by_at_most_the_lag_limit() {
     const YEAR_MS: u64 = 365 * 24 * 3_600_000;
     let mut o = secure("o", 1, &[("b", 2)]);
     let at = |s: u64| Instant::ZERO + Duration::from_secs(s);
@@ -527,13 +623,21 @@ fn ki06_a_member_far_ahead_stretches_the_replay_window() {
         o.handle_timeout(at(s));
         drain(&mut o);
     }
+    let dropped = o.metrics().replays_dropped;
     o.handle_datagram(at(3_700), addr(3), &recording);
     let answered = drain(&mut o)
         .iter()
         .any(|t| matches!(t, Transmit::Datagram { to, .. } if *to == addr(2)));
     assert!(
-        answered,
-        "the hour-old recording was refused: {:?}",
+        !answered,
+        "the hour-old recording was answered: {:?}",
         o.metrics()
     );
+    assert_eq!(o.metrics().replays_dropped, dropped + 1);
+
+    // Nor can a packet move cluster time more than 2^40 ms, some 35 years, at once.
+    let now = 10 * YEAR_MS + 3_600_000;
+    o.handle_datagram(at(3_700), addr(3), &stamped(now + (1 << 40) + 1_000, 4));
+    assert_eq!(o.metrics().replays_dropped, dropped + 2);
+    assert!(drain(&mut o).is_empty());
 }

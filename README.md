@@ -58,6 +58,8 @@ python -m kinship keygen     # prints a base64 32-byte key; give the same key to
 ```
 
 ```python
+import os, kinship
+
 cfg = kinship.Config.lan(
     name="cache-07",                     # stable names survive restarts
     keys=[os.environ["KINSHIP_KEY"]],
@@ -131,7 +133,7 @@ async for event in cluster.events():
 | `MemberDead` | `member` | A suspicion expired without a refutation |
 | `MemberLeft` | `member` | A node left on purpose |
 | `MemberUpdated` | `member`, `previous_meta` | A node changed its metadata |
-| `NameConflict` | `member`, `other_addr` | Two live nodes claim the same name; the newer one is ignored |
+| `NameConflict` | `member`, `other_addr` | Two nodes claim the same name, a live one or one that recently died or left; the one at `other_addr` is ignored |
 | `EventsLost` | `count` | Your consumer fell behind and `count` events were dropped |
 
 Events never describe the local node, except `NameConflict`. Each call to `events()` is an independent subscription that starts at the moment of the call, not at the first `await`, so nothing is missed between `events()` and the loop. Every subscription buffers up to `event_buffer` events (1,024). When a slow consumer fills it, kinship drops the oldest events and your next read is `EventsLost(n)`; call `cluster.members()` and resync. The protocol never waits for you.
@@ -169,6 +171,8 @@ cfg2 = cfg.replace(name="edge-12")    # configs are frozen
 
 Durations are seconds as `float`, or a `datetime.timedelta`. Every field is validated when the config is built, so `kinship.ConfigError` (a `ValueError` that names the field) fires before any socket opens. The full field list lives in the configuration reference; the ones you are most likely to set are `name`, `bind`, `advertise`, `cluster`, `seeds`, `meta`, `keys` and `event_buffer`. Use `bind="0.0.0.0:0"` to let the OS pick a port when several processes share a host, and read it back from `cluster.local.addr`.
 
+A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
+
 ## Encryption and keys
 
 Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything, and packets it recorded are refused when it plays them back. Keys are 32 bytes, given as `bytes` or base64 text, and never logged. The threat model and what kinship does not protect against are in [SECURITY.md](SECURITY.md).
@@ -185,6 +189,8 @@ print(cluster.keyring.key_ids())         # ['9f3a01c2', ...], safe to log
 Finish each step on every node before starting the next. A node that falls behind looks dead to the others until it catches up, and `cluster.stats().decrypt_failures` counts what it dropped. Changing `keys` in your config and restarting nodes one by one does the same thing.
 
 Inside the node, keys live in one place and are wiped from memory when removed or when the node closes. Python cannot wipe a `bytes` or `str`, so a key you hold as one stays in memory until Python reuses it: read it from a file or the environment just before you build the config, pass it straight in, and drop your references to it afterwards. The config keeps its keys until it is freed, and a cluster keeps its config.
+
+Every node that holds the key is trusted with membership: it can report any member dead, and claim names and metadata. kinship keeps a member that died or left at its address until its record expires, so another node cannot take its name meanwhile, but it does not authenticate who a member is. If your application routes requests, assigns shards or sends data to members by name, check that a member's address, and any address you read from its metadata, is one you expect from your own configuration or service discovery, and escape names and metadata before you log or display them. Remove a node you no longer trust by rotating the key on every other node.
 
 To run without encryption beyond loopback, set `insecure_plaintext=True`; kinship logs a warning at startup. Without encryption anyone who can reach the port can forge membership, so use it only where everything that can reach the port is trusted. A plaintext node sends only to members it knows, so a forged packet cannot make it send traffic to a third party.
 

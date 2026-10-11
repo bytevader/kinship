@@ -6,6 +6,9 @@
 //! about this node at or above its own incarnation is refuted by raising the incarnation past it
 //! and gossiping Alive; one below it is answered by gossiping the same Alive again, since its
 //! sender missed the refutation.
+//!
+//! "Higher" is serial number arithmetic (RFC 1982), see [`newer`]: incarnations wrap past
+//! u32::MAX to 0, so no rumour, however high, leaves a member unable to refute it (KI-02).
 
 use core::net::SocketAddr;
 
@@ -49,19 +52,76 @@ pub struct Member {
     pub incarnation: u32,
 }
 
+/// Whether incarnation `a` is newer than `b`.
+///
+/// Incarnations are serial numbers (RFC 1982): they wrap from u32::MAX to 0, and `a` is newer
+/// when it is less than 2^31 ahead of `b` around that ring. Every incarnation therefore has
+/// newer ones, so a member can always refute, whatever incarnation a rumour names; and one
+/// rumour moves a member's incarnation less than 2^31 ahead of what a node holds. Two
+/// incarnations exactly 2^31 apart are neither newer than the other, and a rumour at either
+/// loses to the other. Honest members raise their incarnation once per refutation or metadata
+/// change, so they never come near 2^31 apart, and every comparison among them is the plain
+/// one it was before incarnations wrapped.
+pub(crate) fn newer(a: u32, b: u32) -> bool {
+    // The difference as a signed number: positive when `a` is up to 2^31 - 1 ahead. Exactly
+    // 2^31 is i32::MIN, so neither of two such incarnations is newer.
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+/// Whether incarnation `a` is `b` or newer than it.
+pub(crate) fn at_least(a: u32, b: u32) -> bool {
+    a == b || newer(a, b)
+}
+
+/// How many members new to this node one datagram or push-pull frame may still add: created
+/// once per packet, so every Alive and record in it shares `max_new_members_per_packet`.
+#[derive(Debug)]
+pub(crate) struct Admission {
+    left: usize,
+}
+
 impl Node {
-    pub(crate) fn on_alive(&mut self, now: Instant, a: &Alive<'_>) {
+    /// The admission budget of one packet.
+    pub(crate) fn admission(&self) -> Admission {
+        Admission {
+            left: self.cfg.max_new_members_per_packet,
+        }
+    }
+
+    /// Whether the table has room for one more member: it holds fewer than `max_members`,
+    /// this node and tombstones included.
+    pub(crate) fn has_room(&self) -> bool {
+        self.table.len() + 1 < self.cfg.max_members
+    }
+
+    /// Takes one admission from `budget` if the table and the packet have room for a new
+    /// member, and counts a refusal otherwise.
+    fn admit(&mut self, budget: &mut Admission) -> bool {
+        if budget.left == 0 || !self.has_room() {
+            self.metrics.members_refused += 1;
+            return false;
+        }
+        budget.left -= 1;
+        true
+    }
+
+    /// An Alive about `a.node`. One about a member this node does not know adds it only if
+    /// `budget` and the table have room (KI-04); one about a known member always applies.
+    pub(crate) fn on_alive(&mut self, now: Instant, a: &Alive<'_>, budget: &mut Admission) {
         let name = a.node.as_str();
         if name == self.local.member.name {
             if a.addr != self.local.member.addr {
                 self.name_conflict(self.local.member.clone(), a.addr);
-            } else if a.inc > self.local.member.incarnation {
+            } else if newer(a.inc, self.local.member.incarnation) {
                 // An older instance of this node, or a forgery: claim the name back.
                 self.refute(a.inc);
             }
             return;
         }
         let Some(entry) = self.table.get(name) else {
+            if !self.admit(budget) {
+                return;
+            }
             let member = Member {
                 name: name.to_owned(),
                 addr: a.addr,
@@ -80,18 +140,20 @@ impl Node {
             return;
         };
         let old = &entry.member;
-        if a.inc <= old.incarnation {
+        if !newer(a.inc, old.incarnation) {
             return;
         }
-        if old.state.is_live() && a.addr != old.addr {
-            // Two live nodes claim one name; the one we knew first keeps it.
+        if a.addr != old.addr {
+            // Two nodes claim one name; the one we knew first keeps it. That holds for a Dead
+            // or Left member too, until its tombstone is reaped, so that nobody can move the
+            // name of a member that died or left to an address of their choosing (KI-03); a
+            // member that really moved is admitted at its new address once it has been.
             let member = old.clone();
             self.name_conflict(member, a.addr);
             return;
         }
         let was = old.state;
         let previous_meta = (old.meta != a.meta).then(|| old.meta.clone());
-        self.table.set_addr(name, a.addr);
         let entry = self.table.update(name, State::Alive, a.inc, now);
         entry.member.meta.clear();
         entry.member.meta.extend_from_slice(a.meta);
@@ -134,7 +196,7 @@ impl Node {
         let (state, inc) = (entry.member.state, entry.member.incarnation);
         let from = s.from.as_str();
         match state {
-            State::Alive if s.inc >= inc => {
+            State::Alive if at_least(s.inc, inc) => {
                 let n = self.cluster_size();
                 let member = self
                     .table
@@ -147,7 +209,7 @@ impl Node {
                 self.events.push_back(Event::MemberSuspect(member));
                 self.broadcast(Gossip::from_suspect(s));
             }
-            State::Suspect if s.inc > inc => {
+            State::Suspect if newer(s.inc, inc) => {
                 // The member refuted the old suspicion, even if its Alive has not reached us,
                 // so this is a new one: a fresh timer and fresh confirmations.
                 let n = self.cluster_size();
@@ -177,7 +239,7 @@ impl Node {
         let Some(entry) = self.table.get(name) else {
             return;
         };
-        if !entry.member.state.is_live() || d.inc < entry.member.incarnation {
+        if !entry.member.state.is_live() || !at_least(d.inc, entry.member.incarnation) {
             return;
         }
         let state = if d.is_left() {
@@ -213,8 +275,8 @@ impl Node {
         };
         let (state, addr) = (entry.member.state, entry.member.addr);
         match state {
-            State::Alive if inc >= entry.member.incarnation => {}
-            State::Suspect if inc > entry.member.incarnation => {}
+            State::Alive if at_least(inc, entry.member.incarnation) => {}
+            State::Suspect if newer(inc, entry.member.incarnation) => {}
             _ => return,
         }
         let n = self.cluster_size();
@@ -241,7 +303,7 @@ impl Node {
 
     /// A Suspect or Dead about this node at `inc`.
     fn about_self(&mut self, inc: u32) {
-        if inc >= self.local.member.incarnation {
+        if at_least(inc, self.local.member.incarnation) {
             // Others missed our Acks: likely this node is the slow one.
             self.health_delta(1);
             self.refute(inc);
@@ -250,15 +312,15 @@ impl Node {
         }
     }
 
-    /// Raises this node's incarnation past `seen` and gossips Alive, unless it has left.
+    /// Raises this node's incarnation past `seen`, which is its own or newer, and gossips
+    /// Alive, unless it has left. Past u32::MAX the incarnation wraps to 0, which is newer.
     pub(crate) fn refute(&mut self, seen: u32) {
         if self.has_left() {
             // A node that left stays gone: an Alive now would undo its Left everywhere.
             return;
         }
         let me = &mut self.local.member;
-        // At u32::MAX a rumour can no longer be outbid; the member stays as it is.
-        me.incarnation = me.incarnation.max(seen.saturating_add(1));
+        me.incarnation = seen.wrapping_add(1);
         self.metrics.refutations += 1;
         self.broadcast(self.local_alive());
     }
@@ -278,5 +340,27 @@ impl Node {
         self.metrics.name_conflicts += 1;
         self.events
             .push_back(Event::NameConflict { member, other_addr });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incarnations_compare_as_serial_numbers() {
+        // The plain order, wherever honest members are.
+        assert!(newer(1, 0) && newer(7_000, 6_999) && !newer(0, 1) && !newer(5, 5));
+        assert!(at_least(5, 5) && at_least(6, 5) && !at_least(4, 5));
+        // Past u32::MAX comes 0, which is newer: u32::MAX can be outbid.
+        assert!(newer(0, u32::MAX) && !newer(u32::MAX, 0));
+        assert!(newer(u32::MAX.wrapping_add(10), u32::MAX - 10));
+        // Up to 2^31 - 1 ahead is newer; exactly 2^31 apart, neither is.
+        let half = 1u32 << 31;
+        assert!(newer(half - 1, 0) && !newer(0, half - 1));
+        assert!(!newer(half, 0) && !newer(0, half));
+        assert!(!at_least(half, 0) && !at_least(0, half));
+        // A rumour more than 2^31 ahead reads as old, so it moves nothing.
+        assert!(newer(0, half + 1) && !newer(half + 1, 0));
     }
 }

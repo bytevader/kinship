@@ -377,6 +377,7 @@ impl Node {
             ("refutations", m.refutations),
             ("misdirected", m.misdirected),
             ("name_conflicts", m.name_conflicts),
+            ("members_refused", m.members_refused),
             ("push_pulls", m.push_pulls),
             ("push_pull_failures", m.push_pull_failures),
             ("push_pulls_served", m.push_pulls_served),

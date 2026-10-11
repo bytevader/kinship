@@ -1,6 +1,6 @@
 //! The transmit-limited gossip queue, and packing it into outgoing datagrams.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
 use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect};
@@ -113,20 +113,30 @@ struct Queued {
     gossip: Gossip,
     /// Encoded size inside a payload.
     len: usize,
-    transmits: u32,
     /// Only sends to live members count towards the limit.
     live_only: bool,
-    /// Insertion order; newer entries go first among equals.
-    id: u64,
+}
+
+/// Where an entry stands in the queue: least sent first, and among those the newest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Rank {
+    transmits: u32,
+    /// Insertion order, reversed so that newer entries sort first among equals.
+    id: core::cmp::Reverse<u64>,
 }
 
 /// Rumours still to be spread, at most one per member.
 ///
 /// Each entry rides on outgoing packets until it has been sent `limit` times. Packets take the
 /// least-sent entries first, and the newest among those, so fresh news overtakes old.
+///
+/// Entries are kept in that order and indexed by member, so a rumour replaces its member's
+/// previous one, and a send counts, in O(log n): a bulk merge of n new members costs
+/// O(n log n), not the O(n²) of scanning the queue for each (KI-04).
 #[derive(Debug, Default)]
 pub(crate) struct Broadcasts {
-    queue: Vec<Queued>,
+    queue: BTreeMap<Rank, Queued>,
+    by_node: BTreeMap<String, Rank>,
     next_id: u64,
 }
 
@@ -143,21 +153,30 @@ impl Broadcasts {
     }
 
     fn push_with(&mut self, gossip: Gossip, live_only: bool) {
-        self.queue.retain(|q| q.gossip.node() != gossip.node());
-        let len = gossip.message().encoded_len();
-        self.queue.push(Queued {
-            gossip,
-            len,
+        let rank = Rank {
             transmits: 0,
-            live_only,
-            id: self.next_id,
-        });
+            id: core::cmp::Reverse(self.next_id),
+        };
         self.next_id += 1;
+        if let Some(old) = self.by_node.insert(gossip.node().to_owned(), rank) {
+            self.queue.remove(&old);
+        }
+        let len = gossip.message().encoded_len();
+        self.queue.insert(
+            rank,
+            Queued {
+                gossip,
+                len,
+                live_only,
+            },
+        );
     }
 
     /// Drops anything queued about `node`.
     pub fn forget(&mut self, node: &str) {
-        self.queue.retain(|q| q.gossip.node() != node);
+        if let Some(rank) = self.by_node.remove(node) {
+            self.queue.remove(&rank);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -166,7 +185,7 @@ impl Broadcasts {
 
     /// Whether a rumour about `node` is still being spread.
     pub fn contains(&self, node: &str) -> bool {
-        self.queue.iter().any(|q| q.gossip.node() == node)
+        self.by_node.contains_key(node)
     }
 
     #[cfg(test)]
@@ -174,36 +193,70 @@ impl Broadcasts {
         self.queue.len()
     }
 
-    /// Entries that fit in `budget` bytes, best first.
-    fn select(&self, budget: usize) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.queue.len()).collect();
-        order.sort_unstable_by_key(|&i| {
-            let q = &self.queue[i];
-            (q.transmits, u64::MAX - q.id)
-        });
-        let mut left = budget;
-        order.retain(|&i| {
-            let len = self.queue[i].len;
-            let fits = len <= left;
-            if fits {
-                left -= len;
-            }
-            fits
-        });
-        order
+    /// The rumour queued at `rank`, which [`select`](Self::select) returned.
+    fn gossip(&self, rank: Rank) -> &Gossip {
+        &self.queue[&rank].gossip
     }
 
-    /// Counts one more send of each entry in `sent`, to a live member if `live`, dropping those
-    /// that reached `limit`.
-    fn sent(&mut self, sent: &[usize], limit: u32, live: bool) {
-        for &i in sent {
-            let q = &mut self.queue[i];
-            if live || !q.live_only {
-                q.transmits += 1;
+    /// Entries that fit in `budget` bytes, best first: in queue order, skipping any that do
+    /// not fit what is left so that smaller ones behind it still can. Stops once what is left
+    /// is too small for any rumour, so a long queue costs only what a packet takes from it.
+    fn select(&self, budget: usize) -> Vec<Rank> {
+        let smallest = smallest_rumour();
+        let mut left = budget;
+        let mut picked = Vec::new();
+        for (&rank, q) in &self.queue {
+            if left < smallest {
+                break;
+            }
+            if q.len <= left {
+                left -= q.len;
+                picked.push(rank);
             }
         }
-        self.queue.retain(|q| q.transmits < limit);
+        picked
     }
+
+    /// Counts one more send of each entry in `sent`, to a live member if `live`, then drops
+    /// every entry that has reached `limit`, including ones not in `sent`, which the limit
+    /// can catch when it falls with the cluster's size.
+    fn sent(&mut self, sent: &[Rank], limit: u32, live: bool) {
+        for &rank in sent {
+            let Some(q) = self.queue.get(&rank) else {
+                continue;
+            };
+            if !live && q.live_only {
+                continue;
+            }
+            let q = self.queue.remove(&rank).expect("looked up above");
+            let next = Rank {
+                transmits: rank.transmits + 1,
+                ..rank
+            };
+            if let Some(r) = self.by_node.get_mut(q.gossip.node()) {
+                *r = next;
+            }
+            self.queue.insert(next, q);
+        }
+        // The most sent entries sort last.
+        while let Some(entry) = self.queue.last_entry() {
+            if entry.key().transmits < limit {
+                break;
+            }
+            let q = entry.remove();
+            self.by_node.remove(q.gossip.node());
+        }
+    }
+}
+
+/// Bytes the smallest rumour takes in a payload: a Suspect with one-byte names.
+fn smallest_rumour() -> usize {
+    Message::Suspect(Suspect {
+        inc: 0,
+        node: id("n"),
+        from: id("n"),
+    })
+    .encoded_len()
 }
 
 /// Bytes a payload's message count can take: counts stay below 2^14 in any packet.
@@ -276,7 +329,7 @@ impl Outbox {
         msgs.extend(
             picked
                 .iter()
-                .map(|&i| self.broadcasts.queue[i].gossip.message()),
+                .map(|&rank| self.broadcasts.gossip(rank).message()),
         );
         let mut payload = Vec::new();
         // Only an oversized head can fail, and no head is near the limit.
@@ -454,14 +507,42 @@ mod tests {
         assert_eq!(n.metrics().gossip_too_large, 1);
     }
 
+    /// The members of the rumours `select` picks for `budget` bytes, in order.
+    fn picks(b: &Broadcasts, budget: usize) -> Vec<String> {
+        b.select(budget)
+            .into_iter()
+            .map(|rank| b.gossip(rank).node().to_owned())
+            .collect()
+    }
+
+    /// Checks that the member index and the ordered queue agree.
+    fn consistent(b: &Broadcasts) {
+        assert_eq!(b.queue.len(), b.by_node.len());
+        for (node, rank) in &b.by_node {
+            assert_eq!(b.queue[rank].gossip.node(), node);
+        }
+    }
+
     #[test]
     fn newer_gossip_replaces_older_about_the_same_member() {
         let mut b = Broadcasts::default();
         b.push(suspect("a", 1));
         b.push(suspect("b", 1));
+        let first = b.select(usize::MAX);
+        b.sent(&first, 5, true);
         b.push(suspect("a", 2));
         assert_eq!(b.len(), 2);
-        assert!(b.queue.iter().any(|q| q.gossip == suspect("a", 2)));
+        consistent(&b);
+        assert_eq!(b.gossip(b.by_node["a"]), &suspect("a", 2));
+        // The replacement starts unsent and newest, so it goes first again.
+        assert_eq!(picks(&b, usize::MAX), ["a", "b"]);
+        assert_eq!(b.by_node["a"].transmits, 0);
+        assert_eq!(b.by_node["b"].transmits, 1);
+        b.forget("a");
+        consistent(&b);
+        assert!(!b.contains("a") && b.contains("b"));
+        b.forget("a");
+        assert_eq!(b.len(), 1);
     }
 
     #[test]
@@ -470,14 +551,107 @@ mod tests {
         b.push(suspect("a", 1));
         b.push(suspect("b", 1));
         let first = b.select(usize::MAX);
-        assert_eq!(b.queue[first[0]].gossip.node(), "b");
+        assert_eq!(b.gossip(first[0]).node(), "b");
         b.sent(&first[..1], 2, true);
         let next = b.select(usize::MAX);
-        assert_eq!(b.queue[next[0]].gossip.node(), "a");
+        assert_eq!(b.gossip(next[0]).node(), "a");
         b.sent(&next, 2, true);
         assert_eq!(b.len(), 1, "b reached its limit of 2");
-        let one = b.queue[0].len;
+        consistent(&b);
+        let one = b.queue.values().next().unwrap().len;
         assert!(b.select(one - 1).is_empty());
+    }
+
+    #[test]
+    fn a_lower_limit_drops_every_entry_that_reached_it() {
+        let mut b = Broadcasts::default();
+        for node in ["a", "b", "c"] {
+            b.push(suspect(node, 1));
+        }
+        // a and b go out three times each under a limit of 5; c is never picked.
+        for _ in 0..3 {
+            let two: Vec<Rank> = b
+                .select(usize::MAX)
+                .into_iter()
+                .filter(|&r| b.gossip(r).node() != "c")
+                .collect();
+            b.sent(&two, 5, true);
+        }
+        assert_eq!(b.len(), 3);
+        // The cluster shrank and the limit fell to 3: a send of c alone also drops a and b.
+        let c = b.by_node["c"];
+        b.sent(&[c], 3, true);
+        assert_eq!(picks(&b, usize::MAX), ["c"]);
+        consistent(&b);
+    }
+
+    #[test]
+    fn packing_skips_what_does_not_fit_and_takes_smaller_rumours_behind_it() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1));
+        let big = Gossip::Alive {
+            inc: 1,
+            node: "big".to_owned(),
+            addr,
+            meta: vec![7; 200],
+            vmin: 1,
+            vmax: 1,
+        };
+        let mut b = Broadcasts::default();
+        b.push(suspect("old", 1));
+        b.push(big);
+        b.push(suspect("new", 1));
+        let small = suspect("new", 1).message().encoded_len();
+        let large = b
+            .queue
+            .values()
+            .find(|q| q.gossip.node() == "big")
+            .unwrap()
+            .len;
+        assert_eq!(picks(&b, usize::MAX), ["new", "big", "old"]);
+        // Room for the big one only after the newest, and not for the oldest beside it.
+        assert_eq!(picks(&b, small + large), ["new", "big"]);
+        // Too little for the big one: the smaller ones behind it still go.
+        assert_eq!(picks(&b, small * 2), ["new", "old"]);
+        assert!(picks(&b, smallest_rumour() - 1).is_empty());
+    }
+
+    #[test]
+    fn rumours_to_the_live_count_only_sends_to_live_members() {
+        let mut b = Broadcasts::default();
+        b.push_to_live(suspect("left", 1));
+        b.push(suspect("other", 1));
+        let all = b.select(usize::MAX);
+        // A send to a member not held live counts for the ordinary rumour only.
+        b.sent(&all, 2, false);
+        assert_eq!(b.by_node["left"].transmits, 0);
+        assert_eq!(b.by_node["other"].transmits, 1);
+        let all = b.select(usize::MAX);
+        assert_eq!(b.gossip(all[0]).node(), "left", "still unsent, so first");
+        b.sent(&all, 2, false);
+        assert_eq!(picks(&b, usize::MAX), ["left"], "other reached its limit");
+        for _ in 0..2 {
+            let all = b.select(usize::MAX);
+            b.sent(&all, 2, true);
+        }
+        assert!(b.is_empty());
+        consistent(&b);
+    }
+
+    #[test]
+    fn a_bulk_of_rumours_is_queued_and_replaced_in_log_time() {
+        // Quadratic replacement took seconds here; the index takes milliseconds.
+        let mut b = Broadcasts::default();
+        let names: Vec<String> = (0..20_000).map(|i| format!("m-{i:05}")).collect();
+        for name in &names {
+            b.push(suspect(name, 1));
+        }
+        for name in &names {
+            b.push(suspect(name, 2));
+        }
+        assert_eq!(b.len(), names.len());
+        consistent(&b);
+        let first = b.select(1_400);
+        assert_eq!(b.gossip(first[0]), &suspect(names.last().unwrap(), 2));
     }
 
     #[test]

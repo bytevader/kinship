@@ -269,6 +269,11 @@ impl Config {
         with_tcp_timeout => tcp_timeout: Duration;
         /// Attempts per seed in a join, with exponential backoff from the probe interval.
         with_join_retries => join_retries: u32;
+        /// Most members a node holds, itself and tombstones included (8,192). Alives for new
+        /// names are refused while the table is full; known members keep updating.
+        with_max_members => max_members: usize;
+        /// Most new members one datagram or push-pull frame can add (1,024).
+        with_max_new_members_per_packet => max_new_members_per_packet: usize;
         /// Largest datagram sent, header and tag included. Must fit an Alive with
         /// `max_meta_bytes` of metadata beside a Ping: 813 bytes encrypted with the default 512.
         with_udp_max_payload => limits.udp_max_payload: usize;
@@ -383,6 +388,10 @@ mod tests {
         );
         let cfg = Config::local().with_tcp_header_timeout(Duration::ZERO);
         assert_eq!(cfg.build().unwrap_err().field, "tcp_header_timeout");
+        let cfg = Config::local().with_max_members(0);
+        assert_eq!(cfg.build().unwrap_err().field, "max_members");
+        let cfg = Config::local().with_max_new_members_per_packet(0);
+        assert_eq!(cfg.build().unwrap_err().field, "max_new_members_per_packet");
     }
 
     #[test]
@@ -399,6 +408,18 @@ mod tests {
         assert!(core.local_health && core.dynamic_suspicion);
         assert_eq!(core.limits.max_meta_bytes, 256);
         assert_eq!(core.probe_interval, Duration::from_secs(5));
+        assert_eq!(
+            (core.max_members, core.max_new_members_per_packet),
+            (8_192, 1_024)
+        );
+        let big = Config::wan()
+            .with_max_members(20_001)
+            .with_max_new_members_per_packet(20_000);
+        let core = big.core();
+        assert_eq!(
+            (core.max_members, core.max_new_members_per_packet),
+            (20_001, 20_000)
+        );
         let plain = cfg.without_lifeguard();
         let core = plain.core();
         assert!(!core.local_health && !core.nacks && !core.dynamic_suspicion && !core.buddy_system);

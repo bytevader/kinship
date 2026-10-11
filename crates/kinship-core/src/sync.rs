@@ -16,7 +16,7 @@ use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Re
 use crate::broadcast::{Gossip, id};
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
 use crate::io::{StreamEvent, StreamId, Transmit};
-use crate::member::State;
+use crate::member::{Admission, State};
 use crate::replay::stamp_of;
 use crate::time::Instant;
 use crate::{Node, Stamp};
@@ -141,6 +141,10 @@ impl Node {
             return self.end_stream(conn, false);
         }
         let stamp = self.check_stamp(frame);
+        if matches!(stamp, Stamp::TooFarAhead) {
+            self.metrics.replays_dropped += 1;
+            return self.end_stream(conn, false);
+        }
         if matches!(stamp, Stamp::Stale) && !conn.is_inbound() {
             // The peer sealed its reply after reading this node's request and catching up with
             // it, so a stale reply is a recording.
@@ -166,12 +170,14 @@ impl Node {
                         Stamp::Fresh(nonce) => Some(stamp_of(&nonce)),
                         _ => None,
                     };
+                    // Every record in the frame shares one admission budget for new members.
+                    let mut budget = self.admission();
                     let mut answered = false;
                     for msg in payload.iter() {
                         answered = if conn.is_inbound() {
-                            self.serve(now, conn, &msg)
+                            self.serve(now, conn, &msg, &mut budget)
                         } else {
-                            self.on_reply(now, conn, &msg, reply_stamp)
+                            self.on_reply(now, conn, &msg, reply_stamp, &mut budget)
                         };
                         if answered {
                             break;
@@ -192,10 +198,16 @@ impl Node {
     }
 
     /// Answers the first frame of a connection a peer opened. True if `msg` was answered.
-    fn serve(&mut self, now: Instant, conn: StreamId, msg: &Message<'_>) -> bool {
+    fn serve(
+        &mut self,
+        now: Instant,
+        conn: StreamId,
+        msg: &Message<'_>,
+        budget: &mut Admission,
+    ) -> bool {
         match msg {
             Message::PushPull(p) => {
-                self.merge(now, p.records);
+                self.merge(now, p.records, budget);
                 if self.send_state(conn, false, true) {
                     self.metrics.push_pulls_served += 1;
                 }
@@ -223,6 +235,7 @@ impl Node {
         conn: StreamId,
         msg: &Message<'_>,
         stamp: Option<u64>,
+        budget: &mut Admission,
     ) -> bool {
         let Some(out) = self.sync.streams.get(&conn).cloned() else {
             return false;
@@ -230,7 +243,7 @@ impl Node {
         let purpose = out.purpose;
         match (purpose, msg) {
             (Purpose::Join { .. } | Purpose::Sync, Message::PushPull(p)) => {
-                self.merge(now, p.records);
+                self.merge(now, p.records, budget);
                 let window = self.replay.window_ms();
                 let was_stale = stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window);
                 if was_stale && !out.repeat {
@@ -282,12 +295,13 @@ impl Node {
     ///
     /// As in memberlist, a peer's Dead record becomes a suspicion rather than a death, but not
     /// one this node reports; see [`Node::on_merged_suspicion`]. Records about members this
-    /// node does not know only add them if Alive.
-    fn merge(&mut self, now: Instant, records: Records<'_>) {
+    /// node does not know only add them if Alive, and only as many as `budget` and
+    /// `max_members` allow (KI-04).
+    fn merge(&mut self, now: Instant, records: Records<'_>, budget: &mut Admission) {
         for r in records.iter() {
             let a = r.alive;
             match r.state {
-                kinship_proto::State::Alive => self.on_alive(now, &a),
+                kinship_proto::State::Alive => self.on_alive(now, &a, budget),
                 kinship_proto::State::Left => self.on_dead(
                     now,
                     &Dead {
@@ -857,6 +871,61 @@ mod tests {
     }
 
     #[test]
+    fn one_push_pull_frame_shares_one_admission_budget() {
+        let t = Instant::ZERO;
+        let mut b = node("b", 2);
+        b.cfg.max_new_members_per_packet = 3;
+        b.add_member(t, "c", addr(3)).unwrap();
+        while b.poll_event().is_some() {}
+        let record = |name: &'static str, inc, port| Record {
+            state: kinship_proto::State::Alive,
+            alive: Alive {
+                inc,
+                node: id(name),
+                addr: addr(port),
+                meta: b"",
+                vmin: 1,
+                vmax: 1,
+            },
+        };
+        // Five members b has never heard of, then news about one it knows.
+        let records = [
+            record("n1", 0, 11),
+            record("n2", 0, 12),
+            record("n3", 0, 13),
+            record("n4", 0, 14),
+            record("n5", 0, 15),
+            record("c", 4, 3),
+        ];
+        let msg = Message::PushPull(PushPull {
+            join: false,
+            records: Records::Slice(&records),
+        });
+        let codec =
+            kinship_proto::Codec::insecure_plaintext(b"default", kinship_proto::Limits::default())
+                .unwrap();
+        let mut frame = Vec::new();
+        codec
+            .seal(PacketKind::Stream, &[msg], &[0; 24], &mut frame)
+            .unwrap();
+        b.handle_stream(t, StreamId::inbound(0), StreamEvent::Frame(&frame));
+        let ev: Vec<Event> = std::iter::from_fn(|| b.poll_event()).collect();
+        let names: Vec<&str> = joined(&ev).iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["n1", "n2", "n3"]);
+        assert_eq!(b.metrics().members_refused, 2);
+        assert_eq!(
+            b.member("c").unwrap().incarnation,
+            4,
+            "known members update"
+        );
+        assert_eq!(
+            b.metrics().push_pulls_served,
+            1,
+            "and the frame is answered"
+        );
+    }
+
+    #[test]
     fn joining_only_yourself_succeeds_at_once() {
         let mut a = node("a", 1);
         let cmd = a.command(
@@ -942,6 +1011,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
             },
+            &mut b.admission(),
         );
         b.on_dead(
             t,
@@ -1059,7 +1129,7 @@ mod tests {
             record("b", 2, kinship_proto::State::Suspect),
             record("c", 3, kinship_proto::State::Dead),
         ];
-        a.merge(t, Records::Slice(&records));
+        a.merge(t, Records::Slice(&records), &mut a.admission());
         for name in ["b", "c"] {
             assert_eq!(a.member(name).unwrap().state, State::Suspect);
             assert_eq!(a.suspicions[name].confirmations(), 0);
@@ -1085,7 +1155,7 @@ mod tests {
         assert_eq!(a.suspicions["b"].confirmations(), 0);
         assert_eq!(a.suspicions["b"].deadline, full);
         // A merge that repeats it leaves it as it is.
-        a.merge(t, Records::Slice(&records[..1]));
+        a.merge(t, Records::Slice(&records[..1]), &mut a.admission());
         assert_eq!(a.suspicions["b"].confirmations(), 0);
         a.on_suspect(t, &from("e"));
         assert_eq!(a.suspicions["b"].confirmations(), 1);

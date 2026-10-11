@@ -69,20 +69,9 @@ impl Table {
         self.addrs.contains_key(&addr)
     }
 
-    /// Moves a known member to `addr`. Addresses change only here, which keeps them indexed.
-    pub fn set_addr(&mut self, name: &str, addr: SocketAddr) {
-        let Some(entry) = self.entries.get_mut(name) else {
-            return;
-        };
-        if entry.member.addr != addr {
-            unindex(&mut self.addrs, entry.member.addr);
-            *self.addrs.entry(addr).or_default() += 1;
-            entry.member.addr = addr;
-        }
-    }
-
-    /// Moves a known member to `state` at `inc`, and returns it for further changes; its
-    /// address changes only through [`set_addr`](Self::set_addr).
+    /// Moves a known member to `state` at `inc`, and returns it for further changes. A member
+    /// keeps its address for as long as it is in the table, tombstone included (KI-03), which
+    /// keeps addresses indexed; callers must not change it.
     ///
     /// # Panics
     ///
@@ -189,14 +178,14 @@ mod tests {
     }
 
     #[test]
-    fn member_addresses_are_indexed_through_moves_replacements_and_reaping() {
+    fn member_addresses_are_indexed_through_replacements_and_reaping() {
         let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
         let mut t = Table::default();
         t.insert(entry("a", 1, State::Alive));
         t.insert(entry("b", 1, State::Alive));
         assert!(t.has_addr(at(1)) && !t.has_addr(at(2)));
-        // A move leaves the old address while another member still has it.
-        t.set_addr("a", at(2));
+        // A replacement leaves the old address while another member still has it.
+        t.insert(entry("a", 2, State::Alive));
         assert!(t.has_addr(at(1)) && t.has_addr(at(2)));
         t.insert(entry("b", 3, State::Alive));
         assert!(!t.has_addr(at(1)), "b's replacement took it away");

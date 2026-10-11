@@ -76,6 +76,8 @@ class Config:
     # None: one max_stream_frame frame and its 4-byte length prefix
     max_inbound_bytes_per_ip: int | None
     join_retries: int
+    max_members: int
+    max_new_members_per_packet: int
     event_buffer: int
     runtime_threads: int
 

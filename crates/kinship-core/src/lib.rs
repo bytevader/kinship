@@ -226,7 +226,8 @@ impl Node {
 
     /// Learns a member as Alive at incarnation 0 without contacting it, as a static member
     /// list would. Its metadata stays empty until it gossips a newer Alive. Does nothing if the
-    /// name is this node's or already known.
+    /// name is this node's or already known, and refuses a new one, naming `max_members`, when
+    /// the table already holds that many.
     ///
     /// A node given its members this way counts as joined: it has no seed's reply to wait for,
     /// so a later cluster time it hears is a member running ahead, and its replay floor
@@ -247,6 +248,13 @@ impl Node {
         self.joined = true;
         if name == self.local.member.name || self.table.get(name).is_some() {
             return Ok(());
+        }
+        if !self.has_room() {
+            self.metrics.members_refused += 1;
+            return Err(ConfigError {
+                field: "max_members",
+                reason: "the member table is full",
+            });
         }
         let member = Member {
             name: name.to_owned(),
@@ -276,9 +284,16 @@ impl Node {
             return;
         }
         let stamp = self.check_stamp(buf);
-        if let Stamp::Stale = stamp {
-            self.metrics.replays_dropped += 1;
-            return;
+        match stamp {
+            Stamp::Stale => {
+                self.metrics.replays_dropped += 1;
+                return;
+            }
+            Stamp::TooFarAhead => {
+                self.metrics.replays_dropped += 1;
+                return;
+            }
+            Stamp::Unchecked | Stamp::Fresh(_) => {}
         }
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
@@ -339,7 +354,7 @@ impl Node {
                 self.me.meta.clone_from(&meta);
                 let local = &mut self.local.member;
                 local.meta = meta;
-                local.incarnation = local.incarnation.saturating_add(1);
+                local.incarnation = local.incarnation.wrapping_add(1);
                 self.broadcast(self.local_alive());
                 self.finish(id, Ok(CommandOutput::Done));
             }
@@ -484,11 +499,23 @@ impl Node {
         let Some(nonce) = sealed_nonce(buf) else {
             return Stamp::Unchecked;
         };
-        if self.replay.is_stale(replay::stamp_of(&nonce)) {
+        let stamp = replay::stamp_of(&nonce);
+        if self
+            .replay
+            .is_too_far_ahead(self.now, stamp, self.settling())
+        {
+            Stamp::TooFarAhead
+        } else if self.replay.is_stale(stamp) {
             Stamp::Stale
         } else {
             Stamp::Fresh(nonce)
         }
+    }
+
+    /// Whether this node has yet to complete a join, or has one in flight; see
+    /// [`Replay::set_settling`].
+    fn settling(&self) -> bool {
+        !self.joined || !self.sync.joins.is_empty()
     }
 
     /// Records the nonce of a packet that authenticated, catching up with its cluster time.
@@ -497,8 +524,7 @@ impl Node {
         let Stamp::Fresh(nonce) = stamp else {
             return true;
         };
-        self.replay
-            .set_settling(!self.joined || !self.sync.joins.is_empty());
+        self.replay.set_settling(self.settling());
         if !self.replay.accept(self.now, nonce) {
             self.metrics.replays_dropped += 1;
             return false;
@@ -521,8 +547,11 @@ impl Node {
     /// that just joined through another node, announces itself with an Alive in the packets it
     /// sends. The addresses those announce count as members' while the packet is handled, so
     /// that the Ping ahead of the Alive is answered as it would be with encryption.
+    ///
+    /// The Alives in one datagram share one admission budget for new members.
     fn process(&mut self, payload: &Payload<'_>) {
         let now = self.now;
+        let mut budget = self.admission();
         if !self.out.codec.is_encrypted() {
             self.announced
                 .extend(payload.iter().filter_map(|msg| match msg {
@@ -536,7 +565,7 @@ impl Node {
                 Message::PingReq(r) => self.on_ping_req(now, &r),
                 Message::Ack { seq } => self.on_ack(seq),
                 Message::Nack { seq } => self.on_nack(seq),
-                Message::Alive(a) => self.on_alive(now, &a),
+                Message::Alive(a) => self.on_alive(now, &a, &mut budget),
                 Message::Suspect(s) => self.on_suspect(now, &s),
                 Message::Dead(d) => self.on_dead(now, &d),
                 // Push-pull runs over streams only.
@@ -554,6 +583,8 @@ enum Stamp {
     Unchecked,
     /// Stamped before the replay window.
     Stale,
+    /// Stamped further ahead of cluster time than this node may jump.
+    TooFarAhead,
     /// Inside the window, with this nonce.
     Fresh([u8; kinship_proto::NONCE_LEN]),
 }
@@ -637,8 +668,11 @@ mod tests {
             source: NodeId::new("b").unwrap(),
             source_addr: addr(2),
         });
+        // Stamped at cluster time 0, random bytes after.
+        let mut nonce = [9; 24];
+        nonce[..8].fill(0);
         codec
-            .seal(PacketKind::Datagram, &[ping], &[9; 24], &mut pkt)
+            .seal(PacketKind::Datagram, &[ping], &nonce, &mut pkt)
             .unwrap();
         n.handle_datagram(Instant::ZERO, addr(2), &pkt);
         assert_eq!(n.metrics().packets_received, 1);
@@ -728,11 +762,12 @@ mod tests {
         let codec = Codec::encrypted(b"default", Limits::default(), vec![key.clone()]).unwrap();
         let secs = |s: u64| Instant::ZERO + core::time::Duration::from_secs(s);
         // Another node that has just started reaches this one first; then the cluster's time
-        // arrives, an hour on; then a recording from ten minutes before that.
+        // arrives, an hour on; then a recording from three minutes before that, inside the lag
+        // limit that bounds how far behind a settled node's floor may follow.
         let hear = |n: &mut Node| {
             n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 2_000, 1));
             n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 3_600_000, 2));
-            n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 3_000_000, 3));
+            n.handle_datagram(secs(1), addr(2), &stamped_ping(&codec, 3_420_000, 3));
             n.metrics().replays_dropped
         };
         let mut new = node(Security::Keys(vec![key.clone()]));
@@ -982,6 +1017,45 @@ mod tests {
     }
 
     #[test]
+    fn a_rumour_at_the_last_incarnation_is_refuted_past_it() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        // From 0, u32::MAX is one behind: a stale rumour, answered with the Alive again.
+        deliver(&mut n, t, &[dead("a", u32::MAX, "m")]);
+        assert_eq!(n.local().incarnation, 0);
+        assert_eq!(n.metrics().refutations, 0);
+        // Driven there in two steps, each less than 2^31 ahead, it refutes past it.
+        deliver(&mut n, t, &[dead("a", (1 << 31) - 1, "m")]);
+        assert_eq!(n.local().incarnation, 1 << 31);
+        deliver(&mut n, t, &[dead("a", u32::MAX, "m")]);
+        assert_eq!(n.local().incarnation, 0, "wrapped past u32::MAX");
+        assert_eq!(n.local().state, State::Alive);
+        assert_eq!(n.metrics().refutations, 2);
+        // An ordinary suspicion at the new incarnation is refuted as any other.
+        deliver(&mut n, t, &[suspect("a", 0, "b")]);
+        assert_eq!(n.local().incarnation, 1);
+        // A rumour 2^31 ahead is not newer, and only queues the Alive again.
+        deliver(&mut n, t, &[dead("a", 1 + (1 << 31), "m")]);
+        assert_eq!(n.local().incarnation, 1);
+        assert_eq!(n.metrics().refutations, 3);
+
+        // Peers see the refutation win: b, driven to the end of the ring and held dead there,
+        // comes back at 0.
+        deliver(&mut n, t, &[suspect("b", (1 << 31) - 1, "m")]);
+        deliver(&mut n, t, &[dead("b", u32::MAX - 1, "m")]);
+        let b = n.member("b").unwrap();
+        assert_eq!((b.state, b.incarnation), (State::Dead, u32::MAX - 1));
+        deliver(&mut n, t, &[alive("b", 0, 2)]);
+        let b = n.member("b").unwrap();
+        assert_eq!((b.state, b.incarnation), (State::Alive, 0));
+        // Set_meta at u32::MAX wraps too.
+        n.local.member.incarnation = u32::MAX;
+        n.command(t, Command::SetMeta(b"x".to_vec()));
+        assert_eq!(n.local().incarnation, 0);
+    }
+
+    #[test]
     fn a_stale_rumour_about_this_node_queues_its_alive_again() {
         let mut n = node(Security::InsecurePlaintext);
         let t = Instant::ZERO;
@@ -1095,6 +1169,38 @@ mod tests {
         assert!(matches!(&ev[1], Event::NameConflict { member, .. } if member.name == "a"));
         assert_eq!(n.member("b").unwrap().addr, addr(2));
         assert_eq!(n.local().incarnation, 0);
+    }
+
+    #[test]
+    fn a_tombstone_keeps_its_name_at_its_address_until_it_is_reaped() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        n.add_member(t, "c", addr(3)).unwrap();
+        // b died and c left; Alives for them from another address are conflicts.
+        deliver(&mut n, t, &[dead("b", 0, "x"), dead("c", 0, "c")]);
+        events(&mut n);
+        deliver(&mut n, t, &[alive("b", 5, 9), alive("c", 5, 9)]);
+        assert_eq!(kinds(&mut n), ["conflict", "conflict"]);
+        assert_eq!(n.metrics().name_conflicts, 2);
+        for (name, port, state) in [("b", 2, State::Dead), ("c", 3, State::Left)] {
+            let m = n.member(name).unwrap();
+            assert_eq!((m.state, m.addr, m.incarnation), (state, addr(port), 0));
+        }
+        // From their own address, they come back.
+        deliver(&mut n, t, &[alive("b", 1, 2), alive("c", 1, 3)]);
+        assert_eq!(kinds(&mut n), ["joined", "joined"]);
+        // Once a tombstone is reaped, the name is free, at any address.
+        deliver(&mut n, t, &[dead("b", 1, "x")]);
+        let keep = n.cfg.dead_reclaim.max(n.replay.window());
+        let later = t + keep + n.probe_interval() * 2;
+        while let Some(at) = n.poll_timeout().filter(|&at| at <= later) {
+            n.handle_timeout(at);
+            while n.poll_transmit().is_some() {}
+        }
+        assert!(n.member("b").is_none());
+        deliver(&mut n, later, &[alive("b", 0, 9)]);
+        assert_eq!(n.member("b").unwrap().addr, addr(9));
     }
 
     #[test]
@@ -1432,6 +1538,79 @@ mod tests {
         assert!(contains(&pkts, addr(3), "Dead(Dead { inc: 3"), "{pkts:?}");
         assert!(!contains(&pkts, addr(2), "Ping("), "{pkts:?}");
         assert!(n.relays.is_empty());
+    }
+
+    fn names(n: &Node) -> Vec<String> {
+        n.all_members().map(|m| m.name.clone()).collect()
+    }
+
+    #[test]
+    fn one_datagram_admits_at_most_its_share_of_new_members() {
+        let mut n = node(Security::InsecurePlaintext);
+        n.cfg.max_new_members_per_packet = 2;
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        events(&mut n);
+        // Three new members, then news about a known one, in one datagram.
+        deliver(
+            &mut n,
+            t,
+            &[
+                alive("c", 0, 3),
+                alive("d", 0, 4),
+                alive("e", 0, 5),
+                alive("b", 1, 2),
+            ],
+        );
+        assert_eq!(kinds(&mut n), ["joined", "joined"]);
+        assert_eq!(names(&n), ["a", "b", "c", "d"]);
+        assert_eq!(
+            n.member("b").unwrap().incarnation,
+            1,
+            "known members update"
+        );
+        assert_eq!(n.metrics().members_refused, 1);
+        assert!(
+            !n.out.broadcasts.contains("e"),
+            "nor is a refused one gossiped"
+        );
+        // Members already known spend nothing: the next datagram has its own share.
+        deliver(&mut n, t, &[alive("c", 1, 3), alive("e", 0, 5)]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        assert_eq!(n.metrics().members_refused, 1);
+    }
+
+    #[test]
+    fn the_table_holds_at_most_max_members_this_node_and_tombstones_included() {
+        let mut n = node(Security::InsecurePlaintext);
+        n.cfg.max_members = 3;
+        let t = Instant::ZERO;
+        n.add_member(t, "b", addr(2)).unwrap();
+        deliver(&mut n, t, &[dead("b", 0, "c")]);
+        deliver(&mut n, t, &[alive("c", 0, 3)]);
+        events(&mut n);
+        // a, b's tombstone and c: full.
+        deliver(&mut n, t, &[alive("d", 0, 4)]);
+        assert!(n.member("d").is_none());
+        assert_eq!(n.metrics().members_refused, 1);
+        let full = n.add_member(t, "d", addr(4)).unwrap_err();
+        assert_eq!(full.field, "max_members");
+        assert_eq!(n.metrics().members_refused, 2);
+        // Members it holds keep changing, the tombstone included.
+        deliver(&mut n, t, &[alive("c", 1, 3), alive("b", 1, 2)]);
+        assert_eq!(kinds(&mut n), ["joined"], "b came back");
+        assert_eq!(n.member("c").unwrap().incarnation, 1);
+        // Once a tombstone is reaped there is room again.
+        deliver(&mut n, t, &[dead("b", 1, "c")]);
+        let keep = n.cfg.dead_reclaim.max(n.replay.window());
+        let later = t + keep + n.probe_interval() * 2;
+        while let Some(at) = n.poll_timeout().filter(|&at| at <= later) {
+            n.handle_timeout(at);
+            while n.poll_transmit().is_some() {}
+        }
+        assert!(n.member("b").is_none());
+        deliver(&mut n, later, &[alive("d", 0, 4)]);
+        assert!(n.member("d").is_some());
     }
 
     #[test]
