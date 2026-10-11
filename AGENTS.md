@@ -7,12 +7,12 @@
 Feature-complete for 0.1 and in hardening.
 
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
-- At 100 nodes, kill -9 detection matches memberlist at the median (9.70 s vs 9.83 s on 2026-10-11), but kinship's tail is heavier in that run and in a same-day control on main; see `docs/results/detection.md`.
+- At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; see `docs/results/detection.md`.
 - Protocol review fixes KP-01..KP-05 (`docs/review.md`) and security fixes KS-01..KS-08 (`SECURITY.md`) are merged.
 - Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
 - `CHANGELOG.md` covers 0.1.0, still unreleased; versions stay at 0.0.0 until the release.
 - Timing preset tuning is parked on `feature/tuned-presets`; `docs/results/tuning.md` lists what is left.
-- Before 0.1, run the `Detection latency` workflow (`.github/workflows/detection.yml`) by hand, and look into the kinship detection tail it reports.
+- Before 0.1, run the `Detection latency` workflow (`.github/workflows/detection.yml`) by hand and check its tail against `docs/results/detection.md`.
 
 ## Where to look
 
