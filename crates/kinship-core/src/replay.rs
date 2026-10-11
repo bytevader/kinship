@@ -16,10 +16,20 @@
 //!
 //! Clocks can jump. When a member's clock jumps ahead, the others adopt its time as its packets
 //! reach them, and until a node has adopted it, everything it sends looks old to those that
-//! have. The floor therefore never jumps: it follows cluster time at up to twice the speed of
-//! this node's own clock, and moves at most half a window on any one input, so for a while
-//! after a jump, its own or another member's, packets from the old timeline still arrive. The
-//! nonces seen are kept down to the floor, so copies stay refused all the while.
+//! have. The floor therefore does not jump with a short jump: it follows cluster time at up to
+//! twice the speed of this node's own clock, and moves at most half a window on any one input,
+//! so for a while after a jump, its own or another member's, packets from the old timeline
+//! still arrive. The nonces seen are kept down to the floor, so copies stay refused all the
+//! while.
+//!
+//! A jump longer than the lag limit, ten windows, is not waited for: the floor never falls more
+//! than that limit behind the window behind cluster time, so a stamp far ahead, from a member
+//! holding a key or from an honest node that kept running while the rest of the cluster
+//! restarted, stretches the window by at most the limit (KI-06). Packets from members still on
+//! the old timeline are then dropped until they hear the new one, which every packet carries.
+//! Such a long jump is adopted at most once a window, and none longer than [`MAX_JUMP_MS`]:
+//! packets that would make another are refused before they are decrypted, so that driving
+//! cluster time to u64::MAX, where it would stop moving, takes years.
 //!
 //! A node that is still settling, one that has not completed a join or has a join in flight,
 //! has no old timeline to wait for: the first packets it hears may come from another node that
@@ -44,6 +54,17 @@ const MIN_WINDOW: Duration = Duration::from_secs(30);
 
 /// Nonces kept at most. Far above what a node receives in one window; past it the floor rises.
 const MAX_SEEN: usize = 1 << 17;
+
+/// How far behind the window behind cluster time the floor may fall, in windows: five minutes
+/// with the default window. Longer than any clock jump the floor is meant to absorb.
+const MAX_LAG_WINDOWS: u32 = 10;
+
+/// The furthest a packet's stamp may be ahead of cluster time, 2^40 ms, some 35 years: past any
+/// honest gap between members, such as a node that kept running for years while the rest of
+/// the cluster restarted. A packet stamped further ahead is refused before it is decrypted, so
+/// one packet cannot bring cluster time near u64::MAX, where it would stop moving and stamps
+/// could no longer tell old packets from new.
+const MAX_JUMP_MS: u64 = 1 << 40;
 
 /// The replay window for `cfg`: at least 30 s, and twice `tcp_timeout`, so a large frame sent
 /// slowly but in time is never stale on arrival.
@@ -77,6 +98,8 @@ pub(crate) struct Replay {
     /// Whether this node has yet to complete a join, or has one in flight: every time it
     /// adopts then moves the floor at once.
     settling: bool,
+    /// When this node last adopted a cluster time past the lag limit ahead of its own.
+    long_jump: Option<Instant>,
     /// Nonces accepted at or above the floor. Each starts with its big-endian stamp, so they
     /// sort by stamp.
     seen: BTreeSet<[u8; NONCE_LEN]>,
@@ -91,6 +114,7 @@ impl Replay {
             ticked: now,
             synced: false,
             settling: false,
+            long_jump: None,
             seen: BTreeSet::new(),
         }
     }
@@ -114,13 +138,27 @@ impl Replay {
     }
 
     /// Moves the floor towards the window behind cluster time, at twice the speed of this
-    /// node's clock and by at most half a window at once.
+    /// node's clock and by at most half a window at once, but never leaves it more than the
+    /// lag limit behind that.
     pub fn tick(&mut self, now: Instant) {
         let elapsed = (now - self.ticked).min(self.window / 4);
         self.ticked = self.ticked.max(now);
         let target = self.stamp(now).saturating_sub(self.window_ms());
         let reach = self.floor.saturating_add(ms(elapsed).saturating_mul(2));
         self.raise_floor(target.min(reach));
+        self.limit_lag(now);
+    }
+
+    /// The most the floor may lag behind the window behind cluster time.
+    fn max_lag_ms(&self) -> u64 {
+        ms(self.window.saturating_mul(MAX_LAG_WINDOWS))
+    }
+
+    /// Raises the floor to the lag limit behind the window behind cluster time, if it is
+    /// further behind: after a jump that long, it does not wait for the old timeline.
+    fn limit_lag(&mut self, now: Instant) {
+        let lag = self.window_ms().saturating_add(self.max_lag_ms());
+        self.raise_floor(self.stamp(now).saturating_sub(lag));
     }
 
     fn raise_floor(&mut self, floor: u64) {
@@ -137,6 +175,18 @@ impl Replay {
     /// forged one only gets an authentic packet dropped, which anyone on the path could do.
     pub fn is_stale(&self, stamp: u64) -> bool {
         stamp < self.floor
+    }
+
+    /// Whether a packet stamped `stamp` is further ahead of cluster time at `now` than this node
+    /// may jump: more than [`MAX_JUMP_MS`], or, unless it is `settling`, past the lag limit
+    /// within a window of the last jump that long. A settling node has yet to hear the
+    /// cluster's time, which may come after a recording or a node that has just started. Like
+    /// [`is_stale`](Self::is_stale), this reads a stamp that is not yet authentic, and a forged
+    /// one only gets a packet dropped that would not authenticate.
+    pub fn is_too_far_ahead(&self, now: Instant, stamp: u64, settling: bool) -> bool {
+        let ahead = stamp.saturating_sub(self.stamp(now));
+        let recent = self.long_jump.is_some_and(|t| now - t < self.window);
+        ahead > MAX_JUMP_MS || (ahead > self.max_lag_ms() && recent && !settling)
     }
 
     /// Records the nonce of a packet that authenticated and is not stale, and adopts its
@@ -156,6 +206,9 @@ impl Replay {
         let adopted = stamp > own;
         if adopted {
             self.offset = self.offset.saturating_add(stamp - own);
+            if stamp - own > self.max_lag_ms() {
+                self.long_jump = Some(now);
+            }
         }
         // The first time this node hears the cluster it was simply behind, not jumped over,
         // so nothing older than the window is worth waiting for. Nor is it while the node
@@ -165,6 +218,9 @@ impl Replay {
             self.synced = true;
             let target = self.stamp(now).saturating_sub(self.window_ms());
             self.raise_floor(target);
+        }
+        if adopted {
+            self.limit_lag(now);
         }
         true
     }
@@ -243,12 +299,19 @@ mod tests {
         assert!(r.is_stale(7_170_000 - 1));
 
         // Settled, the same first packets leave the floor behind, to follow at the speed of
-        // this node's clock: what a member's clock jump needs.
+        // this node's clock: what a member's clock jump needs. A jump of an hour, past the lag
+        // limit, leaves it only that limit behind.
+        let mut r = replay();
+        run(&mut r, 0, 1);
+        assert!(r.accept(at(1), &nonce(2_000, 1)));
+        assert!(r.accept(at(2), &nonce(240_000, 2)));
+        assert!(!r.is_stale(3_000));
         let mut r = replay();
         run(&mut r, 0, 1);
         assert!(r.accept(at(1), &nonce(2_000, 1)));
         assert!(r.accept(at(2), &nonce(3_600_000, 2)));
-        assert!(!r.is_stale(3_000));
+        assert!(r.is_stale(3_600_000 - 330_000 - 1));
+        assert!(!r.is_stale(3_600_000 - 330_000));
     }
 
     #[test]
@@ -304,6 +367,69 @@ mod tests {
         }
         assert_eq!(r.seen.len(), MAX_SEEN);
         assert_eq!(r.stamp(at(2)), u64::MAX);
+    }
+
+    #[test]
+    fn cluster_time_jumps_a_bounded_amount_and_far_only_once_a_window() {
+        let mut r = replay();
+        assert!(r.accept(at(0), &nonce(0, 1)));
+        run(&mut r, 1, 100);
+        let now = r.stamp(at(100));
+        // Never more than MAX_JUMP_MS ahead, settling or not, so a packet cannot bring cluster
+        // time near u64::MAX.
+        assert!(r.is_too_far_ahead(at(100), now + MAX_JUMP_MS + 1, true));
+        assert!(r.is_too_far_ahead(at(100), u64::MAX, false));
+        assert!(!r.is_too_far_ahead(at(100), now + MAX_JUMP_MS, false));
+        // A day ahead, such as a node that kept running while the cluster restarted.
+        let day = 86_400_000;
+        assert!(r.accept(at(100), &nonce(now + day, 2)));
+        // Another jump past the lag limit waits a window; shorter ones do not.
+        let lag = 10 * 30_000;
+        let now = r.stamp(at(110));
+        assert!(r.is_too_far_ahead(at(110), now + lag + 1, false));
+        assert!(
+            !r.is_too_far_ahead(at(110), now + lag + 1, true),
+            "unless settling"
+        );
+        assert!(!r.is_too_far_ahead(at(110), now + lag, false));
+        let now = r.stamp(at(130));
+        assert!(!r.is_too_far_ahead(at(130), now + lag + 1, false));
+        // Driving cluster time from a day to u64::MAX one long jump a window would take years.
+        let windows = u64::MAX / MAX_JUMP_MS;
+        assert!(windows * 30 > 10 * 365 * 24 * 3_600, "{windows} windows");
+    }
+
+    #[test]
+    fn a_jump_past_the_lag_limit_is_not_waited_for() {
+        let lag = 10 * 30_000;
+        // A member stamps a packet ten years ahead: the floor moves at once to the lag limit
+        // behind the window behind it, not half a window at a time.
+        let mut r = replay();
+        assert!(r.accept(at(0), &nonce(0, 1)));
+        run(&mut r, 1, 100);
+        let ahead = 10 * 365 * 24 * 3_600_000;
+        assert!(r.accept(at(100), &nonce(ahead, 2)));
+        assert!(r.is_stale(ahead - 30_000 - lag - 1));
+        assert!(!r.is_stale(ahead - 30_000 - lag));
+        // Within the lag limit, it then catches up as from any jump: a recording made a
+        // second after the jump is refused once the lag limit and the window have passed.
+        run(&mut r, 101, 100 + 330);
+        assert!(r.is_stale(ahead + 1_000));
+
+        // The same holds for this node's own clock.
+        let mut r = replay();
+        assert!(r.accept(at(0), &nonce(0, 1)));
+        run(&mut r, 1, 100);
+        r.tick(at(100 + 3_600));
+        assert!(r.is_stale(100_000), "the old timeline, an hour behind");
+        assert!(!r.is_stale(3_700_000 - 30_000 - lag));
+
+        // A jump inside the limit is absorbed gradually, as before.
+        let mut r = replay();
+        assert!(r.accept(at(0), &nonce(0, 1)));
+        run(&mut r, 1, 100);
+        assert!(r.accept(at(100), &nonce(100_000 + 240_000, 2)));
+        assert!(!r.is_stale(100_000), "a member that has not caught up yet");
     }
 
     #[test]

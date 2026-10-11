@@ -188,6 +188,7 @@ class Stats:
     refutations: int
     misdirected: int
     name_conflicts: int
+    members_refused: int
     push_pulls: int
     push_pull_failures: int
     push_pulls_served: int

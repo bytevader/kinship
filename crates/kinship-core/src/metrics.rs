@@ -12,7 +12,8 @@ pub struct Metrics {
     /// Packets whose key id matched but whose tag did not verify, or with an unknown key id.
     pub decrypt_failures: u64,
     /// Encrypted packets dropped as replays: stamped older than the replay window, which is
-    /// checked before decrypting, or a copy of a packet already accepted inside it.
+    /// checked before decrypting, or a copy of a packet already accepted inside it. Also those
+    /// stamped further ahead of cluster time than a node may jump, checked before decrypting.
     pub replays_dropped: u64,
     /// Probe rounds started.
     pub probes_sent: u64,
@@ -28,8 +29,13 @@ pub struct Metrics {
     pub refutations: u64,
     /// Pings for another name that reached this node's address.
     pub misdirected: u64,
-    /// Alive messages ignored because a live member already holds the name.
+    /// Alive messages ignored because a member already holds the name at another address: a
+    /// live one, or a Dead or Left one whose tombstone is still kept.
     pub name_conflicts: u64,
+    /// Alive messages and push-pull records about members new to this node that were not
+    /// admitted, because the table held `max_members` or their packet had already added
+    /// `max_new_members_per_packet`.
+    pub members_refused: u64,
     /// Push-pull exchanges this node started that completed: joins, anti-entropy, reconnects.
     pub push_pulls: u64,
     /// Push-pull exchanges this node started that failed or timed out.

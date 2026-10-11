@@ -105,7 +105,7 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 
 ## Checked and found consistent
 
-- Incarnation precedence for Alive, Suspect, Dead and Left, in gossip and in push-pull merges, follows design.md's table: no Dead overrides a newer Alive, stale rumours lose, and tombstones yield only to a higher Alive. A refutation raises the incarnation past the rumour, never happens after a leave, and raises local health only for Suspect and Dead. Saturation at u32::MAX is KI-02.
+- Incarnation precedence for Alive, Suspect, Dead and Left, in gossip and in push-pull merges, follows design.md's table: no Dead overrides a newer Alive, stale rumours lose, and tombstones yield only to a higher Alive. A refutation raises the incarnation past the rumour, never happens after a leave, and raises local health only for Suspect and Dead. Saturation at u32::MAX was KI-02; since its fix incarnations wrap and compare as serial numbers.
 - The Lifeguard timeout: T_min, T_max, the cap of K at n - 2 and the fixed-point log2 and log10 match the floating-point formula, as the unit tests in `suspicion.rs` check. Confirmations count distinct reporters at one incarnation, and a higher incarnation starts a fresh timer. Instants and durations saturate, and the only arithmetic that can overflow needs configured values far outside any sensible range.
 - Local health moves by the rules design.md states, stays within 0 to `awareness_max`, and scales both the probe interval and the probe timeout.
 - Nack timing: a relay sends its Nack at 80% of the shortest indirect phase a healthy requester runs, from the unscaled configuration, so it lands in time for every preset with a round trip below the remaining fifth (100 ms on lan(), 400 ms on wan()).
@@ -116,4 +116,4 @@ It also leaves the cluster holding the member at an old incarnation: set_meta ra
 
 ## Note on an open finding
 
-KI-06 does not need a compromised member. A node whose cluster time is far ahead for an honest reason moves every node's floor the same way: for instance one that kept running, cut off, while the rest of the cluster restarted and cluster time began again near zero, and that then rejoins. SECURITY.md's recommended fix, cluster time per key, does not cover that case.
+KI-06 does not need a compromised member. A node whose cluster time is far ahead for an honest reason moves every node's floor the same way: for instance one that kept running, cut off, while the rest of the cluster restarted and cluster time began again near zero, and that then rejoins. SECURITY.md's recommended fix, cluster time per key, does not cover that case. The fix for KI-06 that followed does: the floor lags at most ten windows behind the window, whatever moved cluster time, and kinship-sim `review::ki06_an_honest_node_far_ahead_stretches_the_window_by_at_most_the_lag_limit` replays this scenario.

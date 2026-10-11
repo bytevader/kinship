@@ -203,6 +203,8 @@ impl Fields {
             udp_max_payload => limits.udp_max_payload,
             max_stream_frame => limits.max_stream_frame,
             max_meta_bytes => limits.max_meta_bytes,
+            max_members => max_members,
+            max_new_members_per_packet => max_new_members_per_packet,
         }
         numbers! { u32;
             suspicion_mult => suspicion_mult,
@@ -367,6 +369,8 @@ impl Fields {
             "max_inbound_streams_per_ip" => self.max_inbound_streams_per_ip.into_py_any(py),
             "max_inbound_bytes_per_ip" => self.max_inbound_bytes_per_ip.into_py_any(py),
             "join_retries" => c.join_retries.into_py_any(py),
+            "max_members" => c.max_members.into_py_any(py),
+            "max_new_members_per_packet" => c.max_new_members_per_packet.into_py_any(py),
             "event_buffer" => self.event_buffer.into_py_any(py),
             "runtime_threads" => self.runtime_threads.into_py_any(py),
             _ => return Ok(None),
@@ -415,6 +419,8 @@ const FIELDS: &[&str] = &[
     "max_inbound_streams_per_ip",
     "max_inbound_bytes_per_ip",
     "join_retries",
+    "max_members",
+    "max_new_members_per_packet",
     "event_buffer",
     "runtime_threads",
 ];

@@ -94,8 +94,10 @@ struct Process {
     inner: Observed,
     /// When this process started, on the simulator's clock.
     start: Instant,
-    /// Set on the node the attacker taps.
+    /// Set on the nodes the attacker records from or replays into.
     tape: Option<Rc<RefCell<Tape>>>,
+    /// Whether what this node receives goes on the tape while recording is on.
+    records: bool,
 }
 
 impl Process {
@@ -109,7 +111,7 @@ impl SimNode for Process {
     type Event = Event;
 
     fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]) {
-        if let Some(tape) = &self.tape {
+        if let Some(tape) = self.tape.as_ref().filter(|_| self.records) {
             let mut tape = tape.borrow_mut();
             if tape.on {
                 tape.packets.push((from, buf.to_vec()));
@@ -221,6 +223,7 @@ fn kp01(seed: u64) -> Result<(), String> {
             inner: Observed::new(&local, log, move |_| !restarted),
             start: spec.now,
             tape: (spec.index == KP01_VICTIM).then(|| factory_tape.clone()),
+            records: true,
         }
     });
     let gone = name_of(KP01_GONE);
@@ -774,4 +777,120 @@ fn kp05(seed: u64) -> Result<(), String> {
 #[test]
 fn kp05_a_node_confirms_only_suspicions_its_own_probe_raised() {
     check_all(seeds(8), kp05);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The review's note on KI-06: an honest node far ahead of cluster time, one that kept running cut
+// off while the rest of the cluster restarted, moved every node's floor as a compromised member's
+// stamp does. Since the fix for KI-06 the floor lags at most ten windows behind the window.
+
+/// Keeps running, cut off, while the others restart.
+const KI06_AHEAD: usize = 4;
+/// Where the attacker records, after the heal.
+const KI06_TAPPED: usize = 1;
+/// Where the attacker replays, `KI06_REPLAY_AFTER` later: never seen by it.
+const KI06_VICTIM: usize = 0;
+
+fn ki06_honest(seed: u64) -> Result<(), String> {
+    let cut = secs(10);
+    let restart = secs(3_600);
+    let heal = restart + secs(60);
+    let record = heal + secs(5);
+    // Past the window and the lag limit, 330 s, after the last recorded packet.
+    let replay = record + secs(10) + secs(400);
+    let cmd = |node, cmd| Action::Command { node, cmd };
+    let join = |node, seeds: &[usize]| {
+        let seeds = seeds.iter().map(|&s| addr_of(s)).collect();
+        cmd(node, Tap::Core(Command::Join { seeds }))
+    };
+    let rest = || (0..KI06_AHEAD).collect::<Vec<_>>();
+    let mut scenario = Scenario::new(5)
+        .duration(replay + secs(30))
+        .link(LinkConfig::lan())
+        .trace(TraceConfig::OFF)
+        .at(
+            cut,
+            Action::Partition {
+                a: KI06_AHEAD.into(),
+                b: (0..KI06_AHEAD).into(),
+            },
+        )
+        .at(heal, Action::Heal)
+        .at(heal, join(KI06_AHEAD, &[KI06_VICTIM]))
+        .at(record, cmd(KI06_TAPPED, Tap::Record(true)))
+        .at(record + secs(10), cmd(KI06_TAPPED, Tap::Record(false)))
+        .at(replay, cmd(KI06_VICTIM, Tap::Replay));
+    for i in rest() {
+        let others: Vec<usize> = rest().into_iter().filter(|&j| j != i).collect();
+        scenario = scenario
+            .at(restart, Action::Restart(i))
+            .at(restart, join(i, &others));
+    }
+    let tape = Rc::new(RefCell::new(Tape::default()));
+    let factory_tape = tape.clone();
+    let (mut sim, log) = sim(seed, scenario, move |spec, log| {
+        let restarted = spec.now != Instant::ZERO;
+        let mut local = spec.clone();
+        local.now = Instant::ZERO;
+        let tapped = [KI06_TAPPED, KI06_VICTIM].contains(&spec.index);
+        Process {
+            inner: Observed::new(&local, log, move |_| !restarted),
+            start: spec.now,
+            tape: tapped.then(|| factory_tape.clone()),
+            records: spec.index == KI06_TAPPED,
+        }
+    });
+    let fail = |msg: String| Err(format!("seed {seed}: {msg}"));
+
+    sim.run_until(Instant::ZERO + (replay - ms(1)));
+    // The node far ahead and the restarted cluster find each other, and nobody alive is
+    // declared dead once they have.
+    for o in 0..5 {
+        let live = sim.node(o).expect("running").inner.node.members().count();
+        if live != 5 {
+            return fail(format!(
+                "{} holds {live} live before the replay",
+                name_of(o)
+            ));
+        }
+    }
+    let settled = heal + secs(60);
+    if let Some((o, m, t)) = deaths(&log)
+        .into_iter()
+        .find(|(_, _, t)| *t > Instant::ZERO + settled)
+    {
+        return fail(format!("{} declared {m} dead at {t:?}", name_of(o)));
+    }
+    if tape.borrow().packets.is_empty() {
+        return fail("the attacker recorded nothing".into());
+    }
+    let victim = &sim.node(KI06_VICTIM).expect("running").inner.node;
+    let before = victim.metrics().clone();
+
+    sim.run_until(Instant::ZERO + replay);
+    let after = sim
+        .node(KI06_VICTIM)
+        .expect("running")
+        .inner
+        .node
+        .metrics()
+        .clone();
+    let accepted = after.packets_received - before.packets_received;
+    if accepted > 0 {
+        return fail(format!(
+            "{} accepted {accepted} of {} datagrams {} received from {:?} on, replayed at \
+             {replay:?} ({} dropped as replays)",
+            name_of(KI06_VICTIM),
+            tape.borrow().packets.len(),
+            name_of(KI06_TAPPED),
+            record,
+            after.replays_dropped - before.replays_dropped,
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn ki06_an_honest_node_far_ahead_stretches_the_window_by_at_most_the_lag_limit() {
+    check_all(seeds(8), ki06_honest);
 }

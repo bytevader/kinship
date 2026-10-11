@@ -24,6 +24,10 @@ def test_presets_differ_only_in_timing() -> None:
     assert lan.max_inbound_bytes_per_ip is None and lan.tcp_header_timeout == 1.0
     one_frame = lan.max_stream_frame + 4
     assert lan.replace(max_inbound_bytes_per_ip=one_frame).max_inbound_bytes_per_ip == one_frame
+    for preset in (lan, wan, local):
+        assert (preset.max_members, preset.max_new_members_per_packet) == (8192, 1024)
+    big = lan.replace(max_members=20_001, max_new_members_per_packet=20_000)
+    assert (big.max_members, big.max_new_members_per_packet) == (20_001, 20_000)
     assert kinship.Config(keys=[KEY]).preset == "lan"
 
 
@@ -88,6 +92,9 @@ def test_default_names_are_generated_once_per_config() -> None:
         ({"max_inbound_bytes_per_ip": 1024}, "max_inbound_bytes_per_ip"),
         ({"max_inbound_bytes_per_ip": "8MiB"}, "max_inbound_bytes_per_ip"),
         ({"tcp_header_timeout": 0.0}, "tcp_header_timeout"),
+        ({"max_members": 0}, "max_members"),
+        ({"max_members": -1}, "max_members"),
+        ({"max_new_members_per_packet": 0}, "max_new_members_per_packet"),
     ],
 )
 def test_bad_fields_raise_config_error_naming_the_field(fields: dict, field: str) -> None:

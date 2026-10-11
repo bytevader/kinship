@@ -63,6 +63,13 @@ pub struct Config {
     pub tcp_timeout: Duration,
     /// Attempts per seed in a join. Retries back off from `probe_interval`, doubling each time.
     pub join_retries: u32,
+    /// Most members this node holds, itself and Dead and Left tombstones included. An Alive
+    /// for a name it does not know is not admitted while the table is full; members it knows
+    /// keep updating.
+    pub max_members: usize,
+    /// Most members new to this node that one datagram or one push-pull frame can add, shared
+    /// by every Alive and record in it.
+    pub max_new_members_per_packet: usize,
 }
 
 impl Config {
@@ -94,6 +101,8 @@ impl Config {
             rejoin_interval: Duration::from_secs(60),
             tcp_timeout: Duration::from_secs(10),
             join_retries: 3,
+            max_members: 8_192,
+            max_new_members_per_packet: 1_024,
         }
     }
 
@@ -172,6 +181,12 @@ impl Config {
         }
         if self.join_retries == 0 {
             return fail("join_retries", "must be at least 1");
+        }
+        if self.max_members == 0 {
+            return fail("max_members", "must be positive");
+        }
+        if self.max_new_members_per_packet == 0 {
+            return fail("max_new_members_per_packet", "must be positive");
         }
         let Ok(codec) = self.measuring_codec() else {
             return fail("limits", "too small to hold the packet overhead");
@@ -287,6 +302,30 @@ mod tests {
         let mut cfg = Config::lan(Security::InsecurePlaintext);
         cfg.limits.udp_max_payload = 4;
         assert_eq!(cfg.validate().unwrap_err().field, "limits");
+    }
+
+    #[test]
+    fn member_limits_default_and_must_be_positive() {
+        for cfg in [
+            Config::lan(Security::InsecurePlaintext),
+            Config::wan(Security::InsecurePlaintext),
+            Config::local(Security::InsecurePlaintext),
+        ] {
+            assert_eq!(cfg.max_members, 8_192);
+            assert_eq!(cfg.max_new_members_per_packet, 1_024);
+        }
+        let mut cfg = Config::lan(Security::InsecurePlaintext);
+        cfg.max_members = 0;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_members");
+        let mut cfg = Config::lan(Security::InsecurePlaintext);
+        cfg.max_new_members_per_packet = 0;
+        assert_eq!(
+            cfg.validate().unwrap_err().field,
+            "max_new_members_per_packet"
+        );
+        cfg.max_new_members_per_packet = 1;
+        cfg.max_members = 1;
+        assert_eq!(cfg.validate(), Ok(()), "a node alone is a valid table");
     }
 
     #[test]
