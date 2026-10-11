@@ -462,7 +462,7 @@ The queue in broadcast.rs holds Alive, Suspect and Dead messages that still need
 
 ## Configuration surface
 
-Users pick a preset and override a few fields; the timing defaults start from memberlist's LAN values, which have years of production behind them, and the simulator will tune them before 0.1. One Rust Config struct is the source of truth. The Python Config is a frozen wrapper with the same field names, validated in Rust when constructed, so a bad value raises ValueError before any socket opens.
+Users pick a preset and override a few fields; the timing defaults are memberlist's LAN values, which have years of production behind them. A simulator sweep of every timing field at 50, 200 and 1,000 nodes found no change that detects crashes faster without adding false deaths of CPU-starved members or more than 10% bandwidth, so lan() keeps them (`docs/results/tuning.md`). One Rust Config struct is the source of truth. The Python Config is a frozen wrapper with the same field names, validated in Rust when constructed, so a bad value raises ValueError before any socket opens.
 
 | Preset | Use | Differs from lan() |
 | --- | --- | --- |

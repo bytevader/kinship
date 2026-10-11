@@ -19,8 +19,8 @@
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
 //! `KINSHIP_SEEDS` sets the seeds per cell, `KINSHIP_NODES` runs one cluster size, and
-//! `KINSHIP_VARIANTS` (variants separated by `;`) replaces the variant list. The state of the
-//! tuning and what is left to run are in `docs/results/tuning.md`.
+//! `KINSHIP_VARIANTS` (variants separated by `;`) replaces the variant list. The results are in
+//! `docs/results/tuning.md`.
 
 mod common;
 
