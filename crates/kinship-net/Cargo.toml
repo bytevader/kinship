@@ -17,7 +17,7 @@ test-hooks = []
 kinship-core.workspace = true
 kinship-proto.workspace = true
 arc-swap = "1.7"
-getrandom = "0.3"
+getrandom = "0.4"
 socket2 = "0.6"
 tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing = "0.1.41"
