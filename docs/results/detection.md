@@ -16,9 +16,12 @@ The `Detection latency` workflow runs the same command, 20 runs by default, ever
 
 Refreshed on 2026-10-11 with the probe-order fix below (`detection.csv`). kinship and memberlist detect a kill -9 in the same median time, 9.7 s against 9.8 s, and now with a similar tail: kinship's slowest run took 13.3 s and memberlist's 12.2 s. Every live node declared the killed node dead in every run of every bench below, and neither had a false death.
 
+The `Detection latency` workflow agrees on a GitHub runner. Run by hand on main on 2026-10-11 with 20 runs, it measured 9.742 s against 10.011 s at the median and 12.3 s against 12.2 s at most. Its runs 0 to 19 kill the same nodes as runs 0 to 19 of the published bench, since both draw them from seed 14, so it includes runs 10 and 14, whose late joiners n88 and n95 were slow before the probe-order fix. `detection.csv` stays the published 30-run bench; the workflow's CSV is not kept in the repository.
+
 | Bench | kinship p50 / p99 / max (s) | memberlist p50 / p99 / max (s) | kinship's run median lower in | by, on average |
 | --- | --- | --- | --- | --- |
 | 2026-10-11, with the probe-order fix | 9.733 / 13.325 / 13.336 | 9.811 / 12.119 / 12.214 | 15 of 30 runs | +0.03 s |
+| 2026-10-11, the same main on a GitHub runner, 20 runs | 9.742 / 12.176 / 12.266 | 10.011 / 12.078 / 12.212 | 11 of 20 runs | +0.07 s |
 | 2026-10-11, with the fixes for KI-02, KI-03, KI-04 and KI-06 | 9.695 / 16.342 / 16.392 | 9.827 / 13.346 / 13.443 | 16 of 30 runs | -0.67 s |
 | 2026-10-11, unchanged main (control) | 9.679 / 23.843 / 24.181 | 9.803 / 12.339 / 12.589 | 14 of 30 runs | -0.98 s |
 | 2026-10-08, published before those fixes | 9.522 / 12.500 / 12.568 | 9.857 / 11.980 / 12.106 | 20 of 30 runs | +0.18 s |
@@ -46,7 +49,7 @@ Where they differ is how fast the Dead rumour reaches everyone. Within a run, ki
 - **kinship.** `chaos-node` with `Config::lan()` and a 32-byte key, built in release with the WSL default toolchain, rustc 1.101.0-nightly, for the 2026-10-11 runs. For the first suspicion, the harness also records kinship's `MemberSuspect` events and prints when the first one came in each run's summary line; memberlist reports no suspicions.
 - **memberlist.** v0.7.0, `memberlist.DefaultLANConfig()` with the same key as `SecretKey`, built with Go 1.26.
 - **Run.** Start node 0, then the other 99 in waves of 25 joining it; wait until every node reports every other alive; settle 15 s; kill -9 one node other than node 0. A run ends when every live node has declared it dead, or at the 209 s bound.
-- **Host.** WSL2 on Windows 11, Linux 6.18, 8 vCPUs, 7 GB.
+- **Host.** WSL2 on Windows 11, Linux 6.18, 8 vCPUs, 7 GB. The workflow run used GitHub's `ubuntu-latest` runner and the stable toolchain, with the same command, seed and netem.
 
 ## Metrics
 
@@ -63,6 +66,13 @@ With the probe-order fix, 2026-10-11, the run in `detection.csv`:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | kinship | 30 | 2970 | 9.733 | 13.325 | 13.336 | 9.792 | 13.336 | 0 | 0 |
 | memberlist | 30 | 2970 | 9.811 | 12.119 | 12.214 | 9.954 | 12.214 | 0 | 0 |
+
+The same main in the `Detection latency` workflow on a GitHub runner, 2026-10-11, 20 runs:
+
+| Implementation | Runs | Detections | p50 (s) | p99 (s) | Max (s) | Every node, p50 (s) | Every node, max (s) | Undetected | False deaths |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| kinship | 20 | 1980 | 9.742 | 12.176 | 12.266 | 9.742 | 12.266 | 0 | 0 |
+| memberlist | 20 | 1980 | 10.011 | 12.078 | 12.212 | 10.061 | 12.212 | 0 | 0 |
 
 With the fixes for KI-02, KI-03, KI-04 and KI-06, the same morning:
 
