@@ -21,10 +21,10 @@
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
-- `docs/assets`: the logo (`logo.svg`, `logo.png`, which the README loads from `main`) and the GitHub social preview.
+- `docs/assets`: the logo (`logo.svg`, `logo.png`), the README banners (`banner-light.png`, `banner-dark.png`, loaded from `main`) and the GitHub social preview.
 - `tools/chaos`: chaos harness and detection bench (Linux namespaces, tc netem, nftables). `tools/memberlist-bench`: the Go memberlist node for the bench.
 - Fuzz targets: `crates/kinship-proto/fuzz` (`decode_datagram`, `decode_payload`, `decode_stream_frame`) and `crates/kinship-core/fuzz` (`node_input`).
-- CI (`.github/workflows/ci.yml`): lint, cargo test, `sim-*` jobs (1,000 seeds each), chaos, cargo deny, MSRV, `fuzz smoke (<target>)`, wheels. `detection.yml`: the weekly memberlist bench. `release.yml`: runs on `v*` tags only.
+- CI (`.github/workflows/ci.yml`): lint, cargo test, coverage (Rust with the bindings under pytest, plus Python; `coverage-badge` publishes `coverage.json` for the README badge to the `badges` branch on pushes to main), `sim-*` jobs (1,000 seeds each), chaos, cargo deny, MSRV, `fuzz smoke (<target>)`, wheels. `detection.yml`: the weekly memberlist bench. `release.yml`: runs on `v*` tags only.
 - Released by `release.yml`: the `kinship` package to PyPI, then the crates `kinship-proto`, `kinship-core`, `kinship-net` and `kinship` to crates.io, in that order. `kinship-sim`, `kinship-py`, `kinship-chaos` and the fuzz crates have `publish = false`.
 
 ## Commands

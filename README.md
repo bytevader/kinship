@@ -1,22 +1,29 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/bytevader/kinship/main/docs/assets/logo.png" alt="" width="148">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bytevader/kinship/main/docs/assets/banner-dark.png">
+    <img src="https://raw.githubusercontent.com/bytevader/kinship/main/docs/assets/banner-light.png" alt="kinship" width="560">
+  </picture>
 </p>
-
-<h1 align="center">kinship</h1>
-
 <p align="center">
-  <b>Know which of your processes are alive, without a coordinator.</b><br>
-  SWIM membership and failure detection with Lifeguard, in Rust, for asyncio Python and tokio.
+  <em>Know which of your processes are alive, without a coordinator: SWIM membership and failure detection with Lifeguard, in Rust, for asyncio Python and tokio.</em>
 </p>
-
 <p align="center">
-  <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml"><img src="https://github.com/bytevader/kinship/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/v/kinship" alt="PyPI"></a>
-  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/pyversions/kinship" alt="Python versions"></a>
-  <a href="https://crates.io/crates/kinship"><img src="https://img.shields.io/crates/v/kinship" alt="crates.io"></a>
+  <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/bytevader/kinship/actions/workflows/ci.yml/badge.svg?branch=main" alt="Test"></a>
+  <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbytevader%2Fkinship%2Fbadges%2Fcoverage.json" alt="Coverage"></a>
+  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/v/kinship?color=%2334D058&label=pypi%20package" alt="Package version"></a>
+  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/pyversions/kinship?color=%2334D058" alt="Supported Python versions"></a>
+  <a href="https://crates.io/crates/kinship"><img src="https://img.shields.io/crates/v/kinship?color=%2334D058" alt="crates.io"></a>
   <a href="https://docs.rs/kinship"><img src="https://img.shields.io/docsrs/kinship" alt="docs.rs"></a>
   <a href="https://github.com/bytevader/kinship/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="License: Apache-2.0 OR MIT"></a>
 </p>
+
+---
+
+**Source code**: <a href="https://github.com/bytevader/kinship" target="_blank">https://github.com/bytevader/kinship</a>
+
+**Design and benchmarks**: <a href="https://github.com/bytevader/kinship/blob/main/docs/design.md" target="_blank">design</a>, <a href="https://github.com/bytevader/kinship/blob/main/docs/results/detection.md" target="_blank">detection latency against memberlist</a>
+
+---
 
 kinship tells every Python process in a cluster which peers are alive, suspect, dead or gone, within seconds and with no coordinator to run. It is SWIM with the full Lifeguard extensions, the protocol behind HashiCorp's memberlist, Serf and Consul.
 
