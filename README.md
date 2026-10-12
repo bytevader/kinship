@@ -1,8 +1,32 @@
-# kinship
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bytevader/kinship/main/docs/assets/logo.png" alt="" width="148">
+</p>
 
-kinship tells every Python process in a cluster which peers are alive, suspect, dead or gone, within seconds and with no coordinator to run. It is SWIM with the full Lifeguard extensions, written in Rust and run on its own thread, so a blocked event loop or a long GIL hold never makes a healthy node look dead. Gossip is encrypted by default, and every run of the protocol core can be replayed from a seed.
+<h1 align="center">kinship</h1>
+
+<p align="center">
+  <b>Know which of your processes are alive, without a coordinator.</b><br>
+  SWIM membership and failure detection with Lifeguard, in Rust, for asyncio Python and tokio.
+</p>
+
+<p align="center">
+  <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml"><img src="https://github.com/bytevader/kinship/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/v/kinship" alt="PyPI"></a>
+  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/pyversions/kinship" alt="Python versions"></a>
+  <a href="https://crates.io/crates/kinship"><img src="https://img.shields.io/crates/v/kinship" alt="crates.io"></a>
+  <a href="https://docs.rs/kinship"><img src="https://img.shields.io/docsrs/kinship" alt="docs.rs"></a>
+  <a href="https://github.com/bytevader/kinship/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="License: Apache-2.0 OR MIT"></a>
+</p>
+
+kinship tells every Python process in a cluster which peers are alive, suspect, dead or gone, within seconds and with no coordinator to run. It is SWIM with the full Lifeguard extensions, the protocol behind HashiCorp's memberlist, Serf and Consul.
 
 Use it when you are building your own distributed piece (a sharded cache, a job scheduler, a WebSocket fleet, a pool of edge boxes) and you need membership, not consensus. kinship does not elect leaders, store data or give you agreement during a partition.
+
+- **Fast, honest failure detection.** A kill -9 at 100 nodes is detected in 9.7 s at the median, against 9.8 s for HashiCorp memberlist on the same network ([benchmark](https://github.com/bytevader/kinship/blob/main/docs/results/detection.md)).
+- **No false deaths from a busy process.** The protocol runs in Rust on its own thread, and Lifeguard stretches a slow node's own timeouts, so a blocked event loop or a long GIL hold does not get a healthy node declared dead.
+- **Encrypted by default.** XChaCha20-Poly1305 on every packet, replay protection, and key rotation with no downtime.
+- **Python and Rust.** An asyncio API and a blocking one for Flask, Django and Celery, abi3 wheels plus free-threaded 3.14t; a tokio `Cluster` handle and a sans-IO protocol core for Rust.
+- **Reproducible.** Every run of the protocol core replays from a seed; CI sweeps 1,000 simulated seeds per scenario, fuzzes the decoders and kills nodes on real sockets under packet loss.
 
 ## Install
 
@@ -175,7 +199,7 @@ A node holds at most `max_members` members (8,192, itself and recently departed 
 
 ## Encryption and keys
 
-Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything, and packets it recorded are refused when it plays them back. Keys are 32 bytes, given as `bytes` or base64 text, and never logged. The threat model and what kinship does not protect against are in [SECURITY.md](SECURITY.md).
+Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything, and packets it recorded are refused when it plays them back. Keys are 32 bytes, given as `bytes` or base64 text, and never logged. The threat model and what kinship does not protect against are in [SECURITY.md](https://github.com/bytevader/kinship/blob/main/SECURITY.md).
 
 The first key in `keys` encrypts; every key in the list decrypts. Rotate with no downtime in three steps, each run on every node:
 
@@ -215,11 +239,30 @@ for event in cluster.events(timeout=1.0):   # yields None on each timeout tick
 
 Methods that wait on the network (`join`, `set_meta`, `update_meta`, `leave`, `close` and the keyring calls) block the calling thread and accept `timeout=`. Read events from a dedicated thread. Under Celery or gunicorn's prefork model, start the cluster in the worker after the fork (`worker_process_init`, `post_fork`), and give each worker its own port with `bind="0.0.0.0:0"`.
 
-# Examples
+## Examples
 
-Three of the four examples decide which node owns a key with `kinship.rendezvous.owner(key, members)`. It uses rendezvous (highest random weight) hashing with a stable hash, so every process agrees on the owner, and only the keys of a node that joins or leaves move. Never use Python's built-in `hash()` for this: it differs between processes.
+Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/examples), each a single file with nothing to install beyond kinship:
 
-## Sharded cache
+| Script | What it shows |
+| --- | --- |
+| [`quickstart.py`](https://github.com/bytevader/kinship/blob/main/examples/quickstart.py) | Three terminals, one cluster: nodes joining, leaving and crashing, with timestamps |
+| [`sharded_keys.py`](https://github.com/bytevader/kinship/blob/main/examples/sharded_keys.py) | Rendezvous ownership of keys, and that only a departed node's keys move, after a leave and after a crash |
+| [`failover_job.py`](https://github.com/bytevader/kinship/blob/main/examples/failover_job.py) | A job that runs on exactly one node and moves on its own when that node dies |
+| [`sync_workers.py`](https://github.com/bytevader/kinship/blob/main/examples/sync_workers.py) | The blocking API and metadata: routing around a node that marks itself as draining |
+
+```bash
+python examples/sharded_keys.py
+```
+
+```text
+node-c crashes
+  node-a sees MemberSuspect(node-c) after 0.5 s
+  node-a sees MemberDead(node-c) after 1.1 s
+```
+
+The patterns below show the same building blocks inside real services. Three of the four decide which node owns a key with `kinship.rendezvous.owner(key, members)`. It uses rendezvous (highest random weight) hashing with a stable hash, so every process agrees on the owner, and only the keys of a node that joins or leaves move. Never use Python's built-in `hash()` for this: it differs between processes.
+
+### Sharded cache
 
 Every node holds the keys it owns and fetches the rest from their owner over HTTP. The owner's HTTP address travels in metadata.
 
@@ -248,7 +291,7 @@ class ShardedCache:
 
 `members()` includes suspect nodes on purpose. A node that is only slow keeps its keys, so a brief stall does not reshuffle the cache; its keys move only once it is dead or has left.
 
-## Single-run cron
+### Single-run cron
 
 Each scheduled job runs on the one alive node that owns the job's name, so jobs spread across the fleet and move when their node dies.
 
@@ -267,7 +310,7 @@ async def nightly(cluster: kinship.Cluster) -> None:
 
 This is best effort, not a lock. During a partition, or for the second or two while views disagree, two nodes can both believe they own a job, so the job must be safe to run twice or take a database lock keyed on `run_id`. The `MIN_NODES` check stops a node that started cut off from the cluster from running every job alone.
 
-## WebSocket room routing
+### WebSocket room routing
 
 All sockets for one chat room live on the same server, so a message to the room never crosses the network. A client that lands on the wrong server is told where to go.
 
@@ -301,7 +344,7 @@ async def rebalance() -> None:
 
 Each server advertises its public URL with `meta={"ws": "wss://ws-3.example.com"}`. When a server joins, only the rooms it now owns move to it; when one dies, its clients reconnect and land on the new owners.
 
-## Edge fleet over flaky links
+### Edge fleet over flaky links
 
 Store gateways join a cluster whose seeds are two regional hubs. A dashboard on each hub shows which stores are up, degraded or down.
 
@@ -332,11 +375,11 @@ async def track(cluster: kinship.Cluster) -> None:
 
 `wan()` probes less often and waits longer before declaring a store dead, and Lifeguard keeps a store whose CPU is pegged from being reported dead. A store that drops off for an hour shows as dead; when its link returns it keeps retrying its seeds in the background and rejoins without a restart. Every node must reach every other node's advertised address over UDP and TCP, so stores behind NAT should run on an overlay network such as WireGuard or Tailscale and bind to that address.
 
-# Rust
+## Rust
 
 The Python package is a thin layer over two Rust crates you can use directly.
 
-## kinship: the tokio handle
+### kinship: the tokio handle
 
 ```rust
 use kinship::{Cluster, Config, Event, Key};
@@ -371,7 +414,7 @@ cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7946
 cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 127.0.0.1:7946
 ```
 
-## kinship-core: sans-IO SWIM
+### kinship-core: sans-IO SWIM
 
 `kinship-core` is the whole protocol with no sockets, clocks, threads or randomness of its own. You feed it bytes and the time, and it tells you what to send and when to wake it. Use it to run SWIM on your own runtime, an embedded event loop or a simulator.
 
@@ -407,3 +450,14 @@ let wake_at: Option<Instant> = node.poll_timeout();
 ```
 
 The same seed, nonce key and inputs always give the same outputs, byte for byte, which is how `kinship-sim` replays any failure from its seed, from which it derives both. Encryption happens inside the core, so the bytes in `payload` and `frame` are already sealed.
+
+## Learn more
+
+- [Design](https://github.com/bytevader/kinship/blob/main/docs/design.md): the protocol state machine, wire format, threading model and failure modes.
+- [Benchmarks](https://github.com/bytevader/kinship/blob/main/docs/results/detection.md): detection latency against memberlist, and the [timing preset sweep](https://github.com/bytevader/kinship/blob/main/docs/results/tuning.md).
+- [Security](https://github.com/bytevader/kinship/blob/main/SECURITY.md): the threat model, the audit findings and how to report a vulnerability.
+- [Changelog](https://github.com/bytevader/kinship/blob/main/CHANGELOG.md).
+
+## License
+
+Licensed under either of [Apache License 2.0](https://github.com/bytevader/kinship/blob/main/LICENSE-APACHE) or [MIT](https://github.com/bytevader/kinship/blob/main/LICENSE-MIT), at your option.
