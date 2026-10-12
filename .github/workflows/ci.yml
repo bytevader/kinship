@@ -96,6 +96,9 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
+          # maturin develop installs the dev dependency group with `pip install --group`,
+          # which needs pip 25.1 or later; the venv starts with an older one.
+          python -m pip install --upgrade pip
           python -m pip install "maturin>=1.9,<2" pytest pytest-asyncio pytest-cov
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
