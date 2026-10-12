@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["network-programming", "asynchronous"]
 
 [features]
 # Not part of the API: `Memberlist::panic_actor`, which kinship-py's test-hooks feature

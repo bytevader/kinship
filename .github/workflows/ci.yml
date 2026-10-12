@@ -64,6 +64,86 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --exclude kinship-py
 
+  coverage:
+    name: coverage, Rust and Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: coverage
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-llvm-cov
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # One instrumented build serves both suites: cargo test, then pytest against the extension
+      # built from the same instrumented code, so the bindings count too. The simulator, the
+      # chaos harness, tests and examples are not shipped and are left out of the total.
+      - name: Measure coverage
+        env:
+          IGNORE: "(kinship-sim|tools/chaos|/tests/|/examples/|/fuzz/)"
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          # maturin develop installs the dev dependency group with `pip install --group`,
+          # which needs pip 25.1 or later; the venv starts with an older one.
+          python -m pip install --upgrade pip
+          python -m pip install "maturin>=1.9,<2" pytest pytest-asyncio pytest-cov
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo test --workspace --exclude kinship-py
+          maturin develop
+          python -m pytest --cov=kinship --cov-report=json:python-coverage.json
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE" --summary-only
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE" --lcov --output-path rust.lcov
+          python .github/coverage_badge.py rust.lcov python-coverage.json coverage.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: |
+            coverage.json
+            rust.lcov
+            python-coverage.json
+
+  # The README's coverage badge reads coverage.json from the badges branch, which holds that
+  # one file in a single commit, replaced on every push to main.
+  coverage-badge:
+    name: publish the coverage badge
+    needs: coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage
+          path: coverage
+      - name: Push coverage.json to the badges branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir badges && cp coverage/coverage.json badges/ && cd badges
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          git commit -q -m "Coverage of $GITHUB_SHA"
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+
   sim-scale:
     name: sim 1,000 nodes x 10 minutes
     runs-on: ubuntu-latest

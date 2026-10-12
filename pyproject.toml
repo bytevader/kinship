@@ -4,15 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "kinship"
-version = "0.0.0"
+version = "0.1.0"
 description = "SWIM membership and failure detection with Lifeguard, for Python"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0 OR MIT"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 authors = [{ name = "Nikola Stankovic" }]
+keywords = ["swim", "gossip", "membership", "failure-detection", "cluster", "asyncio"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -26,6 +27,8 @@ classifiers = [
 
 [project.urls]
 Repository = "https://github.com/bytevader/kinship"
+Changelog = "https://github.com/bytevader/kinship/blob/main/CHANGELOG.md"
+Issues = "https://github.com/bytevader/kinship/issues"
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "maturin>=1.9,<2"]

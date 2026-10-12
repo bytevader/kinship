@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="kinship">
+  <title>kinship</title>
+  <defs>
+    <linearGradient id="node" x1="60" y1="60" x2="452" y2="452" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset=".55" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="link" x1="60" y1="60" x2="452" y2="452" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fb923c"/>
+      <stop offset="1" stop-color="#f43f5e"/>
+    </linearGradient>
+  </defs>
+  <path d="M256.0 103.0 L388.9 167.0 L421.7 310.8 L329.8 426.2 L182.2 426.2 L90.3 310.8 L123.1 167.0 Z" fill="none" stroke="url(#link)" stroke-width="18" stroke-linejoin="round" opacity=".4"/>
+  <path d="M256.0 103.0 L421.7 310.8 L182.2 426.2 L123.1 167.0 L388.9 167.0 L329.8 426.2 L90.3 310.8 Z" fill="none" stroke="url(#link)" stroke-width="12" stroke-linejoin="round" opacity=".75"/>
+  <circle cx="256.0" cy="103.0" r="56" fill="none" stroke="url(#hot)" stroke-width="8" stroke-dasharray="13 10" opacity=".8"/>
+  <circle cx="256.0" cy="103.0" r="40" fill="url(#hot)"/>
+  <circle cx="388.9" cy="167.0" r="38" fill="url(#node)"/>
+  <circle cx="421.7" cy="310.8" r="38" fill="url(#node)"/>
+  <circle cx="329.8" cy="426.2" r="38" fill="url(#node)"/>
+  <circle cx="182.2" cy="426.2" r="38" fill="url(#node)"/>
+  <circle cx="90.3" cy="310.8" r="38" fill="url(#node)"/>
+  <circle cx="123.1" cy="167.0" r="38" fill="url(#node)"/>
+</svg>

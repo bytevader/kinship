@@ -2,7 +2,7 @@
 
 All notable changes to kinship are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The finding ids (KS-, KI-, KP-) refer to [SECURITY.md](SECURITY.md) and [docs/review.md](docs/review.md).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-12
 
 The first release.
 
@@ -17,6 +17,7 @@ The first release.
 - **Replay protection.** Every nonce carries the sender's cluster time, kept in step by gossip without synchronized wall clocks; recorded packets older than the replay window and copies inside it are dropped.
 - **Member limits.** `max_members` (8,192) and `max_new_members_per_packet` (1,024) bound the member table and what one packet can add, with refusals counted in `members_refused`.
 - **Python package.** `kinship.Cluster` for asyncio and `kinship.blocking.Cluster` for synchronous code, frozen `Config` and `Member` types, an events iterator with per-subscription buffers and `EventsLost`, `stats()`, `kinship.rendezvous.owner()` and `owners()`, and a bridge from Rust logs to `logging`. abi3 wheels for CPython 3.11 and later, and free-threaded 3.14t.
+- **Examples.** Runnable scripts in `examples/`: a three-terminal quickstart, key ownership with rendezvous hashing, a job that fails over to another node, and the blocking API routing around a draining node. `tests/test_examples.py` runs them.
 - **Rust crates.** `kinship` (the tokio `Cluster` handle and `kinship-agent` example), `kinship-core` (the sans-IO protocol state machine, which reads no clock, socket or randomness of its own), `kinship-net` (the tokio UDP and TCP driver) and `kinship-proto` (wire format and codec).
 - **Testing.** A deterministic simulator that replays any run from its seed, with 1,000-seed sweeps for detection, partitions, joins, leaves, restarts, name conflicts, clock jumps and key rotation; a chaos harness that runs nodes in Linux network namespaces under tc netem and nftables; cargo-fuzz targets for the decoders and the node; and a kill -9 detection bench against hashicorp/memberlist at 100 nodes (`docs/results/detection.md`).
 
