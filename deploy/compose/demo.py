@@ -25,6 +25,8 @@ import kinship
 from kinship.contrib.fastapi import cluster_lifespan, cluster_router
 from kinship.ring import Ring
 
+LIVE_STATES = {"ALIVE", "SUSPECT"}
+
 
 def member_record(member: kinship.Member) -> dict:
     return {
@@ -46,7 +48,7 @@ class View:
         self.log: deque[dict] = deque(maxlen=200)
         self.clients: set[asyncio.Queue] = set()
         self.revision = 0
-        self.counts = {"successes": 0, "misses": 0, "errors": 0}
+        self.counts = {"successes": 0, "misses": 0, "errors": 0, "unreachable": 0}
         self.member_counts: dict[str, dict] = {}
         self.moved_at: dict[str, int] = {}
         self.load_enabled = False
@@ -189,9 +191,15 @@ async def poll_members(view: View, http: httpx.AsyncClient) -> None:
         await asyncio.sleep(2)
 
 
+def entry_node(view: View) -> str:
+    """Pick a node to send a request to, skipping those this dashboard already sees down."""
+    live = [name for name in NAMES if view.members.get(name, {}).get("state") in LIVE_STATES]
+    return random.choice(live or NAMES)
+
+
 async def load_generator(view: View, http: httpx.AsyncClient) -> None:
     async def operation(method, key):
-        url = URLS[random.choice(NAMES)] + "/kv/" + key
+        url = URLS[entry_node(view)] + "/kv/" + key
         try:
             response = await http.request(
                 method, url, **({"json": f"value-{time.time_ns()}"} if method == "PUT" else {})
@@ -201,9 +209,11 @@ async def load_generator(view: View, http: httpx.AsyncClient) -> None:
             elif 200 <= response.status_code < 300:
                 view.counts["successes"] += 1
             else:
+                # The node answered, but the key's owner did not (or no owner was eligible).
                 view.counts["errors"] += 1
         except httpx.HTTPError:
-            view.counts["errors"] += 1
+            # The node itself did not answer: stalled, paused, cut off, or not yet known down.
+            view.counts["unreachable"] += 1
         view.publish()
 
     while True:

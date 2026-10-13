@@ -60,7 +60,12 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   it refutes by raising its incarnation, and on seeing that it drops its whole
   cache, so its returning keys read as misses rather than stale values.
 - Successes count successful GETs and PUTs. Misses are 404s from cold keys,
-  including keys lost with an owner; errors are timeouts or failed requests.
+  including keys lost with an owner. Errors are requests the node answered but
+  the key's owner did not, such as reads that still go to a SUSPECT owner.
+  Unreachable counts requests to a node that did not answer at all. Like a
+  client with a health check, the load generator skips nodes the dashboard
+  already sees DEAD or LEFT, so these mostly come from the seconds before a
+  failure is detected, and from stalls.
   Initial warming can also fail if you inject a fault before it finishes.
 - **Sees N members** is polled from that node's `/cluster/members`. During a
   failure, counts can disagree. If its HTTP API cannot be reached, the card

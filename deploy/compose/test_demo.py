@@ -6,7 +6,8 @@ import unittest
 from types import SimpleNamespace
 
 import httpx
-from demo import View, app, member_record, stream
+from common import NAMES
+from demo import View, app, entry_node, member_record, stream
 
 import kinship
 
@@ -118,6 +119,20 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await iterator.aclose()
         self.assertEqual(len(view.clients), 0)
+
+
+class EntryNodeTests(unittest.TestCase):
+    def test_load_skips_nodes_seen_dead_or_left(self):
+        view = View(Cluster())
+        view.members = {
+            "node-1": {"state": "DEAD"},
+            "node-2": {"state": "LEFT"},
+            "node-3": {"state": "SUSPECT"},
+        }
+        # node-4 and node-5 are not known yet, so only node-3 is a live entry.
+        self.assertEqual({entry_node(view) for _ in range(50)}, {"node-3"})
+        view.members = {}
+        self.assertTrue({entry_node(view) for _ in range(200)} <= set(NAMES))
 
 
 class ControlOriginTests(unittest.IsolatedAsyncioTestCase):

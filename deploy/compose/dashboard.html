@@ -115,7 +115,7 @@
     .feedback { min-height: 18px; font-size: 12px; color: var(--muted); }
 
     /* Stats */
-    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
     .stat { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
     .stat strong { display: block; font-size: 24px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
     .stat span { color: var(--muted); font-size: 12px; }
@@ -198,7 +198,8 @@
     <div class="stats">
       <div class="stat ok"><strong id="successes">0</strong><span>successful reads and writes</span></div>
       <div class="stat miss"><strong id="misses">0</strong><span>misses: the key's value was lost with its owner</span></div>
-      <div class="stat err"><strong id="errors">0</strong><span>errors: a node or an owner didn't answer</span></div>
+      <div class="stat err"><strong id="errors">0</strong><span>errors: the key's owner didn't answer</span></div>
+      <div class="stat err"><strong id="unreachable">0</strong><span>unreachable: the node asked didn't answer</span></div>
       <div class="stat"><strong id="dashboard-view">–</strong><span id="dashboard-note">members the dashboard sees</span></div>
     </div>
 
@@ -376,7 +377,7 @@
 
       const dash = s.member_counts.dashboard;
       $('#dashboard-view').textContent = dash ? dash.count : '–';
-      for (const id of ['successes', 'misses', 'errors']) $(`#${id}`).textContent = s.counts[id].toLocaleString();
+      for (const id of ['successes', 'misses', 'errors', 'unreachable']) $(`#${id}`).textContent = s.counts[id].toLocaleString();
 
       for (const k of s.keys) {
         const cell = keyCells.get(k.key); if (!cell) continue;
