@@ -42,6 +42,9 @@ def config() -> kinship.Config:
         bind=f"{address}:7946",
         seeds=[f"{seed}:7946" for seed in NAMES[:3]],
         meta=meta,
+        # The dashboard starts while the cache nodes still sleep, so its first join finds no
+        # seed. Retry every 5 s instead of the preset's 60 s; this also heals a partition sooner.
+        rejoin_interval=5.0,
         # Plaintext is only for this demo's isolated Docker network.
         insecure_plaintext=True,
     )

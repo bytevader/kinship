@@ -16,7 +16,9 @@ docker compose up --build -d
 
 Open <http://localhost:8080>. The cache nodes wait 15 seconds on every startup
 so crashes remain visible as DEAD before their automatic restart rejoins.
-Allow another few gossip rounds for six ALIVE cards and five owner colours.
+The dashboard starts at once and retries its seeds every 5 seconds
+(`rejoin_interval=5`), so six ALIVE cards and five owner colours appear a few
+seconds after the nodes finish waiting.
 Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
 Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
