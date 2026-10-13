@@ -52,6 +52,10 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
 - DEAD, LEFT and draining nodes own no keys. `ring.changes()` and `ring.moved()`
   drop values a node no longer owns. Draining also clears its own cache at once,
   since a node gets no membership event about its own metadata change.
+- A node that was paused or cut off keeps its values, but meanwhile its peers
+  suspected it or declared it dead and sent writes elsewhere. When it comes back
+  it refutes by raising its incarnation, and on seeing that it drops its whole
+  cache, so its returning keys read as misses rather than stale values.
 - Successes count successful GETs and PUTs. Misses are 404s from cold keys,
   including keys lost with an owner; errors are timeouts or failed requests.
   Initial warming can also fail if you inject a fault before it finishes.

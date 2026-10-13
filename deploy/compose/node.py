@@ -59,6 +59,7 @@ def create_app(name: str | None = None) -> FastAPI:
             httpx.AsyncClient(timeout=3.0, follow_redirects=False, trust_env=False) as http,
         ):
             app.state.http = http
+            app.state.incarnation = app.state.cluster.local.incarnation
             ring = Ring(app.state.cluster, where={"role": "cache"})
             # Subscribe before taking the snapshot, so no membership change is lost.
             changes = ring.changes()
@@ -76,6 +77,16 @@ def create_app(name: str | None = None) -> FastAPI:
     app.include_router(cluster_router())
     data: dict[str, str] = {}
     app.state.data = data
+
+    def owned_values(request: Request) -> dict[str, str]:
+        # A paused or partitioned node keeps its values, but while peers suspected it or
+        # declared it dead, writes went to other owners. It refuted that by raising its
+        # incarnation, so drop everything rather than serve values that may be stale.
+        incarnation = request.app.state.cluster.local.incarnation
+        if incarnation != app.state.incarnation:
+            data.clear()
+            app.state.incarnation = incarnation
+        return data
 
     async def route(request: Request, ring: Ring, key: str, *, new_work: bool):
         if not key or len(key.encode()) > MAX_KEY_BYTES:
@@ -120,10 +131,11 @@ def create_app(name: str | None = None) -> FastAPI:
         forwarded = await route(request, ring, key, new_work=True)
         if forwarded is not None:
             return forwarded
-        if key not in data and len(data) >= MAX_CACHE_KEYS:
+        values = owned_values(request)
+        if key not in values and len(values) >= MAX_CACHE_KEYS:
             # Bound memory while keeping the demo's 64 generated keys well within capacity.
-            data.pop(next(iter(data)))
-        data[key] = value
+            values.pop(next(iter(values)))
+        values[key] = value
         return {"key": key, "node": name}
 
     @app.get("/kv/{key:path}", response_model=None)
@@ -131,9 +143,10 @@ def create_app(name: str | None = None) -> FastAPI:
         forwarded = await route(request, ring, key, new_work=False)
         if forwarded is not None:
             return forwarded
-        if key not in data:
+        values = owned_values(request)
+        if key not in values:
             raise HTTPException(404, f"{key} is not cached on {name}")
-        return {"key": key, "value": data[key], "node": name}
+        return {"key": key, "value": values[key], "node": name}
 
     @app.post("/fault/stall")
     async def stall(seconds: Annotated[float, Query(ge=1, le=60)] = 20):

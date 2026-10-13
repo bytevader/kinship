@@ -96,6 +96,8 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"node": "node-2", "value": "forwarded"})
 
         self.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        self.app.state.cluster = SimpleNamespace(local=SimpleNamespace(incarnation=0))
+        self.app.state.incarnation = 0
 
     async def asyncTearDown(self):
         await self.client.aclose()
@@ -136,6 +138,16 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/kv/key-01", headers={HOP_HEADER: hops})
             self.assertEqual(response.status_code, 400)
         self.assertEqual(len(self.forwarded), 1)
+
+    async def test_refuting_a_suspicion_drops_values_that_may_be_stale(self):
+        await self.client.put("/kv/key-01", json="before the pause")
+        self.assertEqual((await self.client.get("/kv/key-01")).status_code, 200)
+        # Peers suspected this node and routed writes elsewhere; it refuted by raising its
+        # incarnation, so its old value must become a miss rather than a stale read.
+        self.app.state.cluster.local.incarnation = 1
+        self.assertEqual((await self.client.get("/kv/key-01")).status_code, 404)
+        await self.client.put("/kv/key-01", json="after")
+        self.assertEqual((await self.client.get("/kv/key-01")).json()["value"], "after")
 
     async def test_empty_ring_and_missing_value(self):
         self.assertEqual((await self.client.get("/kv/missing")).status_code, 404)
