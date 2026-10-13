@@ -1,0 +1,54 @@
+name: kinship-demo
+
+x-node: &node
+  build: .
+  image: kinship-compose-demo
+  init: true
+  stop_grace_period: 15s
+
+services:
+  node-1:
+    <<: *node
+    hostname: node-1
+    environment:
+      NODE_NAME: node-1
+      ROLE: seed
+      ZONE: zone-a
+  node-2:
+    <<: *node
+    hostname: node-2
+    environment:
+      NODE_NAME: node-2
+      ROLE: worker
+      ZONE: zone-a
+  node-3:
+    <<: *node
+    hostname: node-3
+    environment:
+      NODE_NAME: node-3
+      ROLE: worker
+      ZONE: zone-b
+  node-4:
+    <<: *node
+    hostname: node-4
+    environment:
+      NODE_NAME: node-4
+      ROLE: worker
+      ZONE: zone-b
+  node-5:
+    <<: *node
+    hostname: node-5
+    environment:
+      NODE_NAME: node-5
+      ROLE: worker
+      ZONE: zone-c
+  dashboard:
+    <<: *node
+    hostname: dashboard
+    environment:
+      NODE_NAME: dashboard
+      ROLE: dashboard
+      ZONE: zone-c
+    command: ["uvicorn", "demo:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
