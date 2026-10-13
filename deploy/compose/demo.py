@@ -91,7 +91,8 @@ class View:
             active = {
                 "node": name,
                 "action": reservation["action"],
-                "automatic": reservation["action"] in {"stall", "crash", "kill"}
+                # Docker treats a kill as a manual stop, so on-failure doesn't restart it.
+                "automatic": reservation["action"] in {"stall", "crash"}
                 or reservation.get("phase") == "recovering",
             }
         return json.dumps(
