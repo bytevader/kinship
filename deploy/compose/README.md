@@ -118,6 +118,10 @@ actions and `node-1` through `node-5`, checks Compose container/network labels,
 and uses the Docker HTTP API without passing input to a shell. It is not a
 security boundary against a compromised helper or dashboard. Do not publish
 the dashboard remotely or attach the helper to a production Docker daemon.
+Because a loopback port is still reachable from any page open in your browser,
+the dashboard only answers the `Host` names `localhost` and `127.0.0.1`
+(against DNS rebinding) and refuses a control request whose `Origin` is
+another site.
 
 Membership uses `insecure_plaintext=True`, with a comment in `common.py`,
 only for the isolated demo membership network. No `.env` key is required.

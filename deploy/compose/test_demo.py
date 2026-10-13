@@ -5,7 +5,8 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from demo import View, member_record, stream
+import httpx
+from demo import View, app, member_record, stream
 
 import kinship
 
@@ -117,6 +118,28 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await iterator.aclose()
         self.assertEqual(len(view.clients), 0)
+
+
+class ControlOriginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_other_sites_and_rebound_hosts_cannot_drive_faults(self):
+        # Every request here is refused before a handler, so the app needs no lifespan.
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8080") as http:
+            response = await http.post(
+                "/control/fault/node-3/kill", headers={"origin": "https://example.com"}
+            )
+            self.assertEqual(response.status_code, 403)
+            response = await http.post("/control/fault/node-3/kill", headers={"origin": "null"})
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual((await http.get("/")).status_code, 200)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rebound.test:8080"
+        ) as http:
+            self.assertEqual((await http.get("/")).status_code, 400)
+            response = await http.post(
+                "/control/fault/node-3/kill", headers={"origin": "http://rebound.test:8080"}
+            )
+            self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":

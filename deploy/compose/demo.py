@@ -11,13 +11,15 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from common import KEYS, NAMES, URLS, config
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from faults import FAULT_ACTIONS, ChaosScheduler, FaultController
 from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import kinship
 from kinship.contrib.fastapi import cluster_lifespan, cluster_router
@@ -266,7 +268,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# A DNS-rebinding page reaches 127.0.0.1:8080 under its own host name; refuse it.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 app.include_router(cluster_router())
+
+
+@app.middleware("http")
+async def same_origin_controls(request: Request, call_next):
+    # The controls need no body or secret, so any page open in the browser could POST a
+    # plain form to them. Browsers send Origin on every POST; refuse other sites.
+    origin = request.headers.get("origin")
+    if (
+        request.method != "GET"
+        and origin is not None
+        and urlsplit(origin).netloc != request.headers.get("host")
+    ):
+        return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
