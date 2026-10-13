@@ -6,6 +6,7 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ### Added
 
+- **Compose cache demo.** `deploy/compose/`: a source-built FastAPI cache cluster, live key ownership and membership dashboard, load generator, and opt-in Docker fault controls with timer recovery.
 - **`kinship.ring`.** `Ring(cluster, where=...)` keeps rendezvous ownership in step with membership, over the members whose metadata matches `where` or a predicate, on `kinship.Cluster` and `kinship.blocking.Cluster`: `owner()`, `replicas()`, `members()`, and `moved()` for the keys that changed owner between two snapshots. Suspect members keep their keys; `new_work=True` skips them for routing new requests. `changes()` yields `RingChanged(added, removed, suspect, recovered, members)` from the cluster's events, including metadata updates that flip a `where` match, and resyncs after `EventsLost`.
 - **FastAPI integration.** `kinship.contrib.fastapi`, behind the `kinship[fastapi]` extra: `cluster_lifespan()` runs a cluster for the app's lifetime on `app.state.cluster` and leaves on shutdown, `get_cluster` and `get_ring(where=...)` are dependencies, and `cluster_router()` serves `GET /members` and `GET /stats`. The core package gains no dependency.
 - **Example.** `examples/fastapi_app.py`: a sharded cache as three FastAPI apps in one process, driven through httpx's ASGI transport.

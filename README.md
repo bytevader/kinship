@@ -354,6 +354,7 @@ Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/e
 | [`failover_job.py`](https://github.com/bytevader/kinship/blob/main/examples/failover_job.py) | A job that runs on exactly one node and moves on its own when that node dies |
 | [`sync_workers.py`](https://github.com/bytevader/kinship/blob/main/examples/sync_workers.py) | The blocking API and metadata: routing around a node that marks itself as draining |
 | [`fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) | A sharded cache as three FastAPI apps: `cluster_lifespan`, `get_ring`, redirects to a key's owner, and the keys that move when a node leaves |
+| [`deploy/compose/`](https://github.com/bytevader/kinship/tree/main/deploy/compose) | Five FastAPI cache nodes and a live dashboard: key ownership, load, stalls, crashes, draining and opt-in Docker partitions |
 
 ```bash
 python examples/sharded_keys.py

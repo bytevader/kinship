@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kinship · Compose demo</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cpath d='M256 103L421.7 310.8 182.2 426.2 123.1 167 388.9 167 329.8 426.2 90.3 310.8Z' fill='none' stroke='%2360a5fa' stroke-width='22'/%3E%3Ccircle cx='256' cy='103' r='48' fill='%23f97316'/%3E%3Ccircle cx='388.9' cy='167' r='44' fill='%233b82f6'/%3E%3Ccircle cx='421.7' cy='310.8' r='44' fill='%236366f1'/%3E%3Ccircle cx='329.8' cy='426.2' r='44' fill='%237c3aed'/%3E%3Ccircle cx='182.2' cy='426.2' r='44' fill='%233b82f6'/%3E%3Ccircle cx='90.3' cy='310.8' r='44' fill='%2314b8a6'/%3E%3Ccircle cx='123.1' cy='167' r='44' fill='%2314b8a6'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0f1c; --panel: #111827; --panel-2: #0d1424; --line: #1f2a40; --line-2: #2b3956;
+      --text: #e6ecf5; --muted: #8a99b4; --faint: #5b6984;
+      --teal: #2dd4bf; --blue: #3b82f6; --violet: #8b5cf6;
+      --alive: #34d399; --suspect: #fbbf24; --dead: #f43f5e; --left: #94a3b8;
+      --radius: 12px;
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      background:
+        radial-gradient(900px 380px at 12% -120px, rgb(45 212 191 / .10), transparent 70%),
+        radial-gradient(800px 360px at 88% -140px, rgb(139 92 246 / .12), transparent 70%),
+        var(--bg);
+    }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px 48px; }
+    button, input { font: inherit; color: inherit; }
+    button {
+      cursor: pointer; border: 1px solid var(--line-2); background: #172036; border-radius: 8px;
+      padding: 6px 12px; transition: background .15s, border-color .15s, opacity .15s, transform .1s;
+    }
+    button:hover:not(:disabled) { background: #1e2a46; border-color: #3d4f75; }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+    [hidden] { display: none !important; }
+
+    /* Header */
+    header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 20px; padding: 22px 0 18px; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-right: auto; }
+    .brand svg { width: 40px; height: 40px; flex: none; }
+    .brand h1 {
+      margin: 0; font-size: 26px; font-weight: 650; letter-spacing: -.03em; line-height: 1;
+      background: linear-gradient(90deg, var(--teal), #93c5fd 70%, #a5b4fc); -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .brand small { display: block; margin-top: 4px; color: var(--muted); font-size: 12.5px; letter-spacing: .01em; }
+    .spin { transform-origin: 256px 103px; animation: spin 14s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .toggle { display: inline-flex; align-items: center; gap: 8px; }
+    .toggle::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); transition: background .2s, box-shadow .2s; }
+    .toggle.on { border-color: rgb(45 212 191 / .55); background: rgb(45 212 191 / .10); }
+    .toggle.on::before { background: var(--teal); box-shadow: 0 0 0 4px rgb(45 212 191 / .18); }
+    .toggle.chaos.on { border-color: rgb(251 146 60 / .6); background: rgb(251 146 60 / .10); }
+    .toggle.chaos.on::before { background: #fb923c; box-shadow: 0 0 0 4px rgb(251 146 60 / .2); }
+    .interval { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
+    .interval input { width: 54px; padding: 5px 6px; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; text-align: right; }
+    .pill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 99px; border: 1px solid var(--line-2); color: var(--muted); font-size: 12.5px; }
+    .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+    .pill.live i { background: var(--alive); animation: beat 2s ease-in-out infinite; }
+    @keyframes beat { 50% { box-shadow: 0 0 0 5px rgb(52 211 153 / 0); } 0% { box-shadow: 0 0 0 0 rgb(52 211 153 / .5); } }
+
+    /* Hint */
+    .hint {
+      display: flex; gap: 12px; align-items: flex-start; padding: 12px 16px; margin-bottom: 18px;
+      border: 1px solid var(--line); border-left: 3px solid var(--blue); border-radius: 10px; background: rgb(17 24 39 / .7);
+      animation: rise .35s ease-out;
+    }
+    .hint.fault { border-left-color: #fb923c; }
+    .hint b { white-space: nowrap; color: #93c5fd; font-weight: 600; }
+    .hint.fault b { color: #fdba74; }
+    .hint span { color: #cbd5e1; }
+    @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+
+    /* Section headings */
+    h2 { display: flex; align-items: baseline; gap: 10px; margin: 28px 0 12px; font-size: 15px; font-weight: 600; letter-spacing: .01em; }
+    h2 small { color: var(--faint); font-size: 12.5px; font-weight: 400; }
+
+    /* Nodes */
+    #nodes { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .node {
+      position: relative; display: flex; flex-direction: column; gap: 10px; padding: 14px; overflow: hidden;
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+      transition: border-color .3s, opacity .3s, filter .3s;
+    }
+    .node::before { content: ''; position: absolute; inset: 0 0 auto; height: 3px; background: var(--owner); }
+    .node.SUSPECT { border-color: rgb(251 191 36 / .55); }
+    .node.DEAD { border-color: rgb(244 63 94 / .5); filter: saturate(.55); }
+    .node.LEFT { opacity: .6; filter: saturate(.4); }
+    .node.faulted { box-shadow: 0 0 0 1px rgb(251 146 60 / .35), 0 8px 30px -12px rgb(251 146 60 / .45); }
+    .node-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .node-name { font-weight: 650; font-size: 15px; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--state, var(--faint)); }
+    .badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .ALIVE { --state: var(--alive); } .SUSPECT { --state: var(--suspect); } .DEAD { --state: var(--dead); } .LEFT { --state: var(--left); }
+    .SUSPECT .badge::before { animation: blink .8s ease-in-out infinite alternate; }
+    @keyframes blink { to { opacity: .2; } }
+    .meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, "Cascadia Code", monospace; }
+    .meta .draining { color: var(--suspect); }
+    .share { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+    .share-row { display: flex; justify-content: space-between; }
+    .share-row strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .bar { height: 5px; border-radius: 3px; background: #1a2440; overflow: hidden; }
+    .bar i { display: block; height: 100%; width: 0; background: var(--owner); border-radius: 3px; transition: width .6s cubic-bezier(.2, .8, .2, 1); }
+    .view { font-size: 12px; color: var(--muted); }
+    .view.stale { color: var(--dead); }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+    .actions::before { content: attr(data-label); grid-column: 1 / -1; color: var(--faint); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; }
+    .actions button { padding: 5px 6px; font-size: 12px; border-radius: 7px; }
+    .actions.docker { padding-top: 8px; border-top: 1px dashed var(--line-2); }
+    .actions.recover button { border-color: rgb(52 211 153 / .45); color: #a7f3d0; background: rgb(52 211 153 / .08); }
+    .actions.recover button.primary { background: rgb(52 211 153 / .2); border-color: var(--alive); color: #ecfdf5; animation: nudge 1.6s ease-in-out infinite; }
+    @keyframes nudge { 50% { box-shadow: 0 0 0 4px rgb(52 211 153 / .15); } }
+    .feedback { min-height: 18px; font-size: 12px; color: var(--muted); }
+
+    /* Stats */
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .stat { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+    .stat strong { display: block; font-size: 24px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .stat.ok strong { color: var(--alive); } .stat.miss strong { color: var(--suspect); } .stat.err strong { color: var(--dead); }
+
+    /* Keys */
+    .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend i { width: 10px; height: 10px; border-radius: 3px; background: var(--c); }
+    .legend .susp { width: 10px; height: 10px; border: 1.5px dashed var(--suspect); border-radius: 3px; background: none; }
+    #keys { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 5px; }
+    .key {
+      position: relative; aspect-ratio: 1.25; display: grid; place-items: center; border-radius: 7px;
+      background: color-mix(in srgb, var(--owner, #334155) 78%, #0a0f1c); color: #0a0f1c;
+      font: 600 10.5px ui-monospace, "Cascadia Code", monospace; cursor: default;
+      transition: background-color .7s ease, opacity .3s;
+    }
+    .key.none { --owner: #1e293b; color: var(--faint); }
+    .key.suspect { outline: 2px dashed var(--suspect); outline-offset: -2px; }
+    .key.moved { animation: moved 1.4s ease-out; }
+    @keyframes moved { 0% { transform: scale(1.18); box-shadow: 0 0 0 3px #fff, 0 0 18px 4px var(--owner); } 100% { transform: none; box-shadow: none; } }
+    .note { margin: 10px 0 0; color: var(--faint); font-size: 12px; }
+
+    /* Log */
+    #log { max-height: 340px; overflow-y: auto; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); }
+    .entry { display: grid; grid-template-columns: 74px 128px 1fr; gap: 10px; padding: 6px 14px; border-bottom: 1px solid rgb(31 42 64 / .6); font-size: 12.5px; }
+    .entry:first-child { animation: rise .3s ease-out; }
+    .entry time { color: var(--faint); font: 12px ui-monospace, monospace; }
+    .entry .kind { font-weight: 600; color: #cbd5e1; }
+    .entry.membership .kind { color: #93c5fd; }
+    .entry.ring .kind { color: #c4b5fd; }
+    .entry.fault .kind { color: #fdba74; }
+    .entry .detail { color: var(--muted); overflow-wrap: anywhere; }
+    .empty { padding: 18px; color: var(--faint); text-align: center; }
+    footer { margin-top: 28px; color: var(--faint); font-size: 12px; }
+    code { font: 12px ui-monospace, monospace; color: #cbd5e1; }
+
+    @media (max-width: 1100px) { #nodes { grid-template-columns: repeat(3, minmax(0, 1fr)); } #keys { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+    @media (max-width: 720px) {
+      .wrap { padding: 0 16px 40px; }
+      #nodes { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .entry { grid-template-columns: 64px 1fr; } .entry .detail { grid-column: 1 / -1; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <svg viewBox="0 0 512 512" aria-hidden="true">
+          <defs>
+            <linearGradient id="n" x1="60" y1="60" x2="452" y2="452" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#14b8a6"/><stop offset=".55" stop-color="#3b82f6"/><stop offset="1" stop-color="#7c3aed"/></linearGradient>
+            <linearGradient id="l" x1="60" y1="60" x2="452" y2="452" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2dd4bf"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient>
+            <linearGradient id="h" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fb923c"/><stop offset="1" stop-color="#f43f5e"/></linearGradient>
+          </defs>
+          <path d="M256 103L388.9 167 421.7 310.8 329.8 426.2 182.2 426.2 90.3 310.8 123.1 167Z" fill="none" stroke="url(#l)" stroke-width="18" stroke-linejoin="round" opacity=".4"/>
+          <path d="M256 103L421.7 310.8 182.2 426.2 123.1 167 388.9 167 329.8 426.2 90.3 310.8Z" fill="none" stroke="url(#l)" stroke-width="12" stroke-linejoin="round" opacity=".75"/>
+          <circle class="spin" cx="256" cy="103" r="56" fill="none" stroke="url(#h)" stroke-width="8" stroke-dasharray="13 10" opacity=".8"/>
+          <circle cx="256" cy="103" r="40" fill="url(#h)"/>
+          <circle cx="388.9" cy="167" r="38" fill="url(#n)"/><circle cx="421.7" cy="310.8" r="38" fill="url(#n)"/>
+          <circle cx="329.8" cy="426.2" r="38" fill="url(#n)"/><circle cx="182.2" cy="426.2" r="38" fill="url(#n)"/>
+          <circle cx="90.3" cy="310.8" r="38" fill="url(#n)"/><circle cx="123.1" cy="167" r="38" fill="url(#n)"/>
+        </svg>
+        <div><h1>kinship</h1><small>Compose demo · five cache nodes, 64 keys</small></div>
+      </div>
+      <div class="controls">
+        <button id="load" class="toggle" title="Write all 64 keys once, then read random keys through random nodes">Load</button>
+        <button id="chaos" class="toggle chaos" title="Apply one random fault every interval and recover it on a timer">Random chaos</button>
+        <label class="interval" title="Seconds between random faults">every <input id="interval" type="number" min="5" max="300" value="20" aria-label="Chaos interval in seconds"> s</label>
+        <span id="connection" class="pill" role="status"><i></i><span>Connecting</span></span>
+      </div>
+    </header>
+
+    <div id="hint" class="hint" role="status"><b>Tip</b><span>Connecting to the dashboard…</span></div>
+
+    <h2>Nodes <small id="nodes-note">each card shows that node's own view of the cluster</small></h2>
+    <section id="nodes" aria-label="Cache nodes"></section>
+
+    <div class="stats">
+      <div class="stat ok"><strong id="successes">0</strong><span>successful reads and writes</span></div>
+      <div class="stat miss"><strong id="misses">0</strong><span>misses: the key's value was lost with its owner</span></div>
+      <div class="stat err"><strong id="errors">0</strong><span>errors: the key's owner didn't answer</span></div>
+      <div class="stat err"><strong id="unreachable">0</strong><span>unreachable: the node asked didn't answer</span></div>
+      <div class="stat"><strong id="dashboard-view">–</strong><span id="dashboard-note">members the dashboard sees</span></div>
+    </div>
+
+    <h2>Key ownership <small>rendezvous hashing over the ALIVE and SUSPECT cache nodes</small></h2>
+    <div id="legend" class="legend"></div>
+    <section id="keys" aria-label="64 keys coloured by owner"></section>
+    <p class="note">A key flashes when its owner changes. A dashed outline means its owner is SUSPECT: reads still go there, new writes go to the next node. Values are not replicated, so a moved key starts empty.</p>
+
+    <h2>Event log <small>newest first · membership, ring and fault events</small></h2>
+    <section id="log" aria-label="Event log"><div class="empty">No events yet.</div></section>
+
+    <footer>Plain JavaScript over Server-Sent Events from <code>/events</code>. Raw membership: <code>/cluster/members</code> and <code>/cluster/stats</code>.</footer>
+  </div>
+
+  <script>
+    const NAMES = ['node-1', 'node-2', 'node-3', 'node-4', 'node-5'];
+    const COLOURS = { 'node-1': '#22d3ee', 'node-2': '#60a5fa', 'node-3': '#a78bfa', 'node-4': '#f472b6', 'node-5': '#a3e635' };
+    const FAULTS = [
+      ['stall', 'Stall', 'Block its event loop for 20 s. kinship keeps running on its own thread, so it stays ALIVE'],
+      ['crash', 'Crash', 'Exit without leaving. Peers suspect it, declare it DEAD, and Docker restarts it'],
+      ['leave', 'Leave', 'Leave the cluster gracefully and exit. Peers mark it LEFT at once'],
+      ['drain', 'Drain', 'Set role=draining: still ALIVE, but its keys move to the other cache nodes'],
+    ];
+    const DOCKER_FAULTS = [
+      ['pause', 'Pause', 'Freeze the whole container, kinship included, so it stops answering probes'],
+      ['kill', 'Kill', 'SIGKILL the container. Docker leaves it stopped until you press Start'],
+      ['restart', 'Restart', 'Stop it cleanly (it leaves) and start it again'],
+      ['disconnect', 'Partition', 'Cut it off the network: each side declares the other dead'],
+    ];
+    const RECOVERY = { drain: 'undrain', pause: 'unpause', kill: 'start', leave: 'start', crash: 'start', disconnect: 'connect' };
+    const KINDS = {
+      fault: 'Fault', fault_applied: 'Fault applied', fault_error: 'Fault failed', FaultError: 'Fault failed',
+      recovery: 'Recovery', recovery_error: 'Recovery failed', Load: 'Load', Chaos: 'Chaos',
+    };
+    const RECOVER_LABELS ={ undrain: 'Undrain', unpause: 'Unpause', start: 'Start', connect: 'Reconnect' };
+    const CHAOS_RECOVERS = 'Random chaos recovers it on a timer.';
+    const HINTS = {
+      stall: (n, manual) => `${n}'s event loop is blocked for 20 seconds, so its HTTP calls time out. Its card stays ALIVE: kinship answers probes from its own thread, and a slow app is not a dead node.`,
+      crash: (n, manual) => `${n} exited without leaving. Watch it turn SUSPECT, then DEAD, while its keys take on other colours. Docker restarts it after a 15-second startup delay and it rejoins.`,
+      leave: (n, manual) => `${n} left gracefully, so peers marked it LEFT at once, with no suspicion. ${manual ? `Press Start to bring it back, or run docker compose start ${n}.` : CHAOS_RECOVERS}`,
+      drain: (n, manual) => `${n} is still ALIVE but no longer role=cache, so the ring handed its keys to the others without anyone failing. ${manual ? 'Press Undrain to take them back.' : CHAOS_RECOVERS}`,
+      pause: (n, manual) => `Docker froze ${n}, kinship included. Its keys get a dashed outline while it is SUSPECT, then move when it is DEAD. ${manual ? 'Press Unpause: it' : 'When it is unpaused it'} refutes, rejoins, and drops values that may be stale.`,
+      kill: (n, manual) => `${n} got SIGKILL. Docker treats that as a manual stop, so it stays down. ${manual ? 'Press Start.' : CHAOS_RECOVERS}`,
+      restart: (n, manual) => `${n} stopped cleanly (LEFT) and is starting again; it rejoins after its 15-second startup delay.`,
+      disconnect: (n, manual) => `${n} is cut off. Its peers declare it DEAD and it declares all of them DEAD. ${manual ? 'Press Reconnect' : 'When it is reconnected,'} watch both sides merge again.`,
+    };
+
+    const $ = s => document.querySelector(s);
+    const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+    const nodeViews = new Map(), keyCells = new Map(), seenMove = new Map();
+    let state = null, busy = null;
+
+    async function post(path, body) {
+      const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : `Request failed (${response.status})`);
+      return result;
+    }
+
+    async function act(name, action, feedback) {
+      busy = `${name}/${action}`; render();
+      feedback.textContent = `${action}…`;
+      try { await post(`/control/fault/${name}/${action}`); feedback.textContent = ''; }
+      catch (error) { feedback.textContent = error.message; }
+      finally { busy = null; render(); }
+    }
+
+    function button(name, action, label, title, feedback) {
+      const b = el('button', '', label); b.title = title; b.dataset.action = action;
+      b.setAttribute('aria-label', `${label} ${name}`);
+      b.onclick = () => act(name, action, feedback);
+      return b;
+    }
+
+    for (const name of NAMES) {
+      const card = el('article', 'node'); card.style.setProperty('--owner', COLOURS[name]);
+      const head = el('div', 'node-head'); const badge = el('span', 'badge', 'WAITING');
+      head.append(el('span', 'node-name', name), badge);
+      const meta = el('div', 'meta', '…');
+      const share = el('div', 'share'); const row = el('div', 'share-row'); const keys = el('strong', '', '0');
+      const label = el('span', '', 'keys owned'); row.append(label, keys);
+      const bar = el('div', 'bar'); const fill = el('i'); bar.append(fill); share.append(row, bar);
+      const view = el('div', 'view', 'Waiting for its view…');
+      const feedback = el('div', 'feedback');
+      const faults = el('div', 'actions'); faults.dataset.label = 'In the app'; for (const [a, l, t] of FAULTS) faults.append(button(name, a, l, t, feedback));
+      const docker = el('div', 'actions docker'); docker.dataset.label = 'Docker'; for (const [a, l, t] of DOCKER_FAULTS) docker.append(button(name, a, l, t, feedback));
+      const recover = el('div', 'actions recover'); recover.dataset.label = 'Recover';
+      for (const a of ['undrain', 'unpause', 'start', 'connect']) recover.append(button(name, a, RECOVER_LABELS[a], `Recover ${name}: ${RECOVER_LABELS[a].toLowerCase()}`, feedback));
+      card.append(head, meta, share, view, recover, faults, docker, feedback);
+      $('#nodes').append(card);
+      nodeViews.set(name, { card, badge, meta, keys, fill, view, faults, docker, recover });
+    }
+    for (const name of NAMES) {
+      const item = el('span', '', name); const swatch = el('i'); swatch.style.setProperty('--c', COLOURS[name]);
+      item.prepend(swatch); $('#legend').append(item);
+    }
+    const suspectLegend = el('span', '', 'owner SUSPECT'); suspectLegend.prepend(el('i', 'susp')); $('#legend').append(suspectLegend);
+    for (let i = 0; i < 64; i++) {
+      const key = `key-${String(i).padStart(2, '0')}`; const cell = el('div', 'key none', String(i).padStart(2, '0'));
+      $('#keys').append(cell); keyCells.set(key, cell);
+    }
+
+    $('#load').onclick = async () => { try { await post('/control/load', { enabled: !state?.load_enabled }); } catch (e) { setHint('Load', e.message, true); } };
+    $('#chaos').onclick = async () => { try { await post('/control/chaos', { enabled: !state?.chaos_enabled, interval: Number($('#interval').value) }); } catch (e) { setHint('Chaos', e.message, true); } };
+
+    function setHint(title, text, fault) {
+      const hint = $('#hint'); const key = title + text;
+      if (hint.dataset.key === key) return;
+      hint.dataset.key = key; hint.classList.toggle('fault', !!fault);
+      hint.replaceChildren(el('b', '', title), el('span', '', text));
+      hint.style.animation = 'none'; void hint.offsetWidth; hint.style.animation = '';
+    }
+
+    function hint(s, members) {
+      const cache = members.filter(m => NAMES.includes(m.name) && m.state === 'ALIVE').length;
+      const fault = s.active_fault;
+      if (fault && HINTS[fault.action]) return setHint(`${fault.automatic ? 'Watch' : 'Your move'}`, HINTS[fault.action](fault.node, !fault.automatic), true);
+      if (fault) return setHint('Recovering', `${fault.node}: ${fault.action} applied. The fault slot frees once it reports itself ALIVE again.`, true);
+      if (cache < NAMES.length && !s.chaos_enabled) return setHint('Starting', 'Cache nodes sleep 15 seconds on start, then gossip finds them. Cards turn green as they join.');
+      if (!s.load_enabled) return setHint('Tip', 'Turn on Load: it writes all 64 keys, then reads random keys through random nodes, which forward to the owner.');
+      if (!s.primed) return setHint('Warming', 'Writing all 64 keys once…');
+      if (s.chaos_enabled) return setHint('Chaos', `One random fault every ${s.chaos_interval ?? $('#interval').value} seconds, recovered on a timer. Read the event log top-down to see cause and effect.`);
+      if (!s.docker_enabled) return setHint('Try a fault', 'Crash a node and watch its keys move. Pause, Kill and Partition need the chaos profile: docker compose --profile chaos up --build.');
+      return setHint('Try a fault', 'Crash or Partition a node and watch its keys move; Stall one to see what kinship does not mistake for a failure.');
+    }
+
+    function render() {
+      const s = state; if (!s) return;
+      const members = new Map(s.members.map(m => [m.name, m]));
+      const owned = Object.fromEntries(NAMES.map(n => [n, 0]));
+      for (const k of s.keys) if (k.owner in owned) owned[k.owner]++;
+      const locked = !!(s.active_fault || s.chaos_enabled || busy);
+
+      $('#load').classList.toggle('on', s.load_enabled);
+      $('#load').textContent = s.load_enabled ? 'Load on' : 'Load';
+      $('#chaos').classList.toggle('on', s.chaos_enabled);
+      $('#chaos').textContent = s.chaos_enabled ? 'Chaos on' : 'Random chaos';
+      $('#interval').disabled = s.chaos_enabled;
+
+      for (const name of NAMES) {
+        const v = nodeViews.get(name), m = members.get(name), count = s.member_counts[name];
+        const st = m ? m.state : 'WAITING', role = m?.meta?.role;
+        const faulted = s.active_fault?.node === name;
+        v.card.className = `node ${st}${faulted ? ' faulted' : ''}`;
+        v.badge.textContent = st;
+        v.meta.replaceChildren(document.createTextNode(m ? `${m.meta.zone ?? ''} · ${m.addr.split(':')[0]}` : 'not seen yet'));
+        if (role && role !== 'cache') v.meta.append(document.createTextNode(' · '), el('span', 'draining', role));
+        v.keys.textContent = owned[name];
+        // A full bar is twice a fair share (64 / 5 keys), so an even split sits near half.
+        v.fill.style.width = `${Math.min(100, (owned[name] / 25.6) * 100)}%`;
+        v.view.className = count && !count.reachable ? 'view stale' : 'view';
+        v.view.textContent = !count ? 'Waiting for its view…' : count.reachable ? `Sees ${count.count} members` : `HTTP unreachable · last saw ${count.count ?? '?'}`;
+
+        const unhealthy = st !== 'ALIVE' || role !== 'cache' || (count && !count.reachable);
+        // A fault that recovers by itself (a crash, a stall, or one random chaos owns) needs no button.
+        const wanted = faulted && !s.active_fault.automatic ? RECOVERY[s.active_fault.action] : null;
+        let shown = 0;
+        for (const b of v.recover.children) {
+          const a = b.dataset.action;
+          // With a known fault, offer its own recovery; otherwise every Docker recovery that could apply.
+          const fits = a === 'undrain'
+            ? role === 'draining' && !(faulted && s.active_fault.automatic)
+            : s.docker_enabled && !faulted && unhealthy;
+          b.hidden = !(fits || a === wanted); shown += !b.hidden;
+          b.classList.toggle('primary', a === wanted);
+          b.disabled = busy !== null;
+        }
+        v.recover.hidden = shown === 0;
+        v.docker.hidden = !s.docker_enabled;
+        for (const b of [...v.faults.children, ...v.docker.children]) {
+          b.disabled = locked;
+          b.title = locked && !busy ? (s.chaos_enabled ? 'Stop random chaos first' : 'Recover the current fault first') : [...FAULTS, ...DOCKER_FAULTS].find(f => f[0] === b.dataset.action)[2];
+        }
+      }
+
+      const dash = s.member_counts.dashboard;
+      $('#dashboard-view').textContent = dash ? dash.count : '–';
+      for (const id of ['successes', 'misses', 'errors', 'unreachable']) $(`#${id}`).textContent = s.counts[id].toLocaleString();
+
+      for (const k of s.keys) {
+        const cell = keyCells.get(k.key); if (!cell) continue;
+        cell.classList.toggle('none', !k.owner);
+        cell.style.setProperty('--owner', COLOURS[k.owner] || '#1e293b');
+        cell.classList.toggle('suspect', k.state === 'SUSPECT');
+        cell.title = `${k.key}: owner ${k.owner || 'none'}${k.state === 'SUSPECT' ? ' (SUSPECT)' : ''}; new writes go to ${k.write_owner || 'nobody'}`;
+        if (k.moved_at > (seenMove.get(k.key) || 0)) {
+          if (seenMove.has(k.key)) { cell.classList.remove('moved'); void cell.offsetWidth; cell.classList.add('moved'); }
+          seenMove.set(k.key, k.moved_at);
+        } else if (!seenMove.has(k.key)) seenMove.set(k.key, k.moved_at);
+      }
+
+      const log = $('#log'), atTop = log.scrollTop < 8;
+      const entries = s.log.slice().reverse().map(e => {
+        const row = el('div', `entry ${e.style}`); const t = el('time', '', new Date(e.time).toLocaleTimeString());
+        t.dateTime = e.time; t.title = e.time;
+        row.append(t, el('span', 'kind', KINDS[e.kind] || e.kind), el('span', 'detail', e.detail)); return row;
+      });
+      if (entries.length && log.dataset.top !== s.log.at(-1).time + s.log.length) {
+        log.dataset.top = s.log.at(-1).time + s.log.length;
+        log.replaceChildren(...entries); if (atTop) log.scrollTop = 0;
+      }
+      hint(s, s.members);
+    }
+
+    const source = new EventSource('/events');
+    const pill = $('#connection');
+    source.onopen = () => { pill.className = 'pill live'; pill.lastChild.textContent = 'Live'; };
+    source.onerror = () => { pill.className = 'pill'; pill.lastChild.textContent = 'Reconnecting'; };
+    source.onmessage = ({ data }) => { state = JSON.parse(data); pill.className = 'pill live'; pill.lastChild.textContent = 'Live'; render(); };
+  </script>
+</body>
+</html>
