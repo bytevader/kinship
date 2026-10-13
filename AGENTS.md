@@ -4,7 +4,7 @@
 
 ## Status
 
-0.1.0 shipped on 2026-10-12. 0.1.1 is ready to release: versions are 0.1.1 and `CHANGELOG.md` dates it 2026-10-13. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
+0.1.0 shipped on 2026-10-12 and 0.1.1 on 2026-10-13. 0.2.0, which adds `kinship.ring` and `kinship.contrib.fastapi`, is ready to release: versions are 0.2.0 and `CHANGELOG.md` dates it 2026-10-13. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
 
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.

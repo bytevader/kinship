@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG KINSHIP_INSTALL=source
+ARG KINSHIP_INSTALL=pypi
 FROM rust:1.85.1-slim-bookworm AS rust
 
 FROM python:3.13-slim AS builder
@@ -26,7 +26,7 @@ COPY --from=builder /wheels /wheels
 RUN for wheel in /wheels/*.whl; do pip install --no-cache-dir "${wheel}[fastapi]"; done \
     && rm -rf /wheels
 
-# After ring and the FastAPI extra ship in 0.2: --build-arg KINSHIP_INSTALL=pypi.
+# The default: the published package. --build-arg KINSHIP_INSTALL=source builds this checkout.
 FROM runtime AS pypi
 RUN pip install --no-cache-dir 'kinship[fastapi]>=0.2'
 

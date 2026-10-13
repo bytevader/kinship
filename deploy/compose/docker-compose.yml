@@ -5,7 +5,7 @@ x-node: &node
     context: ../..
     dockerfile: deploy/compose/Dockerfile
     args:
-      KINSHIP_INSTALL: ${KINSHIP_INSTALL:-source}
+      KINSHIP_INSTALL: ${KINSHIP_INSTALL:-pypi}
   image: kinship-compose-demo
   init: true
   restart: on-failure

@@ -4,6 +4,8 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-13
+
 ### Added
 
 - **Compose cache demo.** `deploy/compose/`: a source-built FastAPI cache cluster, live key ownership and membership dashboard, load generator, and opt-in Docker fault controls with timer recovery.
@@ -67,6 +69,7 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
-[Unreleased]: https://github.com/bytevader/kinship/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/bytevader/kinship/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bytevader/kinship/releases/tag/v0.2.0
 [0.1.1]: https://github.com/bytevader/kinship/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bytevader/kinship/releases/tag/v0.1.0
