@@ -97,10 +97,14 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.now = 31
         await self.scheduler.tick()
         self.assertEqual(self.calls, ["/fault/drain", "/fault/undrain"])
-        self.fail_readiness = False
         self.now = 32
         await self.scheduler.tick()
+        self.fail_readiness = False
+        self.now = 34
+        await self.scheduler.tick()
         self.assertIsNone(self.scheduler.active)
+        # Retries poll readiness without applying the recovery again.
+        self.assertEqual(self.calls, ["/fault/drain", "/fault/undrain"])
 
 
 class DockerTests(unittest.IsolatedAsyncioTestCase):

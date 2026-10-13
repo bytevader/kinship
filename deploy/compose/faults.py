@@ -81,6 +81,8 @@ class FaultController:
             await self._request(node, "stall")
         except (httpx.HTTPError, ValueError) as exc:
             self.log("fault_error", f"{node} stall: {exc}")
+        else:
+            self.log("recovery", f"{node}: stall finished")
         finally:
             self.release(node, generation)
 
@@ -174,7 +176,10 @@ class ChaosScheduler:
         recovery = RECOVERY.get(active["action"])
         try:
             if recovery:
-                await self.controller.apply(active["node"], recovery)
+                # Apply the recovery once; later retries only wait for the API to be ready.
+                if not active.get("recovery_applied"):
+                    await self.controller.apply(active["node"], recovery)
+                    active["recovery_applied"] = True
                 response = await self.controller.http.get(
                     f"http://{active['node']}:8000/cluster/members", timeout=1
                 )
@@ -185,10 +190,16 @@ class ChaosScheduler:
             elif active["node"] in self.controller.unavailable_nodes:
                 return  # Stall's background request has not completed yet.
         except (httpx.HTTPError, ValueError) as exc:
-            self.controller.log("recovery_error", f"{active['node']}: {exc}; will retry")
+            if not active.get("recovery_applied"):
+                self.controller.log("recovery_error", f"{active['node']}: {exc}; will retry")
+            elif not active.get("waiting_logged"):
+                # A started worker sleeps before it serves HTTP; say so once, not every retry.
+                active["waiting_logged"] = True
+                self.controller.log("recovery", f"{active['node']}: waiting for its API")
             active["recover_at"] = self.clock() + 2
             return
-        self.controller.log("recovery", f"{active['node']}: {recovery or 'stall complete'}")
+        if recovery:  # The controller logs a stall's end itself.
+            self.controller.log("recovery", f"{active['node']}: {recovery}")
         self.active = None
         # Preserve the interval from fault application, while recovery still
         # prevents another fault from starting before the slot is clear.
