@@ -245,6 +245,20 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             controller.mark_reachable("node-1", controller.poll_token("node-1"))
             self.assertNotIn("node-1", controller.unavailable_nodes)
 
+    async def test_recovery_outside_the_dashboard_releases_the_slot(self):
+        now = 0
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+        ) as http:
+            controller = FaultController(http, lambda *_: None, clock=lambda: now)
+            await controller.apply("node-1", "leave")
+            # Too soon: this self-report may predate the node exiting.
+            controller.mark_reachable("node-1", controller.poll_token("node-1"))
+            self.assertIn("node-1", controller.unavailable_nodes)
+            now = 30  # `docker compose start node-1`, then a fresh ALIVE self-report.
+            controller.mark_reachable("node-1", controller.poll_token("node-1"))
+            self.assertFalse(controller.unavailable_nodes)
+
     async def test_manual_start_waits_for_ready_and_restart_cannot_overlap(self):
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))

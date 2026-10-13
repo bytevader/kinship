@@ -54,16 +54,13 @@ class FaultController:
 
     def mark_reachable(self, node: str, generation: int | None) -> None:
         current = self.reservations.get(node)
+        # A fresh ALIVE self-report releases the slot after a recovery from here, or once the
+        # fault is old enough that the node must have come back, including after a recovery
+        # outside the dashboard such as `docker compose start node-3`.
         if (
             current
             and generation == current["generation"]
-            and (
-                current.get("phase") == "recovering"
-                or (
-                    current["action"] in {"crash", "kill"}
-                    and self.clock() - current["started"] >= 15
-                )
-            )
+            and (current.get("phase") == "recovering" or self.clock() - current["started"] >= 15)
         ):
             self.release(node, generation)
 

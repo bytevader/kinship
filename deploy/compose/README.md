@@ -78,7 +78,7 @@ another. Docker buttons require the optional profile below.
 | --- | --- | --- |
 | **Stall 20s** | The FastAPI event loop blocks with `time.sleep(20)`. HTTP calls time out and its member count becomes stale, but the card stays ALIVE and keys keep their owner: kinship runs on its own Rust thread. | Automatic after 20 seconds. |
 | **Crash** | `os._exit(1)` sends no leave. Watch SUSPECT, DEAD, moved keys and misses, then MemberJoined when `restart: on-failure` starts it again. | Automatic, including the 15-second startup delay. |
-| **Leave** | The node calls `leave()` and exits 0. Watch LEFT, moved keys and misses; Docker leaves it down. | **Start** with the chaos profile, or `docker compose start node-3`. |
+| **Leave** | The node calls `leave()` and exits 0. Watch LEFT, moved keys and misses; Docker leaves it down. | **Start** with the chaos profile, or `docker compose start node-3`; the dashboard frees the fault slot once the node reports itself ALIVE. |
 | **Drain** | Metadata changes to `role=draining`. The member stays ALIVE but its keys move to cache members. | **Undrain** returns `role=cache`; some keys move back, cold. |
 | **Pause** | Docker freezes the entire process, including kinship's thread. Watch SUSPECT outlines, then DEAD and changed owners. | **Unpause**; wait for recovery/rejoin. |
 | **Kill** | SIGKILL models a process crash. Watch failure detection and lost values. | Automatic on-failure restart; **Start** is also available. |
