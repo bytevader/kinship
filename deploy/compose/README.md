@@ -24,21 +24,21 @@ Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
 Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
-The default image builds a release wheel **from this checkout**, with maturin
-and Rust 1.85.1 in a separate build stage. Cargo registry, git and target caches
-persist across builds. The context is the repo root; the Dockerfile-specific
-`Dockerfile.dockerignore` excludes `.git`, `.venv` and `target` directories,
-including nested ones, without changing the repo's root ignore files. The
-runtime is `python:3.13-slim`, installing the wheel's FastAPI extra, uvicorn
-and httpx. After these APIs are published in 0.2, use the optional PyPI path:
+The default image installs `kinship[fastapi]>=0.2` from PyPI on
+`python:3.13-slim`, with uvicorn and httpx. To try changes in this checkout
+instead, build a release wheel from source, with maturin and Rust 1.85.1 in a
+separate build stage:
 
 ```sh
-KINSHIP_INSTALL=pypi docker compose up --build -d
+KINSHIP_INSTALL=source docker compose up --build -d
 ```
 
-In PowerShell, set `$env:KINSHIP_INSTALL = 'pypi'` first; remove it with
-`Remove-Item Env:KINSHIP_INSTALL` to return to the source build. That path
-requires `kinship[fastapi]>=0.2` on PyPI and intentionally cannot use 0.1.1.
+In PowerShell, set `$env:KINSHIP_INSTALL = 'source'` first; remove it with
+`Remove-Item Env:KINSHIP_INSTALL` to return to PyPI. Cargo registry, git and
+target caches persist across builds. The context is the repo root; the
+Dockerfile-specific `Dockerfile.dockerignore` excludes `.git`, `.venv` and
+`target` directories, including nested ones, without changing the repo's root
+ignore files.
 
 ## What the dashboard shows
 
