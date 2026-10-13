@@ -89,7 +89,17 @@ another. Docker buttons require the optional profile below.
 | **Pause** | Docker freezes the entire process, including kinship's thread. Watch SUSPECT outlines, then DEAD and changed owners. | **Unpause**; wait for recovery/rejoin. |
 | **Kill** | SIGKILL models a process crash. Watch failure detection and lost values. Docker counts a kill as a manual stop, so `restart: on-failure` leaves it down. | **Start**. |
 | **Restart** | Docker stops and starts the process. A normal stop sends LEFT; values are lost and the node rejoins after the startup delay. | Automatic. |
-| **Partition** | Disconnects only that cache node from the membership network. HTTP becomes unreachable; peers suspect and mark it DEAD. Keys move and errors/misses rise. | **Reconnect** restores its Docker DNS alias; allow gossip/rejoin to converge. |
+| **Partition** | Disconnects only that cache node from the membership network. HTTP becomes unreachable; peers suspect and mark it DEAD, while it marks all of them DEAD. Keys move and errors/misses rise. | **Reconnect** restores its Docker DNS alias; it rejoins within seconds. Its own stale rumours can briefly flip a healthy member to SUSPECT or DEAD until that member refutes, so watch for a second, short RingChanged. |
+
+A crash on `node-3`, six seconds in: it is DEAD, its card shows its HTTP API
+is gone, and its 12 keys now belong to the other four nodes.
+
+![node-3 DEAD after a crash, with its keys moved to the other nodes](screenshots/crash.jpg)
+
+A partition of `node-3`: the same picture from the dashboard, while views
+still disagree, so the dashboard sees 5 members and `node-1` still sees 6.
+
+![node-3 DEAD behind a partition, with member counts that disagree](screenshots/partition.jpg)
 
 **Start chaos** applies a random fault every configured interval (20 seconds
 by default), holding at most one fault slot at a time. It waits for timer
