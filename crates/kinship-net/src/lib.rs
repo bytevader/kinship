@@ -14,6 +14,7 @@ mod actor;
 mod conn;
 mod events;
 pub mod mem;
+mod seed;
 mod transport;
 
 use std::fmt;
@@ -31,6 +32,7 @@ pub use kinship_core::{
     CommandError, Config, ConfigError, Identity, Key, KeyError, KeyId, Limits, Member, Metrics,
     Security, State, WIRE_VERSION,
 };
+pub use seed::{Seed, SeedError};
 pub use transport::{TokioTransport, Transport, default_advertise};
 
 use crate::actor::{Actor, Clock, KeyChange, Request, Shared, Snapshot};
@@ -51,6 +53,15 @@ pub struct Settings {
     /// Joined on start, and every `rejoin_interval` each one that is not a live member is
     /// push-pulled with again.
     pub seeds: Vec<SocketAddr>,
+    /// Seeds that may be DNS names, joined and rejoined like `seeds`. Each name is looked up
+    /// again at every join and rejoin, and every address it has, A and AAAA records alike, is a
+    /// seed, so a name with several records, such as a Kubernetes headless Service, works as a
+    /// seed list.
+    pub seed_hosts: Vec<Seed>,
+    /// How long a join looks names up again, with backoff, while no seed resolves. A start whose
+    /// seeds stay unresolved this long fails with [`Error::Unresolved`]; once one resolves, the
+    /// others are looked up again at every rejoin.
+    pub resolve_timeout: Duration,
     /// Inbound TCP connections served at once. A new one beyond this drops the oldest of the
     /// source address with the most.
     pub max_inbound_streams: usize,
@@ -73,6 +84,7 @@ impl Settings {
     pub const DEFAULT_MAX_INBOUND_STREAMS_PER_IP: usize = 16;
     pub const DEFAULT_TCP_HEADER_TIMEOUT: Duration = Duration::from_secs(1);
     pub const DEFAULT_EVENT_BUFFER: usize = 1024;
+    pub const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Settings with no metadata, no seeds and the default limits.
     pub fn new(core: Config, name: impl Into<String>) -> Self {
@@ -82,6 +94,8 @@ impl Settings {
             advertise: None,
             meta: Vec::new(),
             seeds: Vec::new(),
+            seed_hosts: Vec::new(),
+            resolve_timeout: Self::DEFAULT_RESOLVE_TIMEOUT,
             max_inbound_streams: Self::DEFAULT_MAX_INBOUND_STREAMS,
             max_inbound_streams_per_ip: Self::DEFAULT_MAX_INBOUND_STREAMS_PER_IP,
             max_inbound_bytes_per_ip: None,
@@ -130,6 +144,12 @@ impl Settings {
 /// The `u32` length prefix in front of every stream frame.
 const FRAME_PREFIX_LEN: usize = 4;
 
+/// `seeds` and `seed_hosts` as one list.
+fn all_seeds(settings: &Settings) -> Vec<Seed> {
+    let addrs = settings.seeds.iter().copied().map(Seed::Addr);
+    addrs.chain(settings.seed_hosts.iter().cloned()).collect()
+}
+
 /// Counters from the protocol core and this node's Lifeguard local health score.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -149,6 +169,8 @@ pub enum Error {
     Io(io::Error),
     /// No seed answered after `join_retries` attempts each.
     JoinFailed,
+    /// No seed resolved to an address within `resolve_timeout`.
+    Unresolved,
     /// Metadata is larger than `max_meta_bytes`.
     MetaTooLarge,
     /// This node has left the cluster.
@@ -173,6 +195,7 @@ impl fmt::Display for Error {
             Self::Config(e) => e.fmt(f),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::JoinFailed => f.write_str("no seed answered"),
+            Self::Unresolved => f.write_str("no seed resolved to an address"),
             Self::MetaTooLarge => f.write_str("metadata larger than max_meta_bytes"),
             Self::Left => f.write_str("this node has left the cluster"),
             Self::Timeout => f.write_str("timed out"),
@@ -265,22 +288,31 @@ pub struct Memberlist {
     requests: mpsc::Sender<Request>,
     shared: Arc<Shared>,
     local_addr: SocketAddr,
+    resolve_timeout: Duration,
     task: Mutex<Option<JoinHandle<()>>>,
     abort: AbortHandle,
 }
 
 impl Memberlist {
-    /// Starts a node on `transport` and joins `settings.seeds`, skipping this node's own address.
+    /// Starts a node on `transport` and joins `settings.seeds` and `settings.seed_hosts`,
+    /// skipping this node's own address.
     ///
     /// A startup join that reaches no seed only logs a warning: the node runs alone and retries
-    /// every `rejoin_interval`. Must be called from within a tokio runtime, which runs the actor.
+    /// every `rejoin_interval`. Seed names that do not resolve are logged and looked up again,
+    /// but if no seed resolves within `resolve_timeout` the node stops and start fails with
+    /// [`Error::Unresolved`]. Must be called from within a tokio runtime, which runs the actor.
     pub async fn start<T: Transport>(settings: Settings, transport: T) -> Result<Self, Error> {
-        let seeds = settings.seeds.clone();
+        let seeds = all_seeds(&settings);
         let ml = Self::spawn(settings, transport)?;
         if !seeds.is_empty() {
-            match ml.join(seeds).await {
+            match ml.join_seeds(seeds).await {
                 Ok(n) => tracing::debug!(seeds = n, "joined"),
                 Err(Error::Closed) => return Err(Error::Closed),
+                Err(Error::Unresolved) => {
+                    tracing::error!("no seed resolved; stopping");
+                    ml.close().await;
+                    return Err(Error::Unresolved);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "startup join failed; retrying in the background")
                 }
@@ -291,6 +323,8 @@ impl Memberlist {
 
     fn spawn<T: Transport>(settings: Settings, transport: T) -> Result<Self, Error> {
         settings.validate()?;
+        let seeds = all_seeds(&settings);
+        let resolve_timeout = settings.resolve_timeout;
         let max_inbound_bytes_per_ip = settings.inbound_bytes_per_ip();
         let local_addr = transport.local_addr();
         let advertise = settings
@@ -326,7 +360,7 @@ impl Memberlist {
             max_inbound_streams: settings.max_inbound_streams,
             max_inbound_streams_per_ip: settings.max_inbound_streams_per_ip,
             max_inbound_bytes_per_ip,
-            seeds: settings.seeds,
+            seeds,
             rejoin_interval,
         };
         let actor = Actor::new(
@@ -342,6 +376,7 @@ impl Memberlist {
             requests,
             shared,
             local_addr,
+            resolve_timeout,
             abort: task.abort_handle(),
             task: Mutex::new(Some(task)),
         })
@@ -395,7 +430,18 @@ impl Memberlist {
     /// Push-pulls with every seed, retrying failed ones with backoff until one answers, and
     /// returns how many answered. This node's own address is skipped.
     pub async fn join(&self, seeds: impl IntoIterator<Item = SocketAddr>) -> Result<usize, Error> {
-        let seeds = seeds.into_iter().collect();
+        self.join_seeds(seeds.into_iter().map(Seed::Addr)).await
+    }
+
+    /// [`join`](Self::join) with seeds that may be DNS names. Each name is looked up now, and
+    /// every address it has is a seed. Names that do not resolve are logged and skipped; while
+    /// none resolves and no seed is an address, they are looked up again with backoff for up to
+    /// `resolve_timeout`, and then the join fails with [`Error::Unresolved`].
+    pub async fn join_seeds(&self, seeds: impl IntoIterator<Item = Seed>) -> Result<usize, Error> {
+        let seeds: Vec<Seed> = seeds.into_iter().collect();
+        let seeds = seed::resolve_for_join(&seeds, self.resolve_timeout)
+            .await
+            .ok_or(Error::Unresolved)?;
         let rx = self.call(|reply| Request::Join { seeds, reply }).await?;
         rx.await.unwrap_or(Err(Error::Closed))
     }

@@ -101,6 +101,8 @@ cfg = kinship.Config.lan(
 
 Every node can share the same seed list, including itself. A seed that is down or is the node itself is skipped, and a node that reaches no seed starts alone and keeps retrying in the background.
 
+A seed's host can be a DNS name, such as a docker compose service (`seeds=["node-1:7946"]`) or a Kubernetes headless Service (`seeds=["kinship.default.svc.cluster.local:7946"]`). kinship looks each name up again at every join and every background retry, and every address it returns, A and AAAA, is a seed, so one name can stand for the whole cluster and follows pods to new addresses. A name that does not resolve is logged and looked up again; only when no seed resolves within `resolve_timeout` (30 s) does starting the cluster raise `JoinError`. A headless Service lists only ready pods by default, so set `publishNotReadyAddresses: true` on it if kinship starts before your readiness probe passes, or the first pod finds no seed.
+
 ## How membership works
 
 Each node probes one peer per round. A peer that misses its probe becomes **suspect**, and the suspicion spreads by gossip. The suspect node hears the rumour and refutes it if it is alive; otherwise it becomes **dead** a few seconds later. A node that shuts down cleanly becomes **left** instead of dead. Views are eventually consistent: two nodes can disagree for a few gossip rounds, and a partition gives you two groups that each think the other is dead until it heals.
@@ -115,7 +117,7 @@ async with kinship.Cluster(cfg) as cluster:   # binds, then joins cfg.seeds
 
 | Call | Returns | What it does |
 | --- | --- | --- |
-| `await cluster.join(seeds=None)` | `int` | Push-pull with each seed until one answers; returns how many answered. Raises `JoinError` if none did. With no argument it uses `cfg.seeds`. |
+| `await cluster.join(seeds=None)` | `int` | Push-pull with each seed until one answers; returns how many answered. Raises `JoinError` if none did, or if no seed name resolved within `resolve_timeout`. With no argument it uses `cfg.seeds`. |
 | `cluster.members()` | `list[Member]` | Alive and suspect members, the local node included. Never waits on the network. |
 | `cluster.member(name)` | `Member \| None` | One member by name, including dead and left tombstones. |
 | `cluster.local` | `Member` | This node as the cluster sees it. |
@@ -200,7 +202,7 @@ cfg = kinship.Config.wan(keys=[key], probe_interval=4.0)
 cfg2 = cfg.replace(name="edge-12")    # configs are frozen
 ```
 
-Durations are seconds as `float`, or a `datetime.timedelta`. Every field is validated when the config is built, so `kinship.ConfigError` (a `ValueError` that names the field) fires before any socket opens. The full field list lives in the configuration reference; the ones you are most likely to set are `name`, `bind`, `advertise`, `cluster`, `seeds`, `meta`, `keys` and `event_buffer`. Use `bind="0.0.0.0:0"` to let the OS pick a port when several processes share a host, and read it back from `cluster.local.addr`.
+Durations are seconds as `float`, or a `datetime.timedelta`. Every field is validated when the config is built, so `kinship.ConfigError` (a `ValueError` that names the field) fires before any socket opens. The full field list lives in the [configuration reference](https://github.com/bytevader/kinship/blob/main/docs/design.md#configuration-surface); the ones you are most likely to set are `name`, `bind`, `advertise`, `cluster`, `seeds`, `meta`, `keys` and `event_buffer`. Use `bind="0.0.0.0:0"` to let the OS pick a port when several processes share a host, and read it back from `cluster.local.addr`.
 
 A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
 
@@ -397,7 +399,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::lan()
         .with_name("worker-17")
         .with_keys([Key::from_base64(&std::env::var("KINSHIP_KEY")?)?])
-        .with_seeds(["10.0.0.5:7946".parse()?]);
+        .with_seeds(["10.0.0.5:7946".parse()?])
+        .with_seed_hosts(["kinship.default.svc.cluster.local:7946".parse()?]);
     let cluster = Cluster::start(cfg).await?;     // binds, joins seeds
     let mut events = cluster.events();
     while let Some(event) = events.recv().await {
@@ -412,13 +415,13 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`.
+The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`. `with_seeds` takes addresses and `with_seed_hosts` takes `Seed`s, parsed from `host:port` with a DNS name or an IP address; `join_seeds` is `join` for them.
 
 The `kinship-agent` example joins a cluster from seeds on the command line and logs every event until Ctrl-C, when it leaves:
 
 ```bash
 cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7946
-cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 127.0.0.1:7946
+cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 localhost:7946
 ```
 
 ### kinship-core: sans-IO SWIM

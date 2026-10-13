@@ -165,6 +165,7 @@ class Cluster(_Base):
     async def start(self) -> Self:
         """Binds, starts the node and joins ``cfg.seeds``, skipping its own address. A startup
         join that reaches no seed only logs a warning; the node keeps retrying in the background.
+        Raises ``JoinError`` if no seed resolves to an address within ``cfg.resolve_timeout``.
         """
         self._started(await _kinship.Node.start(self._cfg))
         return self
@@ -191,7 +192,8 @@ class Cluster(_Base):
 
     async def join(self, seeds: Iterable[str] | None = None) -> int:
         """Push-pulls with each seed until one answers; returns how many answered. Raises
-        ``JoinError`` if none did. With no argument it uses ``cfg.seeds``."""
+        ``JoinError`` if none did. With no argument it uses ``cfg.seeds``. A seed is
+        ``"host:port"``, and a host that is a DNS name is looked up now."""
         node = self._running
         return await node.join(None if seeds is None else _seed_list(seeds))
 

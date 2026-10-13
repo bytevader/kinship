@@ -78,6 +78,7 @@ impl KError {
             Self::Net(E::Config(e)) => config_error(py, e.field, e.reason),
             Self::Net(E::Io(e)) => e.into(),
             Self::Net(E::JoinFailed) => raise(py, "JoinError", ("no seed answered",)),
+            Self::Net(E::Unresolved) => raise(py, "JoinError", ("no seed resolved to an address",)),
             Self::Net(E::MetaTooLarge) => raise(
                 py,
                 "MetaTooLarge",

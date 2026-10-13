@@ -5,14 +5,17 @@
 //! cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 127.0.0.1:7946
 //! ```
 //!
-//! Seeds are positional `host:port` arguments. Beyond loopback, give the cluster key with
-//! `--key` or `KINSHIP_KEY` (32 bytes, base64). `RUST_LOG` adjusts the log level.
+//! Seeds are positional `host:port` arguments, where the host is an IP address or a DNS name
+//! such as a docker compose service or a Kubernetes headless Service; names are looked up again
+//! at every join and rejoin, and every address they have is a seed. Beyond loopback, give the
+//! cluster key with `--key` or `KINSHIP_KEY` (32 bytes, base64). `RUST_LOG` adjusts the log
+//! level.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use kinship::{Cluster, Config, Event, Key, Member};
+use kinship::{Cluster, Config, Event, Key, Member, Seed};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -135,7 +138,7 @@ async fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>,
                 edits.push(Box::new(move |c| c.with_meta(meta)));
             }
             flag if flag.starts_with('-') => return Err(format!("unknown option {flag}\n{USAGE}")),
-            seed => seeds.push(resolve(seed).await?),
+            seed => seeds.push(seed.parse::<Seed>().map_err(|e| e.to_string())?),
         }
     }
     if keys.is_empty() {
@@ -150,7 +153,7 @@ async fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>,
         other => return Err(format!("unknown preset {other}")),
     };
     let cfg = edits.into_iter().fold(cfg, |c, edit| edit(c));
-    Ok(Some(cfg.with_keys(keys).with_seeds(seeds)))
+    Ok(Some(cfg.with_keys(keys).with_seed_hosts(seeds)))
 }
 
 fn key(text: &str) -> Result<Key, String> {

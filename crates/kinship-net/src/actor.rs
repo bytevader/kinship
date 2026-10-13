@@ -24,6 +24,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::conn::{self, Budget, Inbound, Report, Reports, Write};
 use crate::events::{Event, Hub};
+use crate::seed::{self, Seed};
 use crate::transport::Transport;
 use crate::{Error, Stats};
 
@@ -192,7 +193,8 @@ pub(crate) struct Options {
     pub max_inbound_streams_per_ip: usize,
     /// Bytes of unauthenticated inbound frames one source address may hold.
     pub max_inbound_bytes_per_ip: usize,
-    pub seeds: Vec<SocketAddr>,
+    /// Rejoined every `rejoin_interval`; names are looked up again each time.
+    pub seeds: Vec<Seed>,
     pub rejoin_interval: Duration,
 }
 
@@ -217,6 +219,9 @@ pub(crate) struct Actor<T: Transport> {
     opts: Options,
     next_rejoin: Option<Instant>,
     rejoining: bool,
+    /// Addresses of the seeds, from a lookup a rejoin started.
+    resolved_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    resolved: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
     accept_paused: Option<TokioInstant>,
     recv_paused: Option<TokioInstant>,
     /// Scratch for the events of one input.
@@ -229,6 +234,8 @@ enum Input<S> {
     Report((StreamId, Report)),
     Accept(std::io::Result<(S, SocketAddr)>),
     Request(Option<Request>),
+    /// A rejoin's lookup of the seeds finished.
+    Resolved(Vec<SocketAddr>),
     Timer,
 }
 
@@ -242,6 +249,7 @@ impl<T: Transport> Actor<T> {
         opts: Options,
     ) -> Self {
         let (reports_tx, reports) = mpsc::unbounded_channel();
+        let (resolved_tx, resolved) = mpsc::unbounded_channel();
         let next_rejoin = (!opts.rejoin_interval.is_zero() && !opts.seeds.is_empty())
             .then(|| clock.now() + opts.rejoin_interval);
         let budget =
@@ -265,6 +273,8 @@ impl<T: Transport> Actor<T> {
             opts,
             next_rejoin,
             rejoining: false,
+            resolved_tx,
+            resolved,
             accept_paused: None,
             recv_paused: None,
             events: Vec::new(),
@@ -283,6 +293,7 @@ impl<T: Transport> Actor<T> {
                 Some(r) = self.reports.recv() => Input::Report(r),
                 r = self.transport.accept(), if accepting => Input::Accept(r),
                 r = self.requests.recv() => Input::Request(r),
+                Some(addrs) = self.resolved.recv() => Input::Resolved(addrs),
                 () = sleep_until(wake) => Input::Timer,
             };
             match input {
@@ -301,6 +312,7 @@ impl<T: Transport> Actor<T> {
                 Input::Request(Some(req)) => self.request(req),
                 // Every handle is gone.
                 Input::Request(None) => break None,
+                Input::Resolved(addrs) => self.rejoin_resolved(addrs),
                 Input::Timer => {}
             }
             self.drain(&mut buf);
@@ -375,7 +387,8 @@ impl<T: Transport> Actor<T> {
 
     /// Every `rejoin_interval`, push-pulls with each configured seed that is not a live member.
     /// A node that started alone or was cut off finds the cluster again, and a seed on the far
-    /// side of a partition that outlasted the tombstones merges the two sides.
+    /// side of a partition that outlasted the tombstones merges the two sides. Seed names are
+    /// looked up again first, on a task of their own, so a slow resolver never holds up the loop.
     fn rejoin(&mut self, now: Instant) {
         let Some(at) = self.next_rejoin.filter(|&t| t <= now) else {
             return;
@@ -386,18 +399,36 @@ impl<T: Transport> Actor<T> {
         if self.rejoining || self.node.local().state == State::Left {
             return;
         }
+        let addrs = self.opts.seeds.iter().map(|s| match s {
+            Seed::Addr(a) => Some(*a),
+            _ => None,
+        });
+        if let Some(addrs) = addrs.collect::<Option<Vec<_>>>() {
+            return self.rejoin_resolved(addrs);
+        }
+        let seeds = self.opts.seeds.clone();
+        let tx = self.resolved_tx.clone();
+        self.rejoining = true;
+        self.tasks.spawn(async move {
+            let r = seed::resolve(&seeds, seed::LOOKUP_TIMEOUT, true).await;
+            let _ = tx.send(r.addrs);
+        });
+    }
+
+    /// Push-pulls with each of `addrs`, the seeds of a rejoin, that is not a live member.
+    fn rejoin_resolved(&mut self, addrs: Vec<SocketAddr>) {
+        self.rejoining = false;
+        while self.tasks.try_join_next().is_some() {}
+        if self.node.local().state == State::Left {
+            return;
+        }
         // This node is one of its own live members, so its own address is never a target.
         let live: HashSet<SocketAddr> = self.node.members().map(|m| m.addr).collect();
-        let seeds: Vec<SocketAddr> = self
-            .opts
-            .seeds
-            .iter()
-            .copied()
-            .filter(|s| !live.contains(s))
-            .collect();
+        let seeds: Vec<SocketAddr> = addrs.into_iter().filter(|s| !live.contains(s)).collect();
         if seeds.is_empty() {
             return;
         }
+        let now = self.clock.now();
         let alone = live.len() == 1;
         tracing::debug!(
             seeds = seeds.len(),

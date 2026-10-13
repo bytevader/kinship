@@ -2,6 +2,19 @@
 
 All notable changes to kinship are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The finding ids (KS-, KI-, KP-) refer to [SECURITY.md](SECURITY.md) and [docs/review.md](docs/review.md).
 
+## [0.1.1] - 2026-10-13
+
+### Added
+
+- **Seeds by DNS name.** A seed's host can be a DNS name as well as an IP address, so `"node-1:7946"` in docker compose and a Kubernetes headless Service such as `"kinship.default.svc.cluster.local:7946"` work as seeds. Names are looked up again at every join and every `rejoin_interval` retry, and every address a name returns, A and AAAA alike, is a seed. Python takes names wherever it takes seeds (`Config(seeds=...)` and `join()`); Rust adds `Seed`, `Config::with_seed_hosts`, `Cluster::join_seeds` and `Memberlist::join_seeds`, and `kinship-agent` takes names on its command line. The core still sees only addresses: lookups happen in `kinship-net`.
+- **`resolve_timeout`** (30 s): how long a join keeps looking seed names up while none resolves. A name that does not resolve is logged and looked up again; a start fails, with `JoinError` in Python and `Error::Unresolved` in Rust, only if no seed resolved within it.
+- **musllinux wheels.** abi3 wheels for musllinux_1_2 on x86_64 and aarch64, so Alpine installs a wheel instead of building the sdist. CI builds and tests them in Alpine on every pull request.
+- **Release smoke test.** After the upload, `release.yml` installs the release from PyPI on Linux, macOS and Windows and runs `examples/quickstart.py` as two nodes (`tools/smoke_quickstart.py`).
+
+### Changed
+
+- `kinship-agent` no longer resolves a seed name once at startup and keeps its first address; it passes the name on, so the node follows it.
+
 ## [0.1.0] - 2026-10-12
 
 The first release.
@@ -45,4 +58,5 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
+[0.1.1]: https://github.com/bytevader/kinship/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bytevader/kinship/releases/tag/v0.1.0
