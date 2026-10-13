@@ -4,7 +4,7 @@
 
 ## Status
 
-0.1.0 is ready to release: versions are 0.1.0 and `CHANGELOG.md` dates it 2026-10-12. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels and sdist to PyPI and the crates to crates.io.
+0.1.0 shipped on 2026-10-12. 0.1.1 is being prepared on `fix/hostname-seeds`: versions are 0.1.1, and `CHANGELOG.md` lists it as unreleased until it is dated for the tag. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
 
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.
@@ -22,9 +22,11 @@
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
 - `docs/assets`: the logo (`logo.svg`, `logo.png`), the README banners (`banner-light.png`, `banner-dark.png`, loaded from `main`) and the GitHub social preview.
+- `tools/smoke_quickstart.py`: the post-publish smoke test, which runs `examples/quickstart.py` as two nodes against an installed kinship.
 - `tools/chaos`: chaos harness and detection bench (Linux namespaces, tc netem, nftables). `tools/memberlist-bench`: the Go memberlist node for the bench.
 - Fuzz targets: `crates/kinship-proto/fuzz` (`decode_datagram`, `decode_payload`, `decode_stream_frame`) and `crates/kinship-core/fuzz` (`node_input`).
-- CI (`.github/workflows/ci.yml`): lint, cargo test, coverage (Rust with the bindings under pytest, plus Python; `coverage-badge` publishes `coverage.json` for the README badge to the `badges` branch on pushes to main), `sim-*` jobs (1,000 seeds each), chaos, cargo deny, MSRV, `fuzz smoke (<target>)`, wheels. `detection.yml`: the weekly memberlist bench. `release.yml`: runs on `v*` tags only.
+- Seeds may be DNS names (`kinship_net::Seed`); kinship-net looks them up at every join and rejoin (`crates/kinship-net/src/seed.rs`), never the core.
+- CI (`.github/workflows/ci.yml`): lint, cargo test, coverage (Rust with the bindings under pytest, plus Python; `coverage-badge` publishes `coverage.json` for the README badge to the `badges` branch on pushes to main), `sim-*` jobs (1,000 seeds each), chaos, cargo deny, MSRV, `fuzz smoke (<target>)`, wheels, musllinux wheels tested in Alpine. `detection.yml`: the weekly memberlist bench. `release.yml`: runs on `v*` tags only.
 - Released by `release.yml`: the `kinship` package to PyPI, then the crates `kinship-proto`, `kinship-core`, `kinship-net` and `kinship` to crates.io, in that order. `kinship-sim`, `kinship-py`, `kinship-chaos` and the fuzz crates have `publish = false`.
 
 ## Commands
