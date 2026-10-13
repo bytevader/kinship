@@ -30,8 +30,18 @@ Repository = "https://github.com/bytevader/kinship"
 Changelog = "https://github.com/bytevader/kinship/blob/main/CHANGELOG.md"
 Issues = "https://github.com/bytevader/kinship/issues"
 
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.110"]
+
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "maturin>=1.9,<2"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "maturin>=1.9,<2",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+]
 
 [tool.maturin]
 manifest-path = "crates/kinship-py/Cargo.toml"

@@ -248,9 +248,104 @@ for event in cluster.events(timeout=1.0):   # yields None on each timeout tick
 
 Methods that wait on the network (`join`, `set_meta`, `update_meta`, `leave`, `close` and the keyring calls) block the calling thread and accept `timeout=`. Read events from a dedicated thread. Under Celery or gunicorn's prefork model, start the cluster in the worker after the fork (`worker_process_init`, `post_fork`), and give each worker its own port with `bind="0.0.0.0:0"`.
 
+## Ownership with kinship.ring
+
+`kinship.ring.Ring` answers "which node owns this key?" from the cluster's live view, over the members you pick, and tells you when the answer changes. It uses `kinship.rendezvous`, so every process that sees the same members agrees, and only the keys of a node that joins or goes move. Here is the sharded cache from the patterns below, built on it:
+
+```python
+import kinship
+from kinship.ring import Ring
+
+class ShardedCache:
+    def __init__(self, cluster: kinship.Cluster, http: aiohttp.ClientSession) -> None:
+        self.ring = Ring(cluster, where={"role": "cache"})   # or a predicate on Member
+        self.cluster, self.http, self.data = cluster, http, {}
+
+    async def get(self, key: str) -> bytes | None:
+        node = self.ring.owner(key)
+        if node.name == self.cluster.local.name:
+            return self.data.get(key)
+        async with self.http.get(f"http://{node.meta['http']}/cache/{key}") as resp:
+            return await resp.read() if resp.status == 200 else None
+
+    async def drop_moved_keys(self) -> None:
+        me, before = self.cluster.local.name, self.ring.members()
+        async for change in self.ring.changes():
+            for key, (old, new) in self.ring.moved(self.data, before, change.members).items():
+                if new is None or new.name != me:
+                    del self.data[key]
+            before = change.members
+```
+
+| Call | Returns | What it does |
+| --- | --- | --- |
+| `Ring(cluster, *, where=None)` | `Ring` | A ring over the members of a `kinship.Cluster` or `kinship.blocking.Cluster` whose metadata matches `where`, a dict such as `{"role": "api"}`, or for which `where(member)` is true. |
+| `ring.owner(key, *, new_work=False)` | `Member` | The member that owns `key`, a `str` or `bytes`. Raises `LookupError` if no member matches. |
+| `ring.replicas(key, n, *, new_work=False)` | `list[Member]` | The `n` best members for `key`, owner first: where to put replicas. |
+| `ring.members()` | `tuple[Member, ...]` | The members on the ring now, sorted by name. |
+| `ring.changes()` | iterator of `RingChanged` | A new subscription to changes in the ring, built on `events()`. |
+| `ring.moved(keys, before, after)` | `dict` | `{key: (old_owner, new_owner)}` for the keys whose owner differs between two `members()` snapshots; keys that stayed put are left out. |
+
+Suspect members keep their keys, so a node that only stalls causes no reshuffle; dead and departed members own nothing. To route new work, such as a new session or a write, pass `new_work=True`: a suspect owner is skipped, and the work goes to the member that would take over its keys if it died.
+
+`changes()` yields `RingChanged(added, removed, suspect, recovered, members)` whenever a member on the ring joins or goes, becomes suspect or recovers, including a metadata update that makes a member start or stop matching `where`. `members` is the ring's new snapshot, ready for `moved()`. After `EventsLost` it re-reads the members and always yields, because lost events may have moved keys. On `kinship.Cluster` it is an async iterator; on `kinship.blocking.Cluster`, `for change in ring.changes(timeout=1.0)` blocks and yields `None` on each quiet tick, like `events()`. Events never describe the local node, so a change to this node's own metadata shows up with the next event.
+
+## FastAPI
+
+```bash
+pip install "kinship[fastapi]"
+```
+
+`kinship.contrib.fastapi` runs a node for as long as your app runs, and hands it, or a ring over it, to your routes. The sharded cache as a FastAPI service:
+
+```python
+import os
+from typing import Annotated
+from urllib.parse import quote
+
+import kinship
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from kinship.contrib.fastapi import cluster_lifespan, cluster_router, get_ring
+from kinship.ring import Ring
+
+def config() -> kinship.Config:   # runs in each worker, at startup
+    return kinship.Config.lan(
+        bind="0.0.0.0:0",
+        keys=[os.environ["KINSHIP_KEY"]],
+        seeds=["cache.default.svc.cluster.local:7946"],
+        meta={"role": "cache", "url": os.environ["PUBLIC_URL"]},   # "https://cache-7.example.com"
+    )
+
+URLS = set(os.environ["CACHE_URLS"].split())   # the URLs you expect your nodes to have
+
+app = FastAPI(lifespan=cluster_lifespan(config))
+app.include_router(cluster_router(), dependencies=[Depends(admin_only)])
+CacheRing = Annotated[Ring, Depends(get_ring(where={"role": "cache"}))]
+data: dict[str, str] = {}
+
+@app.get("/cache/{key}", response_model=None)
+async def get(key: str, ring: CacheRing) -> dict[str, str] | RedirectResponse:
+    node = ring.owner(key)
+    if node.name != ring.cluster.local.name:
+        if node.meta.get("url") not in URLS:   # members write their own metadata
+            raise HTTPException(503)
+        return RedirectResponse(node.meta["url"] + "/cache/" + quote(key, safe=""), 307)
+    if key not in data:
+        raise HTTPException(404)
+    return {"key": key, "value": data[key]}
+```
+
+- `cluster_lifespan(config, *, leave_timeout=5.0)` goes in `FastAPI(lifespan=...)`. At startup it builds the config, calling `config` if it is a function, starts a `kinship.Cluster` and stores it on `app.state.cluster`; at shutdown it calls `leave()`, then `close()`. To run it next to a lifespan of your own, enter it from yours: `async with cluster_lifespan(config)(app): yield`.
+- `get_cluster` and `get_ring(where=...)` are dependencies, for HTTP and WebSocket routes. `get_ring` builds its `Ring` once per `where`, not per request.
+- `cluster_router(prefix="/cluster")` serves `GET /members` (name, address, state and metadata of each member) and `GET /stats` (this node's counters). They expose member addresses and metadata, so protect them, as above, or leave them off in production.
+- Every server worker process runs its own node. With several workers (`uvicorn --workers 4`, gunicorn), each needs its own gossip port and name: pass a function as above, so each worker builds its own config after the fork, with `bind="0.0.0.0:0"` and no `name` (the default adds a random suffix to the host name) or one that includes the process id. The workers on one host share its HTTP port and so its `url`, and a request sent there reaches any of them, so keep per-node state such as this cache to one worker per host.
+- kinship's own traffic is not HTTP: gossip runs over UDP and TCP, encrypted with XChaCha20-Poly1305. Whether your app serves HTTP or HTTPS is up to your server or proxy; put the scheme in the URL you publish in metadata, as above.
+- `httpx.ASGITransport` does not run the lifespan; in tests, enter `app.router.lifespan_context(app)` around the client. [`examples/fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) runs three apps in one process that way.
+
 ## Examples
 
-Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/examples), each a single file with nothing to install beyond kinship:
+Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/examples), each a single file with nothing to install beyond kinship, except `fastapi_app.py`, which needs `kinship[fastapi]` and httpx:
 
 | Script | What it shows |
 | --- | --- |
@@ -258,6 +353,7 @@ Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/e
 | [`sharded_keys.py`](https://github.com/bytevader/kinship/blob/main/examples/sharded_keys.py) | Rendezvous ownership of keys, and that only a departed node's keys move, after a leave and after a crash |
 | [`failover_job.py`](https://github.com/bytevader/kinship/blob/main/examples/failover_job.py) | A job that runs on exactly one node and moves on its own when that node dies |
 | [`sync_workers.py`](https://github.com/bytevader/kinship/blob/main/examples/sync_workers.py) | The blocking API and metadata: routing around a node that marks itself as draining |
+| [`fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) | A sharded cache as three FastAPI apps: `cluster_lifespan`, `get_ring`, redirects to a key's owner, and the keys that move when a node leaves |
 
 ```bash
 python examples/sharded_keys.py

@@ -21,6 +21,7 @@
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
+- `python/kinship/ring.py`: `Ring` and `RingChanged`, key ownership over `rendezvous` that follows membership events. `python/kinship/contrib/fastapi.py`: `cluster_lifespan`, `get_cluster`, `get_ring` and `cluster_router`, behind the `kinship[fastapi]` extra; the core package has no Python dependencies, and FastAPI tests skip when fastapi is not installed.
 - `docs/assets`: the logo (`logo.svg`, `logo.png`), the README banners (`banner-light.png`, `banner-dark.png`, loaded from `main`) and the GitHub social preview.
 - `tools/smoke_quickstart.py`: the post-publish smoke test, which runs `examples/quickstart.py` as two nodes against an installed kinship.
 - `tools/chaos`: chaos harness and detection bench (Linux namespaces, tc netem, nftables). `tools/memberlist-bench`: the Go memberlist node for the bench.

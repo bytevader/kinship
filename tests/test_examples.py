@@ -39,6 +39,22 @@ class TestExamples:
         moved_to = out.split("the job moved to ")[1].split()[0]
         assert moved_to != crashed
 
+    def test_fastapi_app_routes_keys_to_their_owner(self) -> None:
+        pytest.importorskip("fastapi")
+        pytest.importorskip("httpx")
+        out = run("fastapi_app.py")
+        stored = dict(
+            line.split(" stored on ") for line in out.splitlines() if " stored on " in line
+        )
+        assert len(stored) == 9 and set(stored.values()) == {"node-a", "node-b", "node-c"}
+        assert "removed=['node-c']" in out
+        moved = [line.split() for line in out.splitlines() if " moved from " in line]
+        assert moved and all(words[3] == "node-c" for words in moved)
+        assert {words[0] for words in moved} == {
+            key.strip() for key, node in stored.items() if node == "node-c"
+        }
+        assert ": 404, " in out
+
     def test_sync_workers_route_around_a_draining_node(self) -> None:
         out = run("sync_workers.py")
         before, after = out.split("node-a routes new requests around node-b:")

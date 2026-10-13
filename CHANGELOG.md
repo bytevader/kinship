@@ -2,6 +2,14 @@
 
 All notable changes to kinship are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The finding ids (KS-, KI-, KP-) refer to [SECURITY.md](SECURITY.md) and [docs/review.md](docs/review.md).
 
+## [Unreleased]
+
+### Added
+
+- **`kinship.ring`.** `Ring(cluster, where=...)` keeps rendezvous ownership in step with membership, over the members whose metadata matches `where` or a predicate, on `kinship.Cluster` and `kinship.blocking.Cluster`: `owner()`, `replicas()`, `members()`, and `moved()` for the keys that changed owner between two snapshots. Suspect members keep their keys; `new_work=True` skips them for routing new requests. `changes()` yields `RingChanged(added, removed, suspect, recovered, members)` from the cluster's events, including metadata updates that flip a `where` match, and resyncs after `EventsLost`.
+- **FastAPI integration.** `kinship.contrib.fastapi`, behind the `kinship[fastapi]` extra: `cluster_lifespan()` runs a cluster for the app's lifetime on `app.state.cluster` and leaves on shutdown, `get_cluster` and `get_ring(where=...)` are dependencies, and `cluster_router()` serves `GET /members` and `GET /stats`. The core package gains no dependency.
+- **Example.** `examples/fastapi_app.py`: a sharded cache as three FastAPI apps in one process, driven through httpx's ASGI transport.
+
 ## [0.1.1] - 2026-10-13
 
 ### Added
@@ -58,5 +66,6 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
+[Unreleased]: https://github.com/bytevader/kinship/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/bytevader/kinship/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bytevader/kinship/releases/tag/v0.1.0
