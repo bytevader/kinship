@@ -240,7 +240,9 @@ async def test_blocked_event_loop_causes_no_false_deaths() -> None:
 
         before = time.monotonic()
         handler()  # holds the loop; kinship keeps probing on its own thread
-        assert time.monotonic() - before >= 10
+        # On Windows, sleep() and monotonic() tick on different timers, so a 10 s sleep can
+        # measure a few milliseconds short.
+        assert time.monotonic() - before >= 9.9
         await asyncio.sleep(1.0)  # let anything the protocol decided arrive
 
         for node, stream in zip(nodes, streams, strict=True):
