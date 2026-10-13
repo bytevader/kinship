@@ -69,9 +69,6 @@ services:
     profiles: [chaos]
     hostname: chaos
     user: "0:0"
-    environment:
-      DOCKER_PROJECT: kinship-demo
-      DOCKER_NETWORK: kinship-demo_membership
     command: ["uvicorn", "chaos:app", "--host", "0.0.0.0", "--port", "9000"]
     volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
     networks: [control]
