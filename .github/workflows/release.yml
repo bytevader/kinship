@@ -1,8 +1,9 @@
 name: Release
 
 # Publishes a release when a v* tag is pushed, and on nothing else: the abi3 and free-threaded
-# wheels and the sdist to PyPI through trusted publishing, then the Rust crates to crates.io in
-# dependency order. Both publish steps skip what is already up, so a failed run can be re-run.
+# wheels, the musllinux abi3 wheels and the sdist to PyPI through trusted publishing, then the
+# Rust crates to crates.io in dependency order. Both publish steps skip what is already up, so a
+# failed run can be re-run.
 on:
   push:
     tags: ["v*"]
@@ -96,6 +97,44 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  # Alpine and other musl distributions: abi3 wheels built in the musllinux_1_2 container and
+  # tested in an Alpine one, since the runner's own Python links glibc.
+  musllinux:
+    name: wheel abi3 musllinux (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build wheel (musllinux_1_2)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.arch }}
+          manylinux: musllinux_1_2
+          args: --release --out dist --interpreter python3.11
+      - name: Test wheel on Alpine
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io python:3.11-alpine sh -euc '
+            python -m pip install pytest pytest-asyncio
+            python -m pip install --no-index --find-links dist kinship
+            python -m pytest
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-musllinux-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
   sdist:
     needs: check
     runs-on: ubuntu-latest
@@ -125,7 +164,7 @@ jobs:
 
   pypi:
     name: publish to PyPI
-    needs: [wheels, sdist]
+    needs: [wheels, musllinux, sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:

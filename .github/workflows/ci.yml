@@ -399,3 +399,49 @@ jobs:
         with:
           name: wheels-${{ matrix.flavor }}-${{ matrix.os }}
           path: dist
+
+  # Alpine and other musl distributions, as release.yml builds them: abi3 wheels from the
+  # musllinux_1_2 container, tested in Alpine on the oldest and newest CPython kinship supports.
+  wheels-musllinux:
+    name: wheel abi3 musllinux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build wheel (musllinux_1_2)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.arch }}
+          manylinux: musllinux_1_2
+          args: --release --out dist --interpreter python3.11
+      - name: Build wheel with the panic hook (musllinux_1_2)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.arch }}
+          manylinux: musllinux_1_2
+          args: --release --out dist-hooks --interpreter python3.11 --features test-hooks
+      - name: Test wheel on Alpine
+        run: |
+          for python in 3.11 3.14; do
+            docker run --rm -v "$PWD:/io" -w /io "python:${python}-alpine" sh -euc '
+              python -m pip install pytest pytest-asyncio
+              python -m pip install --no-index --find-links dist kinship
+              python -m pytest
+              python -m pip install --force-reinstall --no-deps --no-index --find-links dist-hooks kinship
+              KINSHIP_TEST_HOOKS=1 python -m pytest tests/test_panic.py
+            '
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-musllinux-${{ matrix.arch }}
+          path: dist
