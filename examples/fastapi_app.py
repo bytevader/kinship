@@ -2,7 +2,7 @@
 
 Starts three FastAPI apps in this process, each running its own kinship node through
 ``cluster_lifespan``. A request for a key that another node owns is redirected to the owner,
-whose HTTP address travels in metadata. No server is needed: the script drives the apps
+whose URL travels in metadata. No server is needed: the script drives the apps
 in-process through httpx's ASGI transport. Then one node leaves, and ``Ring.changes()`` and
 ``Ring.moved()`` show which keys moved with it.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException
@@ -27,15 +28,18 @@ from kinship.ring import Ring
 KEYS = [f"user:{i}" for i in range(1, 10)]
 NAMES = ["node-a", "node-b", "node-c"]
 CacheRing = Annotated[Ring, Depends(get_ring(where={"role": "cache"}))]
+#: Every node's base URL. Members write their own metadata, so an owner's URL is checked
+#: against the ones you expect before a client is sent there.
+URLS = {f"http://{name}" for name in NAMES}
 
 
 def make_app(name: str, seeds: list[str]) -> FastAPI:
     """One cache node. ``seeds`` is read at startup, so it can be filled in after this call."""
 
     def config() -> kinship.Config:
-        # In production: Config.lan(keys=[...], seeds=[...], bind="0.0.0.0:7946") and an
-        # "http" entry that other nodes can reach, such as "http://10.0.0.7:8080".
-        meta = {"role": "cache", "http": f"http://{name}"}
+        # In production: Config.lan(keys=[...], seeds=[...], bind="0.0.0.0:7946") and a "url"
+        # that clients can reach, such as "https://cache-7.example.com".
+        meta = {"role": "cache", "url": f"http://{name}"}
         return kinship.Config.local(name=name, bind="127.0.0.1:0", seeds=seeds, meta=meta)
 
     app = FastAPI(lifespan=cluster_lifespan(config))
@@ -48,7 +52,10 @@ def make_app(name: str, seeds: list[str]) -> FastAPI:
         node = ring.owner(key, new_work=True)
         if node.name == name:
             return None
-        return RedirectResponse(f"{node.meta['http']}/cache/{key}", status_code=307)
+        url = node.meta.get("url")
+        if url not in URLS:
+            raise HTTPException(503, f"{node.name} has no known URL")
+        return RedirectResponse(url + "/cache/" + quote(key, safe=""), status_code=307)
 
     @app.put("/cache/{key}", response_model=None)
     async def put(

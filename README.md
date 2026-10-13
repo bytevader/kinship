@@ -301,6 +301,7 @@ pip install "kinship[fastapi]"
 ```python
 import os
 from typing import Annotated
+from urllib.parse import quote
 
 import kinship
 from fastapi import Depends, FastAPI, HTTPException
@@ -313,8 +314,10 @@ def config() -> kinship.Config:   # runs in each worker, at startup
         bind="0.0.0.0:0",
         keys=[os.environ["KINSHIP_KEY"]],
         seeds=["cache.default.svc.cluster.local:7946"],
-        meta={"role": "cache", "http": os.environ["HTTP_ADDR"]},   # "10.0.0.7:8080"
+        meta={"role": "cache", "url": os.environ["PUBLIC_URL"]},   # "https://cache-7.example.com"
     )
+
+URLS = set(os.environ["CACHE_URLS"].split())   # the URLs you expect your nodes to have
 
 app = FastAPI(lifespan=cluster_lifespan(config))
 app.include_router(cluster_router(), dependencies=[Depends(admin_only)])
@@ -325,7 +328,9 @@ data: dict[str, str] = {}
 async def get(key: str, ring: CacheRing) -> dict[str, str] | RedirectResponse:
     node = ring.owner(key)
     if node.name != ring.cluster.local.name:
-        return RedirectResponse(f"http://{node.meta['http']}/cache/{key}", status_code=307)
+        if node.meta.get("url") not in URLS:   # members write their own metadata
+            raise HTTPException(503)
+        return RedirectResponse(node.meta["url"] + "/cache/" + quote(key, safe=""), 307)
     if key not in data:
         raise HTTPException(404)
     return {"key": key, "value": data[key]}
@@ -334,7 +339,8 @@ async def get(key: str, ring: CacheRing) -> dict[str, str] | RedirectResponse:
 - `cluster_lifespan(config, *, leave_timeout=5.0)` goes in `FastAPI(lifespan=...)`. At startup it builds the config, calling `config` if it is a function, starts a `kinship.Cluster` and stores it on `app.state.cluster`; at shutdown it calls `leave()`, then `close()`. To run it next to a lifespan of your own, enter it from yours: `async with cluster_lifespan(config)(app): yield`.
 - `get_cluster` and `get_ring(where=...)` are dependencies, for HTTP and WebSocket routes. `get_ring` builds its `Ring` once per `where`, not per request.
 - `cluster_router(prefix="/cluster")` serves `GET /members` (name, address, state and metadata of each member) and `GET /stats` (this node's counters). They expose member addresses and metadata, so protect them, as above, or leave them off in production.
-- Every server worker process runs its own node. With several workers (`uvicorn --workers 4`, gunicorn), each needs its own gossip port and name: pass a function as above, so each worker builds its own config after the fork, with `bind="0.0.0.0:0"` and no `name` (the default adds a random suffix to the host name) or one that includes the process id. The workers on one host share its HTTP port and so its `http` address, and a request sent there reaches any of them, so keep per-node state such as this cache to one worker per host.
+- Every server worker process runs its own node. With several workers (`uvicorn --workers 4`, gunicorn), each needs its own gossip port and name: pass a function as above, so each worker builds its own config after the fork, with `bind="0.0.0.0:0"` and no `name` (the default adds a random suffix to the host name) or one that includes the process id. The workers on one host share its HTTP port and so its `url`, and a request sent there reaches any of them, so keep per-node state such as this cache to one worker per host.
+- kinship's own traffic is not HTTP: gossip runs over UDP and TCP, encrypted with XChaCha20-Poly1305. Whether your app serves HTTP or HTTPS is up to your server or proxy; put the scheme in the URL you publish in metadata, as above.
 - `httpx.ASGITransport` does not run the lifespan; in tests, enter `app.router.lifespan_context(app)` around the client. [`examples/fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) runs three apps in one process that way.
 
 ## Examples
