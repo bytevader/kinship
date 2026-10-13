@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use kinship_net::{ConfigError, Key, Security, Settings};
+use kinship_net::{ConfigError, Key, Security, Seed, Settings};
 
 /// Everything a [`Cluster`](crate::Cluster) needs, built from a preset with `with_*` setters.
 ///
@@ -20,6 +20,7 @@ use kinship_net::{ConfigError, Key, Security, Settings};
 ///     .with_name("worker-17")
 ///     .with_keys([Key::from_bytes([7; 32])])
 ///     .with_seeds(["10.0.0.5:7946".parse().unwrap()])
+///     .with_seed_hosts(["kinship.default.svc.cluster.local:7946".parse().unwrap()])
 ///     .with_probe_interval(Duration::from_secs(2))
 ///     .with_probe_timeout(Duration::from_secs(1));
 /// assert!(cfg.core().local_health, "Lifeguard is on unless turned off");
@@ -33,6 +34,8 @@ pub struct Config {
     advertise: Option<SocketAddr>,
     meta: Vec<u8>,
     seeds: Vec<SocketAddr>,
+    seed_hosts: Vec<Seed>,
+    resolve_timeout: Duration,
     keys: Vec<Key>,
     insecure_plaintext: bool,
     /// Set by [`Config::local`]: plaintext needs no opt-in while `bind` is loopback.
@@ -68,6 +71,8 @@ impl Config {
             advertise: None,
             meta: Vec::new(),
             seeds: Vec::new(),
+            seed_hosts: Vec::new(),
+            resolve_timeout: Settings::DEFAULT_RESOLVE_TIMEOUT,
             keys: Vec::new(),
             insecure_plaintext: false,
             loopback_plaintext,
@@ -128,6 +133,10 @@ impl Config {
         &self.seeds
     }
 
+    pub fn seed_hosts(&self) -> &[Seed] {
+        &self.seed_hosts
+    }
+
     /// Unique in the cluster, 1 to 64 bytes. Defaults to the host name plus 6 random hex
     /// characters; a stable name survives restarts.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -166,6 +175,29 @@ impl Config {
     /// list may include this node itself.
     pub fn with_seeds(mut self, seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.seeds = seeds.into_iter().collect();
+        self
+    }
+
+    /// Seeds as `host:port`, where the host may be a DNS name, joined along with
+    /// [`with_seeds`](Self::with_seeds). Each name is looked up again at every join and rejoin,
+    /// and every address it has, A and AAAA, is a seed, so a Kubernetes headless Service or a
+    /// docker compose service name works as a seed list.
+    ///
+    /// ```
+    /// let cfg = kinship::Config::lan().with_seed_hosts(["node-1:7946".parse().unwrap()]);
+    /// assert_eq!(cfg.seed_hosts()[0].to_string(), "node-1:7946");
+    /// ```
+    pub fn with_seed_hosts(mut self, seeds: impl IntoIterator<Item = Seed>) -> Self {
+        self.seed_hosts = seeds.into_iter().collect();
+        self
+    }
+
+    /// How long a join keeps looking seed names up, with backoff, while none resolves (30 s).
+    /// A start whose seeds stay unresolved this long fails with
+    /// [`Error::Unresolved`](crate::Error::Unresolved); once one resolves, the rest are looked
+    /// up again at every rejoin.
+    pub fn with_resolve_timeout(mut self, timeout: Duration) -> Self {
+        self.resolve_timeout = timeout;
         self
     }
 
@@ -309,6 +341,8 @@ impl Config {
             advertise: self.advertise,
             meta: self.meta,
             seeds: self.seeds,
+            seed_hosts: self.seed_hosts,
+            resolve_timeout: self.resolve_timeout,
             max_inbound_streams: self.max_inbound_streams,
             max_inbound_streams_per_ip: self.max_inbound_streams_per_ip,
             max_inbound_bytes_per_ip: self.max_inbound_bytes_per_ip,

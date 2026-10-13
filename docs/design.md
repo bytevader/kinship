@@ -266,7 +266,7 @@ UDP carries everything small and frequent: probes, acks, nacks and piggybacked g
 | --- | --- | --- |
 | Ping, PingReq, Ack, Nack | UDP | every probe round |
 | Gossip (Alive, Suspect, Dead) | UDP, piggybacked or in gossip packets | on every probe and every gossip_interval to gossip_nodes peers |
-| Join | TCP push-pull with join = 1 | on join(), to each seed until one answers |
+| Join | TCP push-pull with join = 1 | on join(), to each seed until one answers; seed names are looked up first |
 | Anti-entropy | TCP push-pull | every push_pull_interval with one random live member |
 | Fallback ping | TCP | when the UDP probe and all indirect probes fail, if tcp_fallback_ping is on |
 | Reconnect | TCP push-pull | every reconnect_interval with one random dead member still in its tombstone window; members that left are not asked |
@@ -291,6 +291,8 @@ sequenceDiagram
     N->>O: gossip Alive(N, inc 8) piggybacked on probes
     Note over S,O: Alive 8 beats Dead 7, N is a member everywhere
 ```
+
+Seeds whose host is a DNS name are resolved by kinship-net, never by the core, which only sees addresses. Each name is looked up again at every join and every rejoin, each lookup bounded at 5 s and every name at once, and every address it returns, A and AAAA alike, becomes a seed of that attempt, so a name with several records, such as a Kubernetes headless Service, is a whole seed list and a seed that moves is followed. A name that resolves to nothing is logged and skipped. While no seed resolves and none is an address, a join looks the names up again with backoff, 250 ms doubling to 5 s, for up to resolve_timeout and then fails, which fails a start; once one has resolved, the rest wait for the next rejoin. A rejoin looks its names up on a task of its own, so a slow resolver never holds up the actor.
 
 join() pushes-pulls with every seed at once, skipping the node's own address. It waits for the first attempt with each seed, so it can report how many answered, and succeeds if any did. Seeds that failed are retried with exponential backoff (probe_interval, then doubling) only while no seed has answered, and join() fails with JoinError once every seed has failed join_retries times. Each exchange is bounded by tcp_timeout.
 
@@ -479,7 +481,8 @@ Users pick a preset and override a few fields; the timing defaults are memberlis
 | advertise | derived from bind | address other members use to reach this node |
 | cluster | "default" | label bound into every packet; clusters with different labels ignore each other |
 | meta | empty | initial metadata, at most max_meta_bytes |
-| seeds | empty | addresses join() uses when called with no arguments |
+| seeds | empty | `host:port` seeds, the host an IP address or a DNS name, joined on start, rejoined every rejoin_interval while not live members, and used by join() when called with no arguments |
+| resolve_timeout | 30 s | how long a join keeps looking seed names up, with backoff, while none resolves; a start whose seeds stay unresolved fails with JoinError (Rust `Error::Unresolved`) |
 
 ### Security
 
@@ -555,6 +558,7 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | One-way UDP loss or a UDP-blocking firewall | Nacks show the relays are fine; the TCP fallback ping keeps the member Alive and a metric flags the path | One-way link blocks in kinship-sim `swim::thousand_seeds_fifty_nodes`; kinship-core `sync::tests::tcp_answers_a_ping_the_udp_path_lost`, which checks the tcp_ping_acks metric; chaos scenario `udp-block` in `tools/chaos`: nftables drops one node's UDP inbound or outbound, no node may suspect it, and every other node's tcp_ping_acks must count the fallback pings |
 | Network partition | Each side marks the other Dead; reconnect_interval push-pulls to recent dead members merge the sides after healing, and refutation restores Alive | kinship-sim `sync::healed_partitions_reconverge_thousand_seeds`, which records the convergence time; partitions that never heal in `swim::thousand_seeds_fifty_nodes`; `review::kp05_a_node_confirms_only_suspicions_its_own_probe_raised`, which reads every node's datagrams for a Suspect it signs about a member it never probed unanswered; kinship-core `sync::tests::a_merged_suspicion_counts_no_reporter_and_is_not_gossiped` |
 | Partition longer than dead_reclaim | Tombstones are gone, so reconnect cannot find the other side. Every rejoin_interval each node push-pulls with any configured seed that is not a live member, so a seed on the far side merges the two; with no seed there, the application calls join() through one | kinship-sim `failure::a_partition_longer_than_dead_reclaim_needs_a_join_thousand_seeds`: the sides stay apart after the heal until one join through a seed merges them; kinship `cluster::a_node_alone_rejoins_its_seeds_in_the_background` and `cluster::a_seed_that_is_not_a_member_is_rejoined` |
+| A seed name that does not resolve (DNS down, a typo, a Service with no ready pods) | Logged and skipped; the name is looked up again at every join and rejoin, and the node joins through the seeds that did resolve. A start fails with JoinError (Rust `Error::Unresolved`) only if no seed resolved within resolve_timeout | kinship `cluster::a_start_whose_seed_names_never_resolve_fails` and `cluster::a_seed_given_by_name_is_looked_up_at_every_join_and_rejoin`; kinship-net `seed::tests::an_unresolvable_name_fails_alone_and_a_join_gives_up_after_its_wait`; `test_cluster.py::test_a_start_whose_seed_names_never_resolve_raises_join_error` and `test_cluster.py::test_seeds_may_be_dns_names` |
 | Restart with the same name | The old tombstone wins at first; the push-pull reply teaches the node its old incarnation and it refutes above it | kinship-sim `failure::a_restarted_node_learns_its_incarnation_and_rejoins_thousand_seeds`, restarting before anyone suspects it or after its tombstone spread, and never reported dead after the restart; kinship-core `sync::tests::a_restarted_node_learns_its_old_incarnation_and_refutes` |
 | Two live nodes with the same name | Alive with the same name and a different address is not applied, for a live member and for a Dead or Left one until its tombstone is reaped; a NameConflict event fires on both sides. A member that comes back at a new address is admitted there once its tombstone is reaped | kinship-sim `failure::a_second_node_with_a_live_name_never_takes_it_thousand_seeds`; kinship-core `tests::a_second_live_node_cannot_take_a_name`, `tests::a_tombstone_keeps_its_name_at_its_address_until_it_is_reaped` and `open_findings::ki03_a_member_cannot_move_a_dead_node_to_another_address`; `test_cluster.py::test_two_live_nodes_with_one_name_both_see_the_conflict` |
 | Key mismatch during rotation | Packets that fail authentication are dropped and counted under decrypt_failures; the node looks dead to peers without the key | kinship-sim `keyring::a_node_that_falls_behind_dies_and_rejoins_thousand_seeds` and `keyring::rotating_every_node_never_raises_a_suspicion_thousand_seeds`; kinship `keyring::rotating_a_cluster_keeps_every_node_alive` |

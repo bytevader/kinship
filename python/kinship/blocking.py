@@ -95,7 +95,8 @@ class Cluster(_Base):
 
     def start(self, *, timeout: Timeout = None) -> Self:
         """Binds, starts the node and joins ``cfg.seeds``, then returns this cluster. A
-        startup join that reaches no seed only logs a warning."""
+        startup join that reaches no seed only logs a warning; one whose seeds do not resolve
+        within ``cfg.resolve_timeout`` raises ``JoinError``."""
         self._started(_kinship.Node.start_blocking(self._cfg, _seconds(timeout)))
         return self
 
@@ -114,7 +115,8 @@ class Cluster(_Base):
 
     def join(self, seeds: Iterable[str] | None = None, *, timeout: Timeout = None) -> int:
         """Push-pulls with each seed until one answers; returns how many answered. Raises
-        ``JoinError`` if none did. With no argument it uses ``cfg.seeds``."""
+        ``JoinError`` if none did. With no argument it uses ``cfg.seeds``. A seed is
+        ``"host:port"``, and a host that is a DNS name is looked up now."""
         node = self._running
         return node.join_blocking(None if seeds is None else _seed_list(seeds), _seconds(timeout))
 

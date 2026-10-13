@@ -37,8 +37,8 @@ pub use config::{Config, DEFAULT_PORT};
 /// The protocol half of [`Config`], from `kinship-core`.
 pub use kinship_net::Config as CoreConfig;
 pub use kinship_net::{
-    ConfigError, Error, Event, Events, Key, KeyError, KeyId, Keyring, Member, Metrics, State,
-    Stats, TokioTransport, Transport, WIRE_VERSION, generate_key, mem,
+    ConfigError, Error, Event, Events, Key, KeyError, KeyId, Keyring, Member, Metrics, Seed,
+    SeedError, State, Stats, TokioTransport, Transport, WIRE_VERSION, generate_key, mem,
 };
 
 use kinship_net::Memberlist;
@@ -60,7 +60,9 @@ impl Cluster {
     ///
     /// A bad field fails before any socket opens. A startup join that reaches no seed only
     /// logs a warning: the node starts alone and retries the seeds every `rejoin_interval`,
-    /// as it does for any seed that is not a live member.
+    /// as it does for any seed that is not a live member. Seed names that do not resolve are
+    /// logged and looked up again, but if no seed resolves within `resolve_timeout`, start
+    /// fails with [`Error::Unresolved`].
     pub async fn start(cfg: Config) -> Result<Self, Error> {
         let (settings, bind) = cfg.build()?;
         let transport = TokioTransport::bind(bind).await?;
@@ -79,6 +81,20 @@ impl Cluster {
     /// [`Error::JoinFailed`] if none did.
     pub async fn join(&self, seeds: impl IntoIterator<Item = SocketAddr>) -> Result<usize, Error> {
         self.inner.join(seeds).await
+    }
+
+    /// [`join`](Self::join) with seeds that may be DNS names, each looked up now; every address
+    /// a name has is a seed. Fails with [`Error::Unresolved`] if no seed resolves within
+    /// `resolve_timeout`.
+    ///
+    /// ```no_run
+    /// # async fn run(cluster: kinship::Cluster) -> Result<(), Box<dyn std::error::Error>> {
+    /// cluster.join_seeds(["node-1:7946".parse()?]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn join_seeds(&self, seeds: impl IntoIterator<Item = Seed>) -> Result<usize, Error> {
+        self.inner.join_seeds(seeds).await
     }
 
     /// Alive and suspect members, this node included.

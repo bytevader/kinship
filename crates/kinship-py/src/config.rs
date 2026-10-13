@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use kinship_net::{ConfigError, Identity, Key, Security, Settings};
+use kinship_net::{ConfigError, Identity, Key, Security, Seed, Settings};
 use kinship_proto::tags::{TagsError, encode_tags};
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyAttributeError, PyTypeError};
@@ -44,7 +44,8 @@ pub struct Fields {
     bind: SocketAddr,
     advertise: Option<SocketAddr>,
     meta: Vec<(String, String)>,
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<Seed>,
+    resolve_timeout: Duration,
     keys: Vec<Key>,
     insecure_plaintext: bool,
     max_inbound_streams: usize,
@@ -71,6 +72,7 @@ impl Fields {
             advertise: None,
             meta: Vec::new(),
             seeds: Vec::new(),
+            resolve_timeout: Settings::DEFAULT_RESOLVE_TIMEOUT,
             keys: Vec::new(),
             insecure_plaintext: false,
             max_inbound_streams: Settings::DEFAULT_MAX_INBOUND_STREAMS,
@@ -84,6 +86,10 @@ impl Fields {
 
     pub fn runtime_threads(&self) -> usize {
         self.runtime_threads
+    }
+
+    pub fn seeds(&self) -> &[Seed] {
+        &self.seeds
     }
 
     /// Checks every field together and resolves what the node needs: its settings and where to
@@ -119,12 +125,15 @@ impl Fields {
         if self.runtime_threads == 0 {
             return fail("runtime_threads", "must be at least 1");
         }
+        let (seeds, seed_hosts) = split_seeds(&self.seeds);
         let settings = Settings {
             core,
             name: self.name.clone(),
             advertise: self.advertise,
             meta,
-            seeds: self.seeds.clone(),
+            seeds,
+            seed_hosts,
+            resolve_timeout: self.resolve_timeout,
             max_inbound_streams: self.max_inbound_streams,
             max_inbound_streams_per_ip: self.max_inbound_streams_per_ip,
             max_inbound_bytes_per_ip: self.max_inbound_bytes_per_ip,
@@ -253,13 +262,13 @@ impl Fields {
                 self.seeds = if v.is_none() {
                     Vec::new()
                 } else {
-                    let reason = "must be a list of \"host:port\" strings with IP addresses";
+                    let reason = "must be a list of \"host:port\" strings, each host an IP address                                   or a DNS name";
                     if v.is_instance_of::<PyString>() {
                         return Err(bad(reason));
                     }
                     let mut seeds = Vec::new();
                     for item in v.try_iter().map_err(|_| bad(reason))? {
-                        seeds.push(addr(&item?).ok_or_else(|| bad(reason))?);
+                        seeds.push(seed(&item?).ok_or_else(|| bad(reason))?);
                     }
                     seeds
                 }
@@ -305,6 +314,10 @@ impl Fields {
                 self.tcp_header_timeout = duration(py, v)
                     .ok_or_else(|| bad("must be seconds as a non-negative float, or a timedelta"))?
             }
+            "resolve_timeout" => {
+                self.resolve_timeout = duration(py, v)
+                    .ok_or_else(|| bad("must be seconds as a non-negative float, or a timedelta"))?
+            }
             "event_buffer" => self.event_buffer = count(v)?,
             "runtime_threads" => self.runtime_threads = count(v)?,
             _ => {
@@ -331,6 +344,7 @@ impl Fields {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .into_py_any(py),
+            "resolve_timeout" => secs(self.resolve_timeout),
             "meta" => {
                 let d = PyDict::new(py);
                 for (k, v) in &self.meta {
@@ -387,6 +401,7 @@ const FIELDS: &[&str] = &[
     "advertise",
     "cluster",
     "seeds",
+    "resolve_timeout",
     "meta",
     "key_ids",
     "insecure_plaintext",
@@ -465,6 +480,23 @@ pub fn duration(py: Python<'_>, v: &Bound<'_, PyAny>) -> Option<Duration> {
 
 fn addr(v: &Bound<'_, PyAny>) -> Option<SocketAddr> {
     v.extract::<String>().ok()?.trim().parse().ok()
+}
+
+fn seed(v: &Bound<'_, PyAny>) -> Option<Seed> {
+    v.extract::<String>().ok()?.parse().ok()
+}
+
+/// Seeds as the addresses among them and the rest, the two lists of `Settings`.
+pub fn split_seeds(seeds: &[Seed]) -> (Vec<SocketAddr>, Vec<Seed>) {
+    let mut addrs = Vec::new();
+    let mut hosts = Vec::new();
+    for s in seeds {
+        match s {
+            Seed::Addr(a) => addrs.push(*a),
+            other => hosts.push(other.clone()),
+        }
+    }
+    (addrs, hosts)
 }
 
 /// A 32-byte key from `bytes` or base64 text. Never echoes the input.

@@ -106,6 +106,32 @@ async def test_join_raises_when_no_seed_answers_but_startup_only_warns() -> None
             await lonely.join(dead_seed)  # type: ignore[arg-type]
 
 
+async def test_seeds_may_be_dns_names() -> None:
+    async with kinship.Cluster(local()) as a:
+        port = a.local.addr.rsplit(":", 1)[1]
+        by_name = [f"localhost:{port}"]
+        async with (
+            kinship.Cluster(local(seeds=by_name)) as b,
+            kinship.Cluster(local()) as c,
+        ):
+            assert await asyncio.wait_for(c.join(by_name), WAIT) >= 1
+            everyone = {a.local.name, b.local.name, c.local.name}
+            await wait_until(lambda: all(names(n) == everyone for n in (a, b, c)))
+
+
+async def test_a_start_whose_seed_names_never_resolve_raises_join_error() -> None:
+    # .invalid never resolves (RFC 6761).
+    cfg = local(seeds=["kinship-seed.invalid:7946"], resolve_timeout=0.3)
+    with pytest.raises(kinship.JoinError, match="resolved"):
+        await asyncio.wait_for(kinship.Cluster(cfg).start(), WAIT)
+    async with kinship.Cluster(local()) as a:
+        cfg = cfg.replace(seeds=[a.local.addr, *cfg.seeds])  # one seed resolves: start goes on
+        async with kinship.Cluster(cfg) as b:
+            await wait_until(lambda: names(a) == {a.local.name, b.local.name})
+            with pytest.raises(kinship.JoinError):
+                await asyncio.wait_for(b.join(["kinship-seed.invalid:7946"]), WAIT)
+
+
 async def test_events_lost_after_a_slow_consumer() -> None:
     async with kinship.Cluster(local(event_buffer=4)) as a:
         slow = a.events()

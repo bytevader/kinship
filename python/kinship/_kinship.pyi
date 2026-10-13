@@ -38,7 +38,9 @@ class Config:
     bind: str
     advertise: str | None
     cluster: str
+    # "host:port"; the host is an IP address or a DNS name, looked up at every join and rejoin
     seeds: list[str]
+    resolve_timeout: float
     meta: dict[str, str]
     # Security: `keys` is write-only; these are their ids.
     key_ids: list[str]

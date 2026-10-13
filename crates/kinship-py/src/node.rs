@@ -3,11 +3,10 @@
 //! Every method comes in an async form, which returns an asyncio awaitable, and a blocking form
 //! with a `_blocking` suffix, which waits with the GIL released. Reads never wait on the node.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kinship_net::{Error, Event, Events, Key, Member, Memberlist, State, TokioTransport};
+use kinship_net::{Error, Event, Events, Key, Member, Memberlist, Seed, State, TokioTransport};
 use kinship_proto::tags::{Tags, TagsError, encode_tags};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -92,16 +91,16 @@ fn raw_event(e: Event) -> RawEvent {
 /// Everything the node's tasks share.
 struct Inner {
     ml: Memberlist,
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<Seed>,
     max_meta: usize,
     /// Serializes metadata changes, so an `update_meta` merge never loses a concurrent one.
     meta_lock: tokio::sync::Mutex<()>,
 }
 
 impl Inner {
-    async fn join(&self, seeds: Option<Vec<SocketAddr>>) -> Result<usize, KError> {
+    async fn join(&self, seeds: Option<Vec<Seed>>) -> Result<usize, KError> {
         let seeds = seeds.unwrap_or_else(|| self.seeds.clone());
-        Ok(self.ml.join(seeds).await?)
+        Ok(self.ml.join_seeds(seeds).await?)
     }
 
     fn encode(&self, pairs: &[(String, String)]) -> Result<Vec<u8>, KError> {
@@ -171,17 +170,14 @@ enum KeyChange {
     Remove,
 }
 
-fn parse_seeds(seeds: Option<Vec<String>>) -> PyResult<Option<Vec<SocketAddr>>> {
+fn parse_seeds(seeds: Option<Vec<String>>) -> PyResult<Option<Vec<Seed>>> {
     seeds
         .map(|seeds| {
             seeds
                 .iter()
                 .map(|s| {
-                    s.trim().parse().map_err(|_| {
-                        PyValueError::new_err(format!(
-                            "seed {s:?} is not \"host:port\" with an IP address"
-                        ))
-                    })
+                    s.parse()
+                        .map_err(|e: kinship_net::SeedError| PyValueError::new_err(e.to_string()))
                 })
                 .collect()
         })
@@ -243,7 +239,7 @@ impl Node {
 
     async fn spawn(fields: config::Fields) -> Result<Node, KError> {
         let (settings, bind) = fields.build(true)?;
-        let seeds = settings.seeds.clone();
+        let seeds = fields.seeds().to_vec();
         let max_meta = settings.core.limits.max_meta_bytes;
         let transport = TokioTransport::bind(bind).await.map_err(Error::from)?;
         let ml = Memberlist::start(settings, transport).await?;

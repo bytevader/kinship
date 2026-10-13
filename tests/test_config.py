@@ -22,6 +22,7 @@ def test_presets_differ_only_in_timing() -> None:
     assert lan.event_buffer == 1024 and lan.max_meta_bytes == 512 and lan.runtime_threads == 1
     assert (lan.max_inbound_streams, lan.max_inbound_streams_per_ip) == (64, 16)
     assert lan.max_inbound_bytes_per_ip is None and lan.tcp_header_timeout == 1.0
+    assert lan.seeds == [] and lan.resolve_timeout == 30.0
     one_frame = lan.max_stream_frame + 4
     assert lan.replace(max_inbound_bytes_per_ip=one_frame).max_inbound_bytes_per_ip == one_frame
     for preset in (lan, wan, local):
@@ -37,14 +38,21 @@ def test_fields_are_set_by_keyword_and_configs_are_frozen() -> None:
         name="edge-12",
         probe_interval=4.0,
         dead_reclaim=timedelta(minutes=2),
-        seeds=["10.0.0.5:7946", "[fd00::5]:7946"],
+        seeds=["10.0.0.5:7946", "[fd00::5]:7946", " kinship-0.kinship.svc:7946 ", "node-1.:7946"],
+        resolve_timeout=timedelta(seconds=90),
         meta={"role": "cache", "zone": "eu-1"},
         cluster="stores-prod",
     )
     assert cfg.name == "edge-12"
     assert cfg.probe_interval == 4.0
     assert cfg.dead_reclaim == 120.0
-    assert cfg.seeds == ["10.0.0.5:7946", "[fd00::5]:7946"]
+    assert cfg.seeds == [
+        "10.0.0.5:7946",
+        "[fd00::5]:7946",
+        "kinship-0.kinship.svc:7946",
+        "node-1:7946",
+    ]
+    assert cfg.resolve_timeout == 90.0
     assert cfg.meta == {"role": "cache", "zone": "eu-1"}
     assert cfg.cluster == "stores-prod"
     with pytest.raises(AttributeError):
@@ -74,6 +82,10 @@ def test_default_names_are_generated_once_per_config() -> None:
         ({"bind": "localhost"}, "bind"),
         ({"seeds": "127.0.0.1:1"}, "seeds"),
         ({"seeds": ["nowhere"]}, "seeds"),
+        ({"seeds": ["::1:7946"]}, "seeds"),
+        ({"seeds": ["node 1:7946"]}, "seeds"),
+        ({"seeds": ["node-1:70000"]}, "seeds"),
+        ({"resolve_timeout": -1.0}, "resolve_timeout"),
         ({"event_buffer": 0}, "event_buffer"),
         ({"event_buffer": True}, "event_buffer"),
         ({"indirect_checks": -1}, "indirect_checks"),

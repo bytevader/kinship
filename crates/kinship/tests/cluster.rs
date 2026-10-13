@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kinship::mem::MemNetwork;
-use kinship::{Cluster, Config, Event, Events, Key, State};
+use kinship::{Cluster, Config, Error, Event, Events, Key, Seed, State};
 use tokio::time::{Instant, sleep, timeout};
 
 /// Upper bound on any single wait. Generous, because CI machines are slow and shared.
@@ -278,6 +278,79 @@ async fn a_seed_that_is_not_a_member_is_rejoined() {
     })
     .await;
     close_all(&[a, b, c]).await;
+}
+
+/// A port on loopback that nothing listens on, for a node that starts later.
+fn free_port() -> u16 {
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.local_addr().unwrap().port()
+}
+
+fn localhost(port: u16) -> Seed {
+    format!("localhost:{port}").parse().unwrap()
+}
+
+#[tokio::test]
+async fn a_seed_given_by_name_is_looked_up_at_every_join_and_rejoin() {
+    let port = free_port();
+    let fast = |i: usize| {
+        config(i)
+            .with_rejoin_interval(Duration::from_millis(300))
+            .with_join_retries(1)
+    };
+    // localhost resolves, but nothing listens there yet: b starts alone.
+    let b = fast(1).with_seed_hosts([localhost(port)]);
+    let b = bounded("start b", Cluster::start(b)).await.unwrap();
+    assert_eq!(b.members().len(), 1);
+
+    let a = fast(0).with_bind(SocketAddr::from(([127, 0, 0, 1], port)));
+    let a = bounded("start a", Cluster::start(a)).await.unwrap();
+    let pair = ["n0".to_owned(), "n1".to_owned()];
+    wait_until("b rejoins a through its name", || {
+        sees_alive(&a, &pair) && sees_alive(&b, &pair)
+    })
+    .await;
+
+    // An explicit join by name, and the IPv4 address of a's name answers.
+    let c = bounded("start c", Cluster::start(fast(2))).await.unwrap();
+    let joined = bounded("c joins", c.join_seeds([localhost(port)])).await;
+    assert!(joined.unwrap() >= 1);
+    let names = ["n0".to_owned(), "n1".to_owned(), "n2".to_owned()];
+    wait_until("c is a member", || {
+        [&a, &b, &c].iter().all(|n| sees_alive(n, &names))
+    })
+    .await;
+    close_all(&[a, b, c]).await;
+}
+
+#[tokio::test]
+async fn a_start_whose_seed_names_never_resolve_fails() {
+    // .invalid never resolves (RFC 6761).
+    let gone: Seed = "kinship-seed.invalid:7946".parse().unwrap();
+    let wait = Duration::from_millis(500);
+    let cfg = config(0)
+        .with_seed_hosts([gone.clone()])
+        .with_resolve_timeout(wait);
+    let begun = Instant::now();
+    let err = bounded("start", Cluster::start(cfg)).await.unwrap_err();
+    assert!(matches!(err, Error::Unresolved), "{err:?}");
+    assert!(begun.elapsed() >= wait, "{:?}", begun.elapsed());
+
+    // With one seed that resolves, a name that does not only logs, and the node starts.
+    let a = bounded("start a", Cluster::start(config(1))).await.unwrap();
+    let cfg = config(2)
+        .with_seeds([a.local().addr])
+        .with_seed_hosts([gone.clone()])
+        .with_resolve_timeout(wait);
+    let b = bounded("start b", Cluster::start(cfg)).await.unwrap();
+    let pair = ["n1".to_owned(), "n2".to_owned()];
+    wait_until("b joins a", || {
+        sees_alive(&a, &pair) && sees_alive(&b, &pair)
+    })
+    .await;
+    let err = bounded("join", b.join_seeds([gone])).await.unwrap_err();
+    assert!(matches!(err, Error::Unresolved), "{err:?}");
+    close_all(&[a, b]).await;
 }
 
 #[tokio::test]
