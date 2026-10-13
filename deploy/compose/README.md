@@ -1,8 +1,9 @@
 # Keys in motion: a kinship Compose demo
 
 Five FastAPI cache nodes own 64 sample keys through `kinship.ring`. A sixth
-node is a dashboard at <http://localhost:8080>, with membership cards, each
-node's member count, a key grid, a load generator and fault controls. Everything
+node is a dashboard at <http://localhost:8080>: a card per node with its state,
+its share of the keys and its own view of the cluster, a hint bar that says what
+to watch, a key grid, a load generator and fault controls. Everything
 updates through Server-Sent Events and plain JavaScript; there is no frontend
 build step. Requires Docker with Compose, including Docker Desktop on Windows.
 
@@ -17,7 +18,7 @@ docker compose up --build -d
 Open <http://localhost:8080>. The cache nodes wait 15 seconds on every startup
 so crashes remain visible as DEAD before their automatic restart rejoins.
 The dashboard starts at once and retries its seeds every 5 seconds
-(`rejoin_interval=5`), so six ALIVE cards and five owner colours appear a few
+(`rejoin_interval=5`), so five green node cards and five owner colours appear a few
 seconds after the nodes finish waiting.
 Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
@@ -41,7 +42,7 @@ requires `kinship[fastapi]>=0.2` on PyPI and intentionally cannot use 0.1.1.
 
 ## What the dashboard shows
 
-Press **Start load**. It warms the 64 keys once, then GETs random keys and
+Turn on **Load**. It warms the 64 keys once, then GETs random keys and
 occasionally PUTs new values through random cache nodes. The receiving node
 uses `get_ring(where={"role": "cache"})` and forwards to the owner. An owner's
 metadata URL must match that node's expected URL; keys are quoted and a hop
@@ -49,7 +50,7 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
 
 - Key colours identify owners. Changed owners flash; only keys that actually
   moved flash. Hover a key to see its normal owner and its new-write owner.
-- SUSPECT owners retain their keys and get an amber outline, while new writes
+- SUSPECT owners retain their keys and get a dashed amber outline, while new writes
   go to an ALIVE fallback. Reads still target the suspect owner.
 - DEAD, LEFT and draining nodes own no keys. `ring.changes()` and `ring.moved()`
   drop values a node no longer owns. Draining also clears its own cache at once,
@@ -64,8 +65,9 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
 - **Sees N members** is polled from that node's `/cluster/members`. During a
   failure, counts can disagree. If its HTTP API cannot be reached, the card
   explicitly shows its last count as stale. DEAD and LEFT cards remain visible.
-- Amber log lines are fault/load actions; blue lines are ring changes; other
-  lines are membership events. History is bounded to 200 timestamped entries.
+- The event log lists the newest first: membership events in blue, ring changes
+  in violet, and fault, load and chaos actions in orange. History is bounded to
+  200 timestamped entries.
   Browsers reconnect to a current snapshot. Restarting the dashboard clears
   counters/history; refreshing the page does not.
 
@@ -76,13 +78,15 @@ lock or a guarantee against concurrent writes during a partition.
 
 ## Try this
 
-Start load and let warming finish first. Use the buttons on `node-3`'s card;
-disable random chaos before manual faults. Recover one fault before starting
-another. Docker buttons require the optional profile below.
+Turn on Load and let warming finish first. Use the buttons on `node-3`'s card;
+the hint bar above the cards says what to watch, and the card offers the right
+recovery button while the node needs one. Turn random chaos off before manual
+faults, and recover one fault before starting another. Docker buttons require
+the optional profile below.
 
 | Fault / button | What to watch | Recovery |
 | --- | --- | --- |
-| **Stall 20s** | The FastAPI event loop blocks with `time.sleep(20)`. HTTP calls time out and its member count becomes stale, but the card stays ALIVE and keys keep their owner: kinship runs on its own Rust thread. | Automatic after 20 seconds. |
+| **Stall** | The FastAPI event loop blocks with `time.sleep(20)`. HTTP calls time out and its member count becomes stale, but the card stays ALIVE and keys keep their owner: kinship runs on its own Rust thread. | Automatic after 20 seconds. |
 | **Crash** | `os._exit(1)` sends no leave. Watch SUSPECT, DEAD, moved keys and misses, then MemberJoined when `restart: on-failure` starts it again. | Automatic, including the 15-second startup delay. |
 | **Leave** | The node calls `leave()` and exits 0. Watch LEFT, moved keys and misses; Docker leaves it down. | **Start** with the chaos profile, or `docker compose start node-3`; the dashboard frees the fault slot once the node reports itself ALIVE. |
 | **Drain** | Metadata changes to `role=draining`. The member stays ALIVE but its keys move to cache members. | **Undrain** returns `role=cache`; some keys move back, cold. |
@@ -91,22 +95,24 @@ another. Docker buttons require the optional profile below.
 | **Restart** | Docker stops and starts the process. A normal stop sends LEFT; values are lost and the node rejoins after the startup delay. | Automatic. |
 | **Partition** | Disconnects only that cache node from the membership network. HTTP becomes unreachable; peers suspect and mark it DEAD, while it marks all of them DEAD. Keys move and errors/misses rise. | **Reconnect** restores its Docker DNS alias; it rejoins within seconds. Its own stale rumours can briefly flip a healthy member to SUSPECT or DEAD until that member refutes, so watch for a second, short RingChanged. |
 
-A crash on `node-3`, six seconds in: it is DEAD, its card shows its HTTP API
-is gone, and its 12 keys now belong to the other four nodes.
+A crash on `node-3`, seven seconds in: it is DEAD, its card shows its HTTP API
+is gone, and its keys now belong to the other four nodes. The hint bar says
+Docker will restart it, so the card offers no recovery button.
 
 ![node-3 DEAD after a crash, with its keys moved to the other nodes](screenshots/crash.jpg)
 
-A partition of `node-3`: the same picture from the dashboard, while views
-still disagree, so the dashboard sees 5 members and `node-1` still sees 6.
+A partition of `node-3`: its peers and the dashboard now see 5 members, its
+own count is stale because its HTTP API is out of reach, and its card offers
+**Reconnect**.
 
 ![node-3 DEAD behind a partition, with member counts that disagree](screenshots/partition.jpg)
 
-**Start chaos** applies a random fault every configured interval (20 seconds
+**Random chaos** applies a random fault every configured interval (20 seconds
 by default), holding at most one fault slot at a time. It waits for timer
 recovery before taking another slot: unpause, start, reconnect or undrain;
 stalls recover on their own. Recovery failures are logged and retried. Manual
 faults block random faults until recovered; a starting worker retains its
-fault slot until its HTTP API is ready. **Stop chaos** also initiates
+fault slot until its HTTP API is ready. Turning it off also initiates
 recovery; if a stall is still running, wait for it to finish. Without the
 Docker helper, random chaos uses only stalls and drains, which can recover
 without access to Docker.
@@ -159,7 +165,7 @@ docker compose run --rm --no-deps dashboard python -m unittest discover -s /app 
 ```
 
 Inspect services with `docker compose ps` and logs with `docker compose logs -f`.
-To stop the demo, first Stop chaos and recover manual faults (Unpause,
+To stop the demo, first turn random chaos off and recover manual faults (Unpause,
 Reconnect, Start or Undrain). Then:
 
 ```sh
