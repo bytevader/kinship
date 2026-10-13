@@ -1,46 +1,56 @@
 name: kinship-demo
 
 x-node: &node
-  build: .
+  build:
+    context: ../..
+    dockerfile: deploy/compose/Dockerfile
+    args:
+      KINSHIP_INSTALL: ${KINSHIP_INSTALL:-source}
   image: kinship-compose-demo
   init: true
+  restart: on-failure
   stop_grace_period: 15s
+  networks: [membership]
+
+x-env: &env
+  ROLE: cache
+  STARTUP_DELAY_SECONDS: "15"
 
 services:
   node-1:
     <<: *node
     hostname: node-1
     environment:
+      <<: *env
       NODE_NAME: node-1
-      ROLE: seed
       ZONE: zone-a
   node-2:
     <<: *node
     hostname: node-2
     environment:
+      <<: *env
       NODE_NAME: node-2
-      ROLE: worker
       ZONE: zone-a
   node-3:
     <<: *node
     hostname: node-3
     environment:
+      <<: *env
       NODE_NAME: node-3
-      ROLE: worker
       ZONE: zone-b
   node-4:
     <<: *node
     hostname: node-4
     environment:
+      <<: *env
       NODE_NAME: node-4
-      ROLE: worker
       ZONE: zone-b
   node-5:
     <<: *node
     hostname: node-5
     environment:
+      <<: *env
       NODE_NAME: node-5
-      ROLE: worker
       ZONE: zone-c
   dashboard:
     <<: *node
@@ -49,6 +59,24 @@ services:
       NODE_NAME: dashboard
       ROLE: dashboard
       ZONE: zone-c
-    command: ["uvicorn", "demo:app", "--host", "0.0.0.0", "--port", "8080"]
+      STARTUP_DELAY_SECONDS: "0"
+    command: ["uvicorn", "demo:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-graceful-shutdown", "5"]
     ports:
       - "127.0.0.1:8080:8080"
+    networks: [membership, control]
+  chaos:
+    <<: *node
+    profiles: [chaos]
+    hostname: chaos
+    user: "0:0"
+    environment:
+      DOCKER_PROJECT: kinship-demo
+      DOCKER_NETWORK: kinship-demo_membership
+    command: ["uvicorn", "chaos:app", "--host", "0.0.0.0", "--port", "9000"]
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    networks: [control]
+
+networks:
+  membership:
+  control:
+    internal: true

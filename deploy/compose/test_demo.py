@@ -35,6 +35,33 @@ async def events(*values):
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_suspect_ownership_and_movement_are_in_sse_snapshot(self):
+        old = member(state=kinship.State.SUSPECT)
+        fallback = member("node-4")
+
+        class FakeRing:
+            def owner(self, key, *, new_work=False):
+                return fallback if new_work else old
+
+            def moved(self, keys, before, after):
+                return {"key-00": (old, fallback)}
+
+        view = View(Cluster(old, fallback), FakeRing())
+        view.resync()
+        snapshot = json.loads(view.snapshot())
+        self.assertEqual(len(snapshot["keys"]), 64)
+        self.assertEqual(snapshot["keys"][0]["owner"], "node-3")
+        self.assertEqual(snapshot["keys"][0]["state"], "SUSPECT")
+        self.assertEqual(snapshot["keys"][0]["write_owner"], "node-4")
+
+        async def changes():
+            yield SimpleNamespace(members=(fallback,))
+
+        await view.ring_changes(changes(), (old, fallback))
+        self.assertGreater(json.loads(view.snapshot())["keys"][0]["moved_at"], 0)
+        self.assertEqual(view.log[-1]["kind"], "RingChanged")
+        self.assertEqual(view.log[-1]["style"], "ring")
+
     async def test_dead_and_left_remain_visible_then_rejoin_replaces_them(self):
         view = View(Cluster(member()))
         view.resync()

@@ -1,0 +1,13 @@
+.git
+.venv
+target
+.worktrees
+**/.git
+**/.venv
+**/target
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+.coverage*
+htmlcov
