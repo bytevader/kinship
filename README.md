@@ -11,7 +11,7 @@
   <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/bytevader/kinship/actions/workflows/ci.yml/badge.svg?branch=main" alt="Test"></a>
   <a href="https://github.com/bytevader/kinship/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbytevader%2Fkinship%2Fbadges%2Fcoverage.json" alt="Coverage"></a>
   <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/v/kinship?color=%2334D058&label=pypi%20package" alt="Package version"></a>
-  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/pypi/pyversions/kinship?color=%2334D058" alt="Supported Python versions"></a>
+  <a href="https://pypi.org/project/kinship/"><img src="https://img.shields.io/badge/python-3.11%2B%20%C2%B7%203.14t-%2334D058" alt="Supported Python versions"></a>
   <a href="https://crates.io/crates/kinship"><img src="https://img.shields.io/crates/v/kinship?color=%2334D058" alt="crates.io"></a>
   <a href="https://docs.rs/kinship"><img src="https://img.shields.io/docsrs/kinship" alt="docs.rs"></a>
   <a href="https://github.com/bytevader/kinship/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="License: Apache-2.0 OR MIT"></a>
