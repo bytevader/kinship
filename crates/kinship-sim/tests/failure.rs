@@ -126,6 +126,11 @@ fn view(sim: &Sim<Observed>, o: usize, name: &str) -> Option<(State, u32, std::n
     Some((m.state, m.incarnation, m.addr))
 }
 
+/// The epoch of the life of `name` that `o` holds.
+fn epoch_seen(sim: &Sim<Observed>, o: usize, name: &str) -> Option<u64> {
+    Some(sim.node(o)?.node.member(name)?.epoch)
+}
+
 /// Steps the sim in `step`s until `done` holds or `until` passes. Returns when it held.
 fn run_until_true(
     sim: &mut Sim<Observed>,
@@ -167,8 +172,14 @@ struct Measured {
 
 // ---------------------------------------------------------------------------------------------
 // 1. A node restarts with the same name.
+//
+// With `epochs`, as from 0.3, the new life starts at a later epoch and replaces the old one
+// at once, at incarnation 0, below the old life's: every node reports the old life leaving,
+// unless it already held it dead, and the new one joining. Without, as before 0.3 and between
+// nodes that do not send epochs, the restarted node learns its old incarnation from its join
+// and refutes above it.
 
-fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn restart(seed: u64, nodes: usize, epochs: bool) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x5245_5354);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -200,9 +211,10 @@ fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
         crash_at - Instant::ZERO + detection_bound(&cfg, nodes) * 2 + cfg.tcp_timeout + settle,
     );
     // A restarted instance knows nobody: it joins through its seeds like a new node.
-    let (mut sim, log) = sim(seed, scenario, |spec, log| {
+    let (mut sim, log) = sim(seed, scenario, move |spec, log| {
         let fresh = spec.now == Instant::ZERO;
-        Observed::new(spec, log, move |_| fresh)
+        let epoch = if epochs { spec.epoch() } else { 0 };
+        Observed::with_epoch(spec, &spec.name, epoch, config(), log, move |_| fresh)
     });
     let fail = |msg: String| {
         Err(format!(
@@ -213,6 +225,7 @@ fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
 
     sim.run_until(crash_at);
     let old = sim.node(r).map_or(0, |n| n.node.local().incarnation);
+    let old_epoch = sim.node(r).map_or(0, |n| n.node.local().epoch);
     if old < changes as u32 {
         return fail(format!("only reached incarnation {old} before the crash"));
     }
@@ -276,28 +289,39 @@ fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
         return fail(format!("the join did not reach a seed: {:?}", joined()));
     }
     let learned = sim.node(r).map_or(0, |n| n.node.local().incarnation);
-    if learned <= old {
+    let new_epoch = sim.node(r).map_or(0, |n| n.node.local().epoch);
+    if epochs && (learned >= old || new_epoch <= old_epoch) {
+        return fail(format!(
+            "joined at incarnation {learned} of epoch {new_epoch}, not below its old {old} \
+             in a later life than {old_epoch}"
+        ));
+    }
+    if !epochs && learned <= old {
         return fail(format!(
             "joined at incarnation {learned}, not above its old {old}"
         ));
     }
+    // The new life, as every node must come to hold it.
+    let current = |sim: &Sim<Observed>, o: usize| {
+        let at_new = if epochs {
+            epoch_seen(sim, o, &name) == Some(new_epoch)
+        } else {
+            view(sim, o, &name).is_some_and(|v| v.1 > old)
+        };
+        at_new && view(sim, o, &name).is_some_and(|v| v.0 == State::Alive && v.2 == addr_of(r))
+    };
 
     let everyone: BTreeSet<usize> = (0..nodes).collect();
     let until = restarted + dissemination_bound(&cfg, nodes);
     let converged = run_until_true(&mut sim, ms(100), until, |sim| {
-        live_set(sim, r) == everyone
-            && others.iter().all(|&o| {
-                view(sim, o, &name)
-                    .is_some_and(|v| v.0 == State::Alive && v.1 > old && v.2 == addr_of(r))
-            })
+        live_set(sim, r) == everyone && others.iter().all(|&o| current(sim, o))
     });
     let Some(at) = converged else {
         let bad: Vec<String> = others
             .iter()
             .filter_map(|&o| {
-                let v = view(&sim, o, &name);
-                v.is_none_or(|v| v.0 != State::Alive || v.1 <= old)
-                    .then(|| format!("{} holds {v:?}", name_of(o)))
+                let v = (view(&sim, o, &name), epoch_seen(&sim, o, &name));
+                (!current(&sim, o)).then(|| format!("{} holds {v:?}", name_of(o)))
             })
             .take(5)
             .collect();
@@ -331,6 +355,33 @@ fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
             return fail(format!("{} ends with it {v:?}", name_of(o)));
         }
     }
+    if epochs {
+        // Each node saw the restart as two events: the old life leaving, unless it already
+        // held it dead, then the new one joining; and nothing more of either.
+        for &o in &others {
+            let seen: Vec<(&str, u64)> = log
+                .borrow()
+                .iter()
+                .filter(|s| s.observer == o && s.t >= restarted)
+                .filter_map(|s| match &s.event {
+                    Event::MemberLeft(m) if m.name == name => Some(("left", m.epoch)),
+                    Event::MemberJoined(m) if m.name == name => Some(("joined", m.epoch)),
+                    _ => None,
+                })
+                .collect();
+            let expected: &[(&str, u64)] = if tombstone {
+                &[("joined", new_epoch)]
+            } else {
+                &[("left", old_epoch), ("joined", new_epoch)]
+            };
+            if seen != expected {
+                return fail(format!(
+                    "{} reported {seen:?} for the restart, not {expected:?}",
+                    name_of(o)
+                ));
+            }
+        }
+    }
     Ok(Measured {
         took: vec![at - restarted],
         tombstone,
@@ -339,20 +390,41 @@ fn restart(seed: u64, nodes: usize) -> Result<Measured, String> {
 }
 
 #[test]
-fn a_restarted_node_learns_its_incarnation_and_rejoins() {
-    let runs = check_all(0..8, |seed| restart(seed, 20));
+fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation() {
+    let runs = check_all(0..8, |seed| restart(seed, 20, true));
     assert!(runs.iter().any(|r| r.tombstone) && runs.iter().any(|r| !r.tombstone));
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
-fn a_restarted_node_learns_its_incarnation_and_rejoins_thousand_seeds() {
+fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation_thousand_seeds() {
     let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| restart(seed, 50));
+    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, true));
     let tombstones = runs.iter().filter(|r| r.tombstone).count();
     println!(
-        "restart: {} seeds x 50 nodes ({tombstones} after the tombstone spread), never reported \
-         dead after the restart, Alive everywhere: {}",
+        "restart with epochs: {} seeds x 50 nodes ({tombstones} after the tombstone spread), \
+         a later life at incarnation 0, never reported dead after the restart, reported as \
+         left and joined, Alive everywhere: {}",
+        seeds.end - seeds.start,
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
+    );
+}
+
+#[test]
+fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins() {
+    let runs = check_all(0..8, |seed| restart(seed, 20, false));
+    assert!(runs.iter().any(|r| r.tombstone) && runs.iter().any(|r| !r.tombstone));
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins_thousand_seeds() {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, false));
+    let tombstones = runs.iter().filter(|r| r.tombstone).count();
+    println!(
+        "restart without epochs: {} seeds x 50 nodes ({tombstones} after the tombstone \
+         spread), never reported dead after the restart, Alive everywhere: {}",
         seeds.end - seeds.start,
         percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
     );

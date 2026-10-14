@@ -23,8 +23,10 @@ pub(crate) struct Probe {
     pub seq: u32,
     pub target: String,
     pub target_addr: SocketAddr,
-    /// The target's incarnation when the round started; a failed round suspects it at this.
+    /// The target's incarnation and epoch when the round started; a failed round suspects
+    /// that life at that incarnation.
     pub inc: u32,
+    pub epoch: u64,
     /// When to give up on a direct Ack and ask relays.
     pub indirect_at: Instant,
     pub indirect_sent: bool,
@@ -95,6 +97,7 @@ impl Node {
                     inc: p.inc,
                     node: id(&p.target),
                     from: id(&me),
+                    epoch: p.epoch,
                 };
                 self.on_suspect(now, &suspect);
             }
@@ -113,10 +116,11 @@ impl Node {
         let Some(target) = self.table.next_probe(&mut self.rng) else {
             return;
         };
-        let (name, addr, inc, suspected) = (
+        let (name, addr, inc, epoch, suspected) = (
             target.member.name.clone(),
             target.member.addr,
             target.member.incarnation,
+            target.member.epoch,
             target.member.state == State::Suspect,
         );
         let seq = self.next_seq();
@@ -134,6 +138,7 @@ impl Node {
             inc,
             node: id(&name),
             from: me,
+            epoch,
         });
         let head = if suspected && self.cfg.buddy_system {
             &[buddy, ping][..]
@@ -149,6 +154,7 @@ impl Node {
             target: name,
             target_addr: addr,
             inc,
+            epoch,
             indirect_at: now + self.probe_timeout(),
             indirect_sent: false,
             acked: false,
@@ -221,14 +227,15 @@ impl Node {
             .table
             .get(req.target.as_str())
             .filter(|e| e.member.state == State::Left)
-            .map(|e| e.member.incarnation);
-        if let Some(inc) = left {
+            .map(|e| (e.member.incarnation, e.member.epoch));
+        if let Some((inc, epoch)) = left {
             // The requester missed the news and would soon declare the member dead; tell it
             // instead of probing a node that is gone.
             let news = Message::Dead(Dead {
                 inc,
                 node: req.target,
                 from: req.target,
+                epoch,
             });
             let limit = self.retransmit_limit();
             // A PingReq names its requester by address only, so it is not counted as live.

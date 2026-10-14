@@ -9,6 +9,7 @@ the keys it gains or loses move.
     ring.owner("user:42")                     # the Member that owns the key
     ring.replicas("user:42", 3)               # the 3 best, owner first
     ring.owner("user:42", new_work=True)      # skips a suspect owner, for routing new requests
+    ring.fence("user:42")                     # ("node-3", 1790000000000): owner and its epoch
 
     before = ring.members()
     async for change in ring.changes():       # on kinship.blocking.Cluster: a plain for loop
@@ -17,7 +18,8 @@ the keys it gains or loses move.
         before = change.members
 
 Suspect members keep their keys, so a node that only stalls causes no reshuffle; dead and
-departed members own nothing.
+departed members own nothing. A member that restarts leaves and joins again under its name,
+at a new epoch, and its keys count as moved; ``fence()`` turns that into a token for writes.
 """
 
 from __future__ import annotations
@@ -49,6 +51,14 @@ _by_name = attrgetter("name")
 
 def _names(members: Iterable[Member]) -> list[str]:
     return [m.name for m in members]
+
+
+def _same_life(a: Member | None, b: Member | None) -> bool:
+    """Whether ``a`` and ``b`` are one run of one member. An epoch of 0, from a member on
+    kinship older than 0.3 or one whose epoch this node has not heard yet, matches any."""
+    if a is None or b is None:
+        return a is b
+    return a.name == b.name and (a.epoch == b.epoch or not a.epoch or not b.epoch)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -136,6 +146,32 @@ class Ring(Generic[C]):
         replicas. Fewer if fewer members qualify. ``new_work=True`` skips suspect members."""
         return rendezvous.owners(key, self._candidates(new_work), n)
 
+    def fence(self, key: str | bytes, *, new_work: bool = False) -> tuple[str, int]:
+        """A fencing token for ``key``: ``(owner_name, epoch)`` of the member that owns it now,
+        as ``owner()`` picks it, ``new_work`` included. Raises ``LookupError`` if no member
+        qualifies.
+
+        A member that restarts comes back with a higher epoch, so the token one run of a node
+        took cannot pass for the next run's, and a token names one owner. Take it before
+        acting on the key, send it with every write, and have whoever applies the write
+        check it:
+
+        - A cluster member that applies writes, a replica or the owner itself, accepts one
+          only if its own ``ring.fence(key)``, with the same ``new_work``, equals the token:
+          same owner, same life. That
+          refuses a write from a node that no longer owns the key in its view, and from an
+          earlier run of the owner, such as a process that stalled through its own restart.
+        - A store outside the cluster keeps the token of the last write it accepted for each
+          key and refuses one with the same owner and a lower epoch, with a conditional write
+          (compare-and-set) so that two writers cannot both pass the check.
+
+        This is not consensus: until membership converges, after a partition for instance,
+        two nodes can each hold a token that their own view confirms. A member on kinship
+        older than 0.3 has epoch 0, which tells its runs apart only by name.
+        """
+        owner = self.owner(key, new_work=new_work)
+        return (owner.name, owner.epoch)
+
     def moved(
         self,
         keys: Iterable[K],
@@ -145,15 +181,16 @@ class Ring(Generic[C]):
         """Which of ``keys`` changed owner between two snapshots, as ``{key: (old_owner,
         new_owner)}``. ``before`` and ``after`` are ``members()`` snapshots or
         ``RingChanged.members``; members that do not belong on this ring are ignored. An
-        owner is ``None`` when its snapshot has no members. Keys that kept their owner are
-        left out."""
+        owner is ``None`` when its snapshot has no members. A key whose owner restarted, the
+        same name at a new epoch, counts as moved, since the new run has none of the old
+        one's state. Keys that kept their owner are left out."""
         old = [m for m in before if self.matches(m)]
         new = [m for m in after if self.matches(m)]
         moved: dict[K, tuple[Member | None, Member | None]] = {}
         for key in keys:
             was = rendezvous.owner(key, old) if old else None
             now = rendezvous.owner(key, new) if new else None
-            if (was.name if was else None) != (now.name if now else None):
+            if not _same_life(was, now):
                 moved[key] = (was, now)
         return moved
 
@@ -232,7 +269,11 @@ class _Tracker:
         old = self._members.get(member.name)
         if self._ring.matches(member):
             self._members[member.name] = member
-            if old is None:
+            if old is not None and not _same_life(old, member):
+                # A restart: its old run is gone, its new one owns the keys from scratch.
+                removed.append(old)
+                added.append(member)
+            elif old is None:
                 added.append(member)
             elif old.state is State.ALIVE and member.state is State.SUSPECT:
                 suspect.append(member)
@@ -246,10 +287,12 @@ class _Tracker:
         old = self._members
         new = {m.name: m for m in self._ring.members()}
         self._members = new
-        both = old.keys() & new.keys()
+        # A member that restarted while events were lost left and joined again.
+        restarted = {n for n in old.keys() & new.keys() if not _same_life(old[n], new[n])}
+        both = (old.keys() & new.keys()) - restarted
         return self._changed(
-            [m for name, m in new.items() if name not in old],
-            [m for name, m in old.items() if name not in new],
+            [m for name, m in new.items() if name not in old or name in restarted],
+            [m for name, m in old.items() if name not in new or name in restarted],
             [new[n] for n in both if old[n].state is State.ALIVE and new[n].state is State.SUSPECT],
             [new[n] for n in both if old[n].state is State.SUSPECT and new[n].state is State.ALIVE],
         )

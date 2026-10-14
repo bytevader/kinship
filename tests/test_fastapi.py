@@ -48,8 +48,10 @@ async def test_lifespan_starts_the_cluster_and_leaves_on_shutdown() -> None:
                 "name": cluster.local.name,
                 "addr": cluster.local.addr,
                 "state": "ALIVE",
+                "epoch": cluster.local.epoch,
                 "meta": {"role": "api"},
             }
+            assert cluster.local.epoch > 0
 
             resp = await http.get("/cluster/stats")
             assert resp.status_code == 200

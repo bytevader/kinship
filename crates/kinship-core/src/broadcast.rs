@@ -24,16 +24,19 @@ pub(crate) enum Gossip {
         meta: Vec<u8>,
         vmin: u8,
         vmax: u8,
+        epoch: u64,
     },
     Suspect {
         inc: u32,
         node: String,
         from: String,
+        epoch: u64,
     },
     Dead {
         inc: u32,
         node: String,
         from: String,
+        epoch: u64,
     },
 }
 
@@ -51,6 +54,7 @@ impl Gossip {
             meta: a.meta.to_vec(),
             vmin: a.vmin,
             vmax: a.vmax,
+            epoch: a.epoch,
         }
     }
 
@@ -59,6 +63,7 @@ impl Gossip {
             inc: s.inc,
             node: s.node.as_str().to_owned(),
             from: s.from.as_str().to_owned(),
+            epoch: s.epoch,
         }
     }
 
@@ -67,6 +72,7 @@ impl Gossip {
             inc: d.inc,
             node: d.node.as_str().to_owned(),
             from: d.from.as_str().to_owned(),
+            epoch: d.epoch,
         }
     }
 
@@ -86,6 +92,7 @@ impl Gossip {
                 meta,
                 vmin,
                 vmax,
+                epoch,
             } => Message::Alive(Alive {
                 inc: *inc,
                 node: id(node),
@@ -93,16 +100,29 @@ impl Gossip {
                 meta,
                 vmin: *vmin,
                 vmax: *vmax,
+                epoch: *epoch,
             }),
-            Self::Suspect { inc, node, from } => Message::Suspect(Suspect {
+            Self::Suspect {
+                inc,
+                node,
+                from,
+                epoch,
+            } => Message::Suspect(Suspect {
                 inc: *inc,
                 node: id(node),
                 from: id(from),
+                epoch: *epoch,
             }),
-            Self::Dead { inc, node, from } => Message::Dead(Dead {
+            Self::Dead {
+                inc,
+                node,
+                from,
+                epoch,
+            } => Message::Dead(Dead {
                 inc: *inc,
                 node: id(node),
                 from: id(from),
+                epoch: *epoch,
             }),
         }
     }
@@ -255,6 +275,7 @@ fn smallest_rumour() -> usize {
         inc: 0,
         node: id("n"),
         from: id("n"),
+        epoch: 0,
     })
     .encoded_len()
 }
@@ -407,6 +428,7 @@ impl Node {
             meta: me.member.meta.clone(),
             vmin: me.vmin,
             vmax: me.vmax,
+            epoch: me.member.epoch,
         }
     }
 
@@ -477,6 +499,7 @@ mod tests {
             inc,
             node: node.to_owned(),
             from: "x".to_owned(),
+            epoch: 0,
         }
     }
 
@@ -497,6 +520,7 @@ mod tests {
             meta: vec![0; room],
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         };
         n.broadcast(huge);
         assert_eq!(n.metrics().gossip_too_large, 1);
@@ -595,6 +619,7 @@ mod tests {
             meta: vec![7; 200],
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         };
         let mut b = Broadcasts::default();
         b.push(suspect("old", 1));

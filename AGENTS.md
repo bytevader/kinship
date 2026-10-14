@@ -10,6 +10,7 @@
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.
 - Protocol review fixes KP-01..KP-05 (`docs/review.md`) and security fixes KS-01..KS-08 (`SECURITY.md`) are merged.
 - Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
+- For 0.3 (Unreleased in `CHANGELOG.md`): member epochs, one per run of a node, which let a restart replace the old run at any incarnation (`docs/design.md`, Epochs), and `Ring.fence()`.
 - Timing preset tuning is done: no variant beats `lan()` at every cluster size without false deaths or more than 10% bandwidth, so `lan()` keeps memberlist's values; see `docs/results/tuning.md`.
 
 ## Where to look
@@ -21,7 +22,7 @@
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
-- `python/kinship/ring.py`: `Ring` and `RingChanged`, key ownership over `rendezvous` that follows membership events. `python/kinship/contrib/fastapi.py`: `cluster_lifespan`, `get_cluster`, `get_ring` and `cluster_router`, behind the `kinship[fastapi]` extra; the core package has no Python dependencies, and FastAPI tests skip when fastapi is not installed.
+- `python/kinship/ring.py`: `Ring` and `RingChanged`, key ownership over `rendezvous` that follows membership events, and `Ring.fence()` tokens from member epochs. `python/kinship/contrib/fastapi.py`: `cluster_lifespan`, `get_cluster`, `get_ring` and `cluster_router`, behind the `kinship[fastapi]` extra; the core package has no Python dependencies, and FastAPI tests skip when fastapi is not installed.
 - `docs/assets`: the logo (`logo.svg`, `logo.png`), the README banners (`banner-light.png`, `banner-dark.png`, loaded from `main`) and the GitHub social preview.
 - `tools/smoke_quickstart.py`: the post-publish smoke test, which runs `examples/quickstart.py` as two nodes against an installed kinship.
 - `tools/chaos`: chaos harness and detection bench (Linux namespaces, tc netem, nftables). `tools/memberlist-bench`: the Go memberlist node for the bench.

@@ -150,6 +150,19 @@ fn all_seeds(settings: &Settings) -> Vec<Seed> {
     addrs.chain(settings.seed_hosts.iter().cloned()).collect()
 }
 
+/// The epoch of this life of the node: milliseconds of the wall clock since the Unix epoch,
+/// which a process that restarts later reads higher. This is the one read of the wall clock,
+/// and it names the node rather than timing anything, so a jump cannot move a timer. A clock
+/// that reads below an earlier life of the same name is caught by the core, which moves past
+/// that life once it hears of it; one before 1970 reads as 1, since 0 means no epoch.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+fn start_epoch() -> u64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since.as_millis()).unwrap_or(u64::MAX).max(1)
+}
+
 /// Counters from the protocol core and this node's Lifeguard local health score.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -330,7 +343,9 @@ impl Memberlist {
         let advertise = settings
             .advertise
             .unwrap_or_else(|| default_advertise(local_addr));
-        let me = kinship_core::Identity::new(settings.name, advertise)?.with_meta(settings.meta);
+        let me = kinship_core::Identity::new(settings.name, advertise)?
+            .with_meta(settings.meta)
+            .with_epoch(start_epoch());
         // The core draws no randomness of its own: its protocol choices come from this seed and
         // the random bytes of its nonces from ChaCha20 under this key, both from the OS.
         let os = |e: getrandom::Error| Error::Io(io::Error::other(e.to_string()));

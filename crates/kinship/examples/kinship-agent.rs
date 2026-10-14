@@ -80,7 +80,8 @@ async fn run() -> Result<(), String> {
 
 fn log(cluster: &Cluster, event: Event) {
     let n = cluster.members().len();
-    let show = |m: &Member| format!("{} {}", m.name, m.addr);
+    // A restart shows as left and joined under one name, at a new epoch.
+    let show = |m: &Member| format!("{} {} epoch {}", m.name, m.addr, m.epoch);
     match event {
         Event::MemberJoined(m) => tracing::info!(members = n, "joined: {}", show(&m)),
         Event::MemberSuspect(m) => tracing::warn!(members = n, "suspect: {}", show(&m)),

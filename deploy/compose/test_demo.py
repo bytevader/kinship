@@ -12,8 +12,9 @@ from demo import View, app, entry_node, member_record, stream
 import kinship
 
 
-def member(name="node-3", state=kinship.State.ALIVE):
-    return kinship.Member(name, "172.18.0.4:7946", state, 0, {"role": "worker", "zone": "b"})
+def member(name="node-3", state=kinship.State.ALIVE, epoch=1_790_000_000_000):
+    meta = {"role": "worker", "zone": "b"}
+    return kinship.Member(name, "172.18.0.4:7946", state, 0, meta, epoch)
 
 
 class Cluster:
@@ -77,6 +78,23 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         await view.consume(events(kinship.MemberJoined(member())))
         self.assertEqual(view.members["node-3"]["state"], "ALIVE")
         self.assertEqual(view.members["node-3"]["meta"]["role"], "worker")
+
+    async def test_a_restart_is_logged_as_a_new_run(self):
+        view = View(Cluster(member()))
+        view.resync()
+        later = 1_790_000_060_000
+        await view.consume(
+            events(
+                kinship.MemberLeft(member(state=kinship.State.LEFT)),
+                kinship.MemberJoined(member(epoch=later)),
+                kinship.MemberJoined(member("node-4")),
+            )
+        )
+        kinds = [entry["kind"] for entry in view.log]
+        self.assertEqual(kinds, ["MemberLeft", "MemberJoined", "Restart", "MemberJoined"])
+        self.assertIn("1790000000000 → 1790000060000", view.log[2]["detail"])
+        self.assertEqual(view.members["node-3"]["epoch"], later)
+        self.assertEqual(json.loads(view.snapshot())["counts"]["fenced"], 0)
 
     async def test_slow_browser_gets_latest_snapshot_and_bounded_history(self):
         view = View(Cluster())

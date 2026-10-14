@@ -236,6 +236,7 @@ mod tests {
             meta: Vec::new(),
             state: State::Alive,
             incarnation: 0,
+            epoch: 0,
         }
     }
 

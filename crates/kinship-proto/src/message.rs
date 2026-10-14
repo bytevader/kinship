@@ -93,8 +93,8 @@ pub struct PingReq<'a> {
     pub want_nack: bool,
 }
 
-/// `Alive`: `node` is alive at incarnation `inc`, reachable at `addr`, speaking wire versions
-/// `vmin` to `vmax`, carrying `meta`.
+/// `Alive`: `node` is alive at incarnation `inc` of its life `epoch`, reachable at `addr`,
+/// speaking wire versions `vmin` to `vmax`, carrying `meta`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Alive<'a> {
     pub inc: u32,
@@ -103,22 +103,31 @@ pub struct Alive<'a> {
     pub meta: &'a [u8],
     pub vmin: u8,
     pub vmax: u8,
+    /// When this life of the node started, in milliseconds of its wall clock, raised past
+    /// any earlier life the node hears of. Appended in 0.3: 0 is not sent, and a message
+    /// without it, from an older node, reads as 0.
+    pub epoch: u64,
 }
 
-/// `Suspect`: `from` suspects `node` at incarnation `inc`.
+/// `Suspect`: `from` suspects `node` at incarnation `inc` of its life `epoch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Suspect<'a> {
     pub inc: u32,
     pub node: NodeId<'a>,
     pub from: NodeId<'a>,
+    /// The life of `node` that is suspected, 0 when unknown; appended as in [`Alive`].
+    pub epoch: u64,
 }
 
-/// `Dead`: `from` declares `node` dead at incarnation `inc`. `from == node` means the node left.
+/// `Dead`: `from` declares `node` dead at incarnation `inc` of its life `epoch`. `from ==
+/// node` means the node left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dead<'a> {
     pub inc: u32,
     pub node: NodeId<'a>,
     pub from: NodeId<'a>,
+    /// The life of `node` that died or left, 0 when unknown; appended as in [`Alive`].
+    pub epoch: u64,
 }
 
 impl Dead<'_> {
@@ -299,6 +308,21 @@ fn read_bool(r: &mut Reader<'_>) -> Result<bool, DecodeError> {
     }
 }
 
+/// Appends an epoch after a message's version 1 fields. Epoch 0, which a node that does not
+/// send one has, is not written, so such a node's messages are the bytes they always were.
+fn put_epoch<S: Sink>(s: &mut S, epoch: u64) {
+    if epoch != 0 {
+        s.put_u64(epoch);
+    }
+}
+
+/// Reads the epoch appended after a message's version 1 fields: 0 when the body ends there, as
+/// from a node older than 0.3. A body that ends part way into it is truncated. Bytes after it
+/// are fields appended by a newer version.
+fn read_epoch(r: &mut Reader<'_>) -> Result<u64, DecodeError> {
+    if r.is_empty() { Ok(0) } else { r.u64() }
+}
+
 fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
     s.put_u32(a.inc);
     put_node(s, &a.node);
@@ -306,6 +330,7 @@ fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
     s.put_bytes(a.meta);
     s.put_u8(a.vmin);
     s.put_u8(a.vmax);
+    put_epoch(s, a.epoch);
 }
 
 fn read_alive<'a>(r: &mut Reader<'a>, limits: &Limits) -> Result<Alive<'a>, DecodeError> {
@@ -321,6 +346,7 @@ fn read_alive<'a>(r: &mut Reader<'a>, limits: &Limits) -> Result<Alive<'a>, Deco
     if vmin == 0 || vmin > vmax {
         return Err(DecodeError::BadVersionRange);
     }
+    let epoch = read_epoch(r)?;
     Ok(Alive {
         inc,
         node,
@@ -328,6 +354,7 @@ fn read_alive<'a>(r: &mut Reader<'a>, limits: &Limits) -> Result<Alive<'a>, Deco
         meta,
         vmin,
         vmax,
+        epoch,
     })
 }
 
@@ -403,11 +430,13 @@ impl<'a> Message<'a> {
                 s.put_u32(m.inc);
                 put_node(s, &m.node);
                 put_node(s, &m.from);
+                put_epoch(s, m.epoch);
             }
             Self::Dead(m) => {
                 s.put_u32(m.inc);
                 put_node(s, &m.node);
                 put_node(s, &m.from);
+                put_epoch(s, m.epoch);
             }
             Self::PushPull(p) => {
                 s.put_u8(u8::from(p.join));
@@ -459,11 +488,13 @@ impl<'a> Message<'a> {
                 inc: r.u32()?,
                 node: read_node(&mut r)?,
                 from: read_node(&mut r)?,
+                epoch: read_epoch(&mut r)?,
             }),
             kind::DEAD => Self::Dead(Dead {
                 inc: r.u32()?,
                 node: read_node(&mut r)?,
                 from: read_node(&mut r)?,
+                epoch: read_epoch(&mut r)?,
             }),
             kind::PUSH_PULL => {
                 let join = read_bool(&mut r)?;

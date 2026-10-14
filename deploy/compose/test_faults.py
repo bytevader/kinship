@@ -223,6 +223,24 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("node-1", controller.unavailable_nodes)
             self.assertEqual(controller.reservations["node-1"]["action"], "drain")
 
+    async def test_bounce_exits_through_the_app_and_recovers_by_itself(self):
+        now = 0
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            controller = FaultController(http, lambda *_: None, clock=lambda: now)
+            await controller.apply("node-2", "bounce")
+            self.assertEqual(seen, ["http://node-2:8000/fault/bounce"])
+            self.assertIn("node-2", controller.unavailable_nodes)
+            # Docker restarts it at once; its first fresh ALIVE self-report frees the slot.
+            now = 30
+            controller.mark_reachable("node-2", controller.poll_token("node-2"))
+            self.assertNotIn("node-2", controller.unavailable_nodes)
+
     async def test_only_fresh_crash_poll_clears_the_matching_reservation(self):
         now = 0
         async with httpx.AsyncClient(

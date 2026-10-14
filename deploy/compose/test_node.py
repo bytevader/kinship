@@ -1,17 +1,27 @@
 """Cache routing tests; run with ``python -m unittest test_node`` in the demo image."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 import httpx
 from common import config
-from node import HOP_HEADER, MAX_HOPS, cache_ring, create_app, drop_moved, watch_ring
+from node import (
+    FENCE_HEADER,
+    HOP_HEADER,
+    MAX_HOPS,
+    cache_ring,
+    create_app,
+    drop_moved,
+    watch_ring,
+)
 
 
-def member(name="node-1", url=None):
-    return SimpleNamespace(name=name, meta={"url": url or f"http://{name}:8000"})
+def member(name="node-1", url=None, epoch=7):
+    return SimpleNamespace(name=name, meta={"url": url or f"http://{name}:8000"}, epoch=epoch)
 
 
 class ConfigTests(unittest.TestCase):
@@ -49,6 +59,26 @@ class ConfigTests(unittest.TestCase):
         udp.connect.assert_called_once_with(("172.20.0.3", 7946))
         self.assertEqual(cfg.lan.call_args.kwargs["bind"], "172.20.0.9:7946")
 
+    def test_a_bounced_node_skips_its_startup_delay_once(self):
+        udp = MagicMock()
+        udp.__enter__.return_value = udp
+        udp.getsockname.return_value = ("172.20.0.9", 43123)
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "bounce"
+            marker.touch()
+            with (
+                patch.dict("os.environ", {"STARTUP_DELAY_SECONDS": "15"}),
+                patch("common.BOUNCE_MARKER", marker),
+                patch("common.time.sleep") as sleep,
+                patch("common.socket.gethostbyname", return_value="172.20.0.2"),
+                patch("common.socket.socket", return_value=udp),
+                patch("common.kinship.Config"),
+            ):
+                config()
+                config()
+            self.assertFalse(marker.exists())
+            self.assertEqual([c.args for c in sleep.call_args_list], [(0,), (15.0,)])
+
     def test_no_peer_route_fails_instead_of_binding_dashboard_control_network(self):
         with (
             patch.dict("os.environ", {"NODE_NAME": "dashboard", "ROLE": "dashboard"}),
@@ -69,10 +99,17 @@ class FakeRing:
 
     def owner(self, key, *, new_work=False):
         self.calls.append((key, new_work))
+        return self._owner(new_work)
+
+    def _owner(self, new_work):
         result = self.write_owner if new_work else self.read_owner
         if result is None:
             raise LookupError("empty ring")
         return result
+
+    def fence(self, key, *, new_work=False):
+        owner = self._owner(new_work)
+        return owner.name, owner.epoch
 
     def members(self):
         return self.snapshot
@@ -113,6 +150,32 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
         await self.client.put("/kv/key-01", json="fresh")
         self.assertEqual(len(self.forwarded), 1)
         self.assertEqual((await self.client.get("/kv/key-01")).json()["node"], "node-1")
+
+    async def test_forwarded_writes_carry_a_fence_that_the_owner_checks(self):
+        self.ring.write_owner = member("node-2", epoch=9)
+        await self.client.put("/kv/key-01", json="v")
+        self.assertEqual(self.forwarded[0].headers[FENCE_HEADER], "node-2/9")
+        # Here node-1 owns the key in the run of epoch 7: a write fenced for its earlier run,
+        # sent by a peer that missed its restart, is refused; one for this run is applied.
+        self.ring.write_owner = member("node-1", epoch=7)
+        for token, status in (("node-1/6", 409), ("node-2/7", 409), ("node-1/x", 400)):
+            response = await self.client.put(
+                "/kv/key-01", json="stale", headers={FENCE_HEADER: token}
+            )
+            self.assertEqual(response.status_code, status, token)
+        self.assertNotIn("key-01", self.app.state.data)
+        response = await self.client.put("/kv/key-01", json="v", headers={FENCE_HEADER: "node-1/7"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.app.state.data["key-01"], "v")
+
+    async def test_bounce_marks_the_next_run_and_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "bounce"
+            with patch("node.BOUNCE_MARKER", marker), patch("node.os._exit") as exit_:
+                response = await self.client.post("/fault/bounce")
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(marker.exists())
+            exit_.assert_called_once_with(1)
 
     async def test_owner_url_must_match_the_expected_name(self):
         for owner in (

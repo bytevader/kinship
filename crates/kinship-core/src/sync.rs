@@ -308,10 +308,11 @@ impl Node {
                         inc: a.inc,
                         node: a.node,
                         from: a.node,
+                        epoch: a.epoch,
                     },
                 ),
                 kinship_proto::State::Suspect | kinship_proto::State::Dead => {
-                    self.on_merged_suspicion(now, a.node.as_str(), a.inc);
+                    self.on_merged_suspicion(now, a.node.as_str(), a.inc, a.epoch);
                 }
             }
         }
@@ -332,6 +333,7 @@ impl Node {
                     meta: &e.member.meta,
                     vmin: e.vmin,
                     vmax: e.vmax,
+                    epoch: e.member.epoch,
                 },
             })
             .collect();
@@ -475,6 +477,7 @@ impl Node {
             inc: me.incarnation,
             node: me.name.clone(),
             from: me.name.clone(),
+            epoch: me.epoch,
         };
         // Sends to members that are dead or gone do not count: a leave that reached only them
         // has told nobody.
@@ -791,6 +794,7 @@ mod tests {
                 meta: b"",
                 vmin: 1,
                 vmax: 1,
+                epoch: 0,
             },
         };
         let records = [alive("x", 8), alive("ghost", 9)];
@@ -886,6 +890,7 @@ mod tests {
                 meta: b"",
                 vmin: 1,
                 vmax: 1,
+                epoch: 0,
             },
         };
         // Five members b has never heard of, then news about one it knows.
@@ -1010,6 +1015,7 @@ mod tests {
                 meta: b"",
                 vmin: 1,
                 vmax: 1,
+                epoch: 0,
             },
             &mut b.admission(),
         );
@@ -1019,6 +1025,7 @@ mod tests {
                 inc: 7,
                 node: id("a"),
                 from: id("b"),
+                epoch: 0,
             },
         );
         assert_eq!(b.member("a").unwrap().state, State::Dead);
@@ -1039,6 +1046,116 @@ mod tests {
         let m = p.nodes[1].member("a").unwrap();
         assert_eq!((m.state, m.incarnation), (State::Alive, 8));
         assert!(matches!(&p.events(1)[..], [Event::MemberJoined(m)] if m.name == "a"));
+    }
+
+    /// `name` at port `port`, starting at `epoch`, with nonces keyed from `port`'s RNG.
+    fn node_at(name: &str, port: u16, epoch: u64) -> Node {
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let me = Identity::new(name, addr(port)).unwrap().with_epoch(epoch);
+        let mut nonce_key = [0; 32];
+        crate::Rng::new(u64::from(port)).fill(&mut nonce_key);
+        Node::new(cfg, me, Instant::ZERO, u64::from(port), &nonce_key).unwrap()
+    }
+
+    /// b holding a live a at incarnation 7 of the life `epoch`.
+    fn remembers_a(epoch: u64) -> Node {
+        let t = Instant::ZERO;
+        let mut b = node_at("b", 2, 1_000);
+        let a = Alive {
+            inc: 7,
+            node: id("a"),
+            addr: addr(1),
+            meta: b"",
+            vmin: 1,
+            vmax: 1,
+            epoch,
+        };
+        b.on_alive(t, &a, &mut b.admission());
+        b
+    }
+
+    #[test]
+    fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation() {
+        let t = Instant::ZERO;
+        let mut p = Pair::new(node_at("a", 1, 200), remembers_a(100));
+        p.events(1);
+        p.nodes[0].command(
+            t,
+            Command::Join {
+                seeds: vec![addr(2)],
+            },
+        );
+        p.pump(t);
+        // The seed took the new life from the join itself: nothing to learn, nothing refuted.
+        assert_eq!(p.nodes[0].local().incarnation, 0);
+        assert_eq!(p.nodes[0].metrics().refutations, 0);
+        let m = p.nodes[1].member("a").unwrap();
+        assert_eq!((m.state, m.epoch, m.incarnation), (State::Alive, 200, 0));
+        let ev = p.events(1);
+        assert!(
+            matches!(&ev[..], [Event::MemberLeft(old), Event::MemberJoined(new)]
+                if (old.epoch, old.incarnation) == (100, 7) && new.epoch == 200),
+            "{ev:?}"
+        );
+        // A peer's records of the old life, dead at a higher incarnation, suspect nothing and
+        // tell a nothing.
+        while p.nodes[1].poll_transmit().is_some() {}
+        let stale = |state| Record {
+            state,
+            alive: Alive {
+                inc: 9,
+                node: id("a"),
+                addr: addr(1),
+                meta: b"",
+                vmin: 1,
+                vmax: 1,
+                epoch: 100,
+            },
+        };
+        let records = [
+            stale(kinship_proto::State::Dead),
+            stale(kinship_proto::State::Left),
+            stale(kinship_proto::State::Alive),
+        ];
+        let b = &mut p.nodes[1];
+        b.merge(t, Records::Slice(&records), &mut b.admission());
+        let m = b.member("a").unwrap();
+        assert_eq!((m.state, m.epoch, m.incarnation), (State::Alive, 200, 0));
+        assert!(b.poll_transmit().is_none() && b.poll_event().is_none());
+    }
+
+    #[test]
+    fn a_node_whose_clock_is_behind_its_last_life_moves_past_it() {
+        let t = Instant::ZERO;
+        // a's last life started at 300 on a clock that ran ahead; this one reads 200.
+        let mut p = Pair::new(node_at("a", 1, 200), remembers_a(300));
+        p.events(1);
+        p.nodes[0].command(
+            t,
+            Command::Join {
+                seeds: vec![addr(2)],
+            },
+        );
+        p.pump(t);
+        // The seed kept the later life it holds; its reply teaches a that life.
+        let local = p.nodes[0].local();
+        assert_eq!((local.epoch, local.incarnation), (301, 8));
+        // The Alive a gossips next replaces that life everywhere.
+        let next = p.nodes[0].poll_timeout().unwrap();
+        p.nodes[0].handle_timeout(next);
+        p.pump(next);
+        let m = p.nodes[1].member("a").unwrap();
+        assert_eq!((m.state, m.epoch, m.incarnation), (State::Alive, 301, 8));
+        let kinds: Vec<_> = p
+            .events(1)
+            .into_iter()
+            .map(|e| match e {
+                Event::MemberLeft(m) => ("left", m.epoch),
+                Event::MemberJoined(m) => ("joined", m.epoch),
+                _ => ("other", 0),
+            })
+            .collect();
+        assert_eq!(kinds, [("left", 300), ("joined", 301)]);
     }
 
     #[test]
@@ -1122,6 +1239,7 @@ mod tests {
                 meta: b"",
                 vmin: 1,
                 vmax: 1,
+                epoch: 0,
             },
         };
         // A peer holds b as Suspect and c as Dead.
@@ -1150,6 +1268,7 @@ mod tests {
             inc: 0,
             node: id("b"),
             from: id(r),
+            epoch: 0,
         };
         a.on_suspect(t, &from("d"));
         assert_eq!(a.suspicions["b"].confirmations(), 0);
@@ -1173,6 +1292,7 @@ mod tests {
             inc: 0,
             node: id("c"),
             from: id("b"),
+            epoch: 0,
         };
         a.on_dead(t0, &dead);
         let cmd = a.command(t0, Command::Leave);
@@ -1226,6 +1346,7 @@ mod tests {
             inc: 5,
             node: id("a"),
             from: id("b"),
+            epoch: 0,
         };
         p.nodes[0].on_suspect(t, &rumour);
         p.nodes[0].handle_timeout(t + Duration::from_secs(5));

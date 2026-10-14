@@ -9,6 +9,14 @@
 //!
 //! "Higher" is serial number arithmetic (RFC 1982), see [`newer`]: incarnations wrap past
 //! u32::MAX to 0, so no rumour, however high, leaves a member unable to refute it (KI-02).
+//!
+//! Above incarnations sits the member's epoch, which names one life of it: a process that
+//! restarts with the same name starts a later life, see [`life`]. An Alive about a later life
+//! than the one held replaces it whatever its incarnation, since a new process counts its
+//! incarnations from 0 again; a rumour about an earlier life changes nothing, so the old life's
+//! death cannot kill the new one, nor its Alives bring a dead member back. Where either side
+//! does not know the epoch (0, from nodes older than 0.3), incarnations decide alone, as they
+//! always did.
 
 use core::net::SocketAddr;
 
@@ -50,6 +58,46 @@ pub struct Member {
     pub state: State,
     /// Raised only by the member itself, on refutation or metadata change.
     pub incarnation: u32,
+    /// Which life of the member this is: the milliseconds of its wall clock when its process
+    /// started, raised past any earlier life of the same name it heard of, so a member that
+    /// restarts comes back with a higher epoch. 0 when no epoch was heard, as from nodes
+    /// older than 0.3.
+    pub epoch: u64,
+}
+
+/// How the life a rumour names compares with the life a node holds for that member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Life {
+    /// The same life, or one whose epoch either side does not know: incarnations decide.
+    Same,
+    /// A later life: the member restarted since the life held.
+    Later,
+    /// An earlier life, which nothing can change any more.
+    Earlier,
+}
+
+/// How the life of epoch `rumour` compares with the life of epoch `held`.
+///
+/// Epochs compare as serial numbers, as incarnations do (KI-02): whatever epoch a forged
+/// rumour names, a member can start a later life than it, and honest epochs, wall-clock
+/// milliseconds, are nowhere near 2^63 apart, so among them this is the plain order. Two
+/// epochs exactly 2^63 apart are each earlier than the other. Epoch 0 means unknown.
+pub(crate) fn life(rumour: u64, held: u64) -> Life {
+    if rumour == held || rumour == 0 || held == 0 {
+        Life::Same
+    } else if (rumour.wrapping_sub(held) as i64) > 0 {
+        Life::Later
+    } else {
+        Life::Earlier
+    }
+}
+
+/// The first epoch past `epoch`, skipping 0, which means unknown.
+pub(crate) fn epoch_past(epoch: u64) -> u64 {
+    match epoch.wrapping_add(1) {
+        0 => 1,
+        e => e,
+    }
 }
 
 /// Whether incarnation `a` is newer than `b`.
@@ -112,9 +160,14 @@ impl Node {
         if name == self.local.member.name {
             if a.addr != self.local.member.addr {
                 self.name_conflict(self.local.member.clone(), a.addr);
-            } else if newer(a.inc, self.local.member.incarnation) {
+                return;
+            }
+            match life(a.epoch, self.local.member.epoch) {
+                Life::Later => self.outlive(a.epoch, a.inc),
                 // An older instance of this node, or a forgery: claim the name back.
-                self.refute(a.inc);
+                Life::Same if newer(a.inc, self.local.member.incarnation) => self.refute(a.inc),
+                // An earlier life of this node, which this one's Alive replaces wherever it goes.
+                Life::Same | Life::Earlier => {}
             }
             return;
         }
@@ -128,6 +181,7 @@ impl Node {
                 meta: a.meta.to_vec(),
                 state: State::Alive,
                 incarnation: a.inc,
+                epoch: a.epoch,
             };
             self.events.push_back(Event::MemberJoined(member.clone()));
             self.table.insert(Entry {
@@ -140,8 +194,26 @@ impl Node {
             return;
         };
         let old = &entry.member;
-        if !newer(a.inc, old.incarnation) {
-            return;
+        let life = life(a.epoch, old.epoch);
+        match life {
+            // A stale life, however high its incarnation: a recording, or gossip from before the
+            // member restarted. It cannot bring a dead member back.
+            Life::Earlier => return,
+            Life::Same if !newer(a.inc, old.incarnation) => {
+                let (state, inc) = (old.state, old.incarnation);
+                if old.epoch == 0
+                    && a.epoch != 0
+                    && a.inc == inc
+                    && a.addr == old.addr
+                    && state.is_live()
+                {
+                    // The Alive this node already applied, now with the epoch that a node older
+                    // than 0.3 dropped when it passed it on. Nothing about the member changed.
+                    self.table.update(name, state, inc, now).member.epoch = a.epoch;
+                }
+                return;
+            }
+            Life::Same | Life::Later => {}
         }
         if a.addr != old.addr {
             // Two nodes claim one name; the one we knew first keeps it. That holds for a Dead
@@ -152,6 +224,9 @@ impl Node {
             self.name_conflict(member, a.addr);
             return;
         }
+        if life == Life::Later {
+            return self.restarted(now, a);
+        }
         let was = old.state;
         let previous_meta = (old.meta != a.meta).then(|| old.meta.clone());
         let entry = self.table.update(name, State::Alive, a.inc, now);
@@ -159,6 +234,10 @@ impl Node {
         entry.member.meta.extend_from_slice(a.meta);
         entry.vmin = a.vmin;
         entry.vmax = a.vmax;
+        if a.epoch != 0 {
+            // New if this node first heard of the member through a node older than 0.3.
+            entry.member.epoch = a.epoch;
+        }
         let member = entry.member.clone();
         self.suspicions.remove(name);
         match was {
@@ -185,14 +264,48 @@ impl Node {
         self.broadcast(Gossip::from_alive(a));
     }
 
+    /// An Alive about a later life of a member this node holds: it restarted. The new life
+    /// replaces the old one whatever the incarnations, since the new process counts its own
+    /// from 0. The application hears the old life leave, unless it had already died or left,
+    /// and the new one join, so that it sees a restart as two events.
+    fn restarted(&mut self, now: Instant, a: &Alive<'_>) {
+        let name = a.node.as_str();
+        let Some(old) = self.table.get(name).map(|e| e.member.clone()) else {
+            return;
+        };
+        let entry = self.table.update(name, State::Alive, a.inc, now);
+        entry.since = now;
+        entry.member.epoch = a.epoch;
+        entry.member.meta.clear();
+        entry.member.meta.extend_from_slice(a.meta);
+        entry.vmin = a.vmin;
+        entry.vmax = a.vmax;
+        let member = entry.member.clone();
+        self.suspicions.remove(name);
+        self.metrics.restarts += 1;
+        if old.state.is_live() {
+            self.events.push_back(Event::MemberLeft(Member {
+                state: State::Left,
+                ..old
+            }));
+        }
+        self.events.push_back(Event::MemberJoined(member));
+        self.broadcast(Gossip::from_alive(a));
+    }
+
     pub(crate) fn on_suspect(&mut self, now: Instant, s: &Suspect<'_>) {
         let name = s.node.as_str();
         if name == self.local.member.name {
-            return self.about_self(s.inc);
+            return self.about_self(s.inc, s.epoch);
         }
         let Some(entry) = self.table.get(name) else {
             return;
         };
+        if life(s.epoch, entry.member.epoch) != Life::Same {
+            // About an earlier life, which is gone, or a later one this node has not heard of
+            // yet, which its Alive will bring.
+            return;
+        }
         let (state, inc) = (entry.member.state, entry.member.incarnation);
         let from = s.from.as_str();
         match state {
@@ -234,12 +347,15 @@ impl Node {
     pub(crate) fn on_dead(&mut self, now: Instant, d: &Dead<'_>) {
         let name = d.node.as_str();
         if name == self.local.member.name {
-            return self.about_self(d.inc);
+            return self.about_self(d.inc, d.epoch);
         }
         let Some(entry) = self.table.get(name) else {
             return;
         };
-        if !entry.member.state.is_live() || !at_least(d.inc, entry.member.incarnation) {
+        if !entry.member.state.is_live()
+            || life(d.epoch, entry.member.epoch) != Life::Same
+            || !at_least(d.inc, entry.member.incarnation)
+        {
             return;
         }
         let state = if d.is_left() {
@@ -265,14 +381,18 @@ impl Node {
     /// node's: it never saw the member fail, so it counts no reporter of its own and is not
     /// gossiped, which would make every other node count this one as an independent
     /// confirmation. A suspicion already running at that incarnation is left as it is. The
-    /// member itself is told, as by the buddy system, so that it can refute.
-    pub(crate) fn on_merged_suspicion(&mut self, now: Instant, name: &str, inc: u32) {
+    /// member itself is told, as by the buddy system, so that it can refute. A record about
+    /// another life of the member than the one held changes nothing.
+    pub(crate) fn on_merged_suspicion(&mut self, now: Instant, name: &str, inc: u32, epoch: u64) {
         if name == self.local.member.name {
-            return self.about_self(inc);
+            return self.about_self(inc, epoch);
         }
         let Some(entry) = self.table.get(name) else {
             return;
         };
+        if life(epoch, entry.member.epoch) != Life::Same {
+            return;
+        }
         let (state, addr) = (entry.member.state, entry.member.addr);
         match state {
             State::Alive if at_least(inc, entry.member.incarnation) => {}
@@ -296,20 +416,42 @@ impl Node {
             inc,
             node: id(name),
             from: id(&me),
+            epoch,
         });
         let limit = self.retransmit_limit();
         self.send_to(addr, true, &[suspect], Some(limit));
     }
 
-    /// A Suspect or Dead about this node at `inc`.
-    fn about_self(&mut self, inc: u32) {
-        if at_least(inc, self.local.member.incarnation) {
-            // Others missed our Acks: likely this node is the slow one.
-            self.health_delta(1);
-            self.refute(inc);
-        } else {
-            self.reassert();
+    /// A Suspect or Dead about this node at `inc` of its life `epoch`. One about an earlier
+    /// life is answered with this life's Alive, as a stale one is.
+    fn about_self(&mut self, inc: u32, epoch: u64) {
+        match life(epoch, self.local.member.epoch) {
+            Life::Later => self.outlive(epoch, inc),
+            Life::Same if at_least(inc, self.local.member.incarnation) => {
+                // Others missed our Acks: likely this node is the slow one.
+                self.health_delta(1);
+                self.refute(inc);
+            }
+            Life::Same | Life::Earlier => self.reassert(),
         }
+    }
+
+    /// Moves this node past a later life of its own name that it heard of: an earlier instance
+    /// whose wall clock ran ahead of this one's, or a forgery. Its epoch goes one past that
+    /// life's, which every node takes as a restart, and its incarnation past that life's too,
+    /// for nodes older than 0.3, which order by incarnation alone; then it gossips Alive.
+    /// Counted as a refutation. A node that left stays gone.
+    fn outlive(&mut self, epoch: u64, inc: u32) {
+        if self.has_left() {
+            return;
+        }
+        let me = &mut self.local.member;
+        me.epoch = epoch_past(epoch);
+        if at_least(inc, me.incarnation) {
+            me.incarnation = inc.wrapping_add(1);
+        }
+        self.metrics.refutations += 1;
+        self.broadcast(self.local_alive());
     }
 
     /// Raises this node's incarnation past `seen`, which is its own or newer, and gossips
@@ -362,5 +504,24 @@ mod tests {
         assert!(!at_least(half, 0) && !at_least(0, half));
         // A rumour more than 2^31 ahead reads as old, so it moves nothing.
         assert!(newer(0, half + 1) && !newer(half + 1, 0));
+    }
+
+    #[test]
+    fn epochs_order_lives_and_zero_is_unknown() {
+        assert_eq!(life(5, 5), Life::Same);
+        assert_eq!(life(6, 5), Life::Later);
+        assert_eq!(life(4, 5), Life::Earlier);
+        // An epoch nobody sent defers to incarnations, on either side.
+        assert_eq!(life(0, 5), Life::Same);
+        assert_eq!(life(5, 0), Life::Same);
+        // Serial numbers, as incarnations are: u64::MAX can be outlived, and a life 2^63 away
+        // is earlier from both sides.
+        assert_eq!(epoch_past(u64::MAX), 1, "0 is skipped");
+        assert_eq!(life(epoch_past(u64::MAX), u64::MAX), Life::Later);
+        assert_eq!(life((1 << 63) + 1, 1), Life::Earlier);
+        assert_eq!(life(1, (1 << 63) + 1), Life::Earlier);
+        assert_eq!(life(1 << 63, 1), Life::Later, "2^63 - 1 ahead");
+        // Wall-clock milliseconds a restart apart are the plain order.
+        assert_eq!(life(1_790_000_000_001, 1_790_000_000_000), Life::Later);
     }
 }

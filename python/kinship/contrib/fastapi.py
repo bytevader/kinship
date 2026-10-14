@@ -129,12 +129,14 @@ class MemberInfo(BaseModel):
     name: str
     addr: str
     state: str
+    epoch: int
     meta: dict[str, str]
 
 
 def cluster_router(prefix: str = "/cluster") -> APIRouter:
     """A router with ``GET {prefix}/members``, the alive and suspect members with their name,
-    address, state and metadata, and ``GET {prefix}/stats``, this node's protocol counters.
+    address, state, epoch and metadata, and ``GET {prefix}/stats``, this node's protocol
+    counters.
 
     These expose member addresses and metadata. In production, protect them, for example
     with ``app.include_router(cluster_router(), dependencies=[Depends(admin_only)])``, or
@@ -145,7 +147,9 @@ def cluster_router(prefix: str = "/cluster") -> APIRouter:
     @router.get("/members")
     async def members(cluster: Annotated[Cluster, Depends(get_cluster)]) -> list[MemberInfo]:
         return [
-            MemberInfo(name=m.name, addr=m.addr, state=m.state.name, meta=dict(m.meta))
+            MemberInfo(
+                name=m.name, addr=m.addr, state=m.state.name, epoch=m.epoch, meta=dict(m.meta)
+            )
             for m in sorted(cluster.members(), key=lambda m: m.name)
         ]
 

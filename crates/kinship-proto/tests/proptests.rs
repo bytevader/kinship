@@ -18,6 +18,7 @@ struct AliveM {
     meta: Vec<u8>,
     vmin: u8,
     vmax: u8,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -42,11 +43,13 @@ enum M {
         inc: u32,
         node: String,
         from: String,
+        epoch: u64,
     },
     Dead {
         inc: u32,
         node: String,
         from: String,
+        epoch: u64,
     },
     PushPull {
         join: bool,
@@ -86,16 +89,22 @@ fn alive_m() -> impl Strategy<Value = AliveM> {
         1u8..=255,
     )
         .prop_flat_map(|(inc, node, addr, meta, vmin)| {
-            (Just((inc, node, addr, meta, vmin)), vmin..=255)
+            (Just((inc, node, addr, meta, vmin)), vmin..=255, epoch())
         })
-        .prop_map(|((inc, node, addr, meta, vmin), vmax)| AliveM {
+        .prop_map(|((inc, node, addr, meta, vmin), vmax, epoch)| AliveM {
             inc,
             node,
             addr,
             meta,
             vmin,
             vmax,
+            epoch,
         })
+}
+
+/// No epoch half the time, as from nodes older than 0.3, and any other the rest.
+fn epoch() -> impl Strategy<Value = u64> {
+    prop_oneof![Just(0u64), any::<u64>()]
 }
 
 fn msg() -> impl Strategy<Value = M> {
@@ -118,8 +127,18 @@ fn msg() -> impl Strategy<Value = M> {
         any::<u32>().prop_map(M::Ack),
         any::<u32>().prop_map(M::Nack),
         alive_m().prop_map(M::Alive),
-        (any::<u32>(), name(), name()).prop_map(|(inc, node, from)| M::Suspect { inc, node, from }),
-        (any::<u32>(), name(), name()).prop_map(|(inc, node, from)| M::Dead { inc, node, from }),
+        (any::<u32>(), name(), name(), epoch()).prop_map(|(inc, node, from, epoch)| M::Suspect {
+            inc,
+            node,
+            from,
+            epoch
+        }),
+        (any::<u32>(), name(), name(), epoch()).prop_map(|(inc, node, from, epoch)| M::Dead {
+            inc,
+            node,
+            from,
+            epoch
+        }),
         (
             any::<bool>(),
             prop::collection::vec((0u8..=3, alive_m()), 0..6)
@@ -140,6 +159,7 @@ fn alive_of(a: &AliveM) -> Alive<'_> {
         meta: &a.meta,
         vmin: a.vmin,
         vmax: a.vmax,
+        epoch: a.epoch,
     }
 }
 
@@ -193,15 +213,27 @@ fn with_messages<R>(ms: &[M], f: impl FnOnce(&[Message<'_>]) -> R) -> R {
             M::Ack(seq) => Message::Ack { seq: *seq },
             M::Nack(seq) => Message::Nack { seq: *seq },
             M::Alive(a) => Message::Alive(alive_of(a)),
-            M::Suspect { inc, node, from } => Message::Suspect(Suspect {
+            M::Suspect {
+                inc,
+                node,
+                from,
+                epoch,
+            } => Message::Suspect(Suspect {
                 inc: *inc,
                 node: id(node),
                 from: id(from),
+                epoch: *epoch,
             }),
-            M::Dead { inc, node, from } => Message::Dead(Dead {
+            M::Dead {
+                inc,
+                node,
+                from,
+                epoch,
+            } => Message::Dead(Dead {
                 inc: *inc,
                 node: id(node),
                 from: id(from),
+                epoch: *epoch,
             }),
             M::PushPull { join, .. } => Message::PushPull(PushPull {
                 join: *join,

@@ -24,10 +24,11 @@ Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
 Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
-The default image installs `kinship[fastapi]>=0.2` from PyPI on
-`python:3.13-slim`, with uvicorn and httpx. To try changes in this checkout
-instead, build a release wheel from source, with maturin and Rust 1.85.1 in a
-separate build stage:
+The default image installs `kinship[fastapi]>=0.3` from PyPI on
+`python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
+`Ring.fence()`, new in 0.3, so until 0.3 is published build from source. To try
+changes in this checkout, build a release wheel from source, with maturin and
+Rust 1.85.1 in a separate build stage:
 
 ```sh
 KINSHIP_INSTALL=source docker compose up --build -d
@@ -59,6 +60,14 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   suspected it or declared it dead and sent writes elsewhere. When it comes back
   it refutes by raising its incarnation, and on seeing that it drops its whole
   cache, so its returning keys read as misses rather than stale values.
+- Each card shows when that node's current run started: its member epoch, the
+  wall-clock time its process started. A restart shows as a new time, and the
+  event log adds a **New run** entry after its MemberJoined.
+- A write forwarded to a key's owner carries a fencing token, `ring.fence(key)`
+  as the forwarding node sees it: the owner's name and epoch. The owner applies
+  it only if its own `ring.fence(key)` agrees, so a write meant for its earlier
+  run, from a peer that has not seen it restart yet, is refused with 409 and
+  counted as **fenced**.
 - Successes count successful GETs and PUTs. Misses are 404s from cold keys,
   including keys lost with an owner. Errors are requests the node answered but
   the key's owner did not, such as reads that still go to a SUSPECT owner.
@@ -92,7 +101,8 @@ the optional profile below.
 | Fault / button | What to watch | Recovery |
 | --- | --- | --- |
 | **Stall** | The FastAPI event loop blocks with `time.sleep(20)`. HTTP calls time out and its member count becomes stale, but the card stays ALIVE and keys keep their owner: kinship runs on its own Rust thread. | Automatic after 20 seconds. |
-| **Crash** | `os._exit(1)` sends no leave. Watch SUSPECT, DEAD, moved keys and misses, then MemberJoined when `restart: on-failure` starts it again. | Automatic, including the 15-second startup delay. |
+| **Crash** | `os._exit(1)` sends no leave. Watch SUSPECT, DEAD, moved keys and misses, then MemberJoined when `restart: on-failure` starts it again, at a new epoch. | Automatic, including the 15-second startup delay. |
+| **Bounce** | `os._exit(1)` too, but the next run skips the startup delay, so it is usually back, a few seconds later, before anyone declares it dead. Its later epoch replaces the old run on every node at once, though its incarnation starts again at 0: MemberLeft, MemberJoined and a New run entry, perhaps after a SUSPECT, with no DEAD. Its keys keep their owner but start cold, and with Load on, writes forwarded with the old run's token count as fenced. | Automatic, within a few seconds. |
 | **Leave** | The node calls `leave()` and exits 0. Watch LEFT, moved keys and misses; Docker leaves it down. | **Start** with the chaos profile, or `docker compose start node-3`; the dashboard frees the fault slot once the node reports itself ALIVE. |
 | **Drain** | Metadata changes to `role=draining`. The member stays ALIVE but its keys move to cache members. | **Undrain** returns `role=cache`; some keys move back, cold. |
 | **Pause** | Docker freezes the entire process, including kinship's thread. Watch SUSPECT outlines, then DEAD and changed owners. | **Unpause**; wait for recovery/rejoin. |

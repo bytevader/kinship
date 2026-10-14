@@ -55,7 +55,7 @@ crates/kinship-core/src/
   time.rs         Instant(u64 nanos) and Duration, no std clock
   rng.rs          seeded xoshiro256** RNG for every random choice, ChaCha20 stream for nonces
   io.rs           Transmit, StreamEvent, StreamId
-  member.rs       Member, State, Incarnation, precedence rules
+  member.rs       Member, State, incarnations and epochs, precedence rules
   table.rs        member table, shuffled probe order
   probe.rs        direct and indirect probe rounds, nacks
   suspicion.rs    Lifeguard suspicion timers and confirmations
@@ -118,6 +118,22 @@ Incarnations compare as serial numbers (RFC 1982): past u32::MAX they wrap to 0,
 | any | Dead or Left(j) | only Alive(i) with i > j, from the member's own address |
 
 When a node receives Suspect(i) or Dead(i) naming itself with i ≥ its own incarnation, it sets its incarnation to i + 1, wrapping past u32::MAX, broadcasts Alive, and raises its local health score. With i below its incarnation, the sender missed an earlier refutation and only the node itself can repair that, so it broadcasts its Alive again at the incarnation it has, without raising local health or counting a refutation; a node that left does neither. Dead and Left members stay as tombstones for dead_reclaim (30 s by default), or the replay window if that is longer, so that late rumours and recorded packets cannot resurrect them, then are deleted.
+
+### Epochs
+
+Incarnations order the rumours of one run of a member, but a process that restarts under the same name counts them from 0 again. From 0.3 each run also has an epoch, a u64 its driver picks when the node starts: kinship-net takes the wall clock's milliseconds since the Unix epoch. That is the one read of a wall clock, and a safe one, since the epoch names the node and times nothing. Every Alive, Suspect and Dead, and every push-pull record, carries the epoch of the life it is about, as an appended field (see Wire format), and `Member.epoch` exposes it in Rust and Python. A rumour is ranked by its epoch first and by its incarnation within one life:
+
+| Incoming epoch e, held epoch h | Effect |
+| --- | --- |
+| e = h, or either is 0 | The incarnation rules above, as before 0.3. An Alive that brings an epoch where 0 was held, at the incarnation held, teaches it. |
+| e later than h | An Alive replaces the life held whatever the incarnations, from the member's own address only (KI-03): the application gets MemberLeft for the old life, unless it had already died or left, then MemberJoined, so a restart reads as two events, and `restarts` counts it. A Suspect or Dead about a life this node has not heard of is dropped, as one about an unknown member is; that life's Alive comes first. |
+| e earlier than h | Dropped, whatever the incarnation: an Alive of an earlier life cannot bring back a member whose later life died, and its Suspect or Dead, at incarnations the new life has not reached again, cannot kill the new one. |
+
+Epochs compare as serial numbers, as incarnations do (KI-02): a member can always start a later life than any epoch a forged rumour names. Honest epochs, milliseconds of wall clocks, are nowhere near 2^63 apart, so among them this is the plain order of integers, and applications compare them as integers.
+
+A node that hears its own name at a later epoch, from its own address, moves past it: its epoch goes one past that life's and its incarnation past that life's, and it gossips Alive, which every node then takes as a restart. That is how a node whose clock reads behind its last run's epoch, after a clock step or on another machine, still starts a later life: its join's push-pull reply holds the old run, and the seed, which found the joiner's own record earlier, kept it. A Suspect or Dead about an earlier life of its own is answered with its Alive, as a stale one is, and one at its own epoch is refuted as before.
+
+A node older than 0.3 skips the epoch as it skips any appended field and sends none, so its members have epoch 0 on every node, and the rumours it passes on have lost theirs and fall back to incarnations. To such a node a restarted 0.3 node at incarnation 0 is older than its last run, so the restarted node still learns its old incarnation the way it did before 0.3, from a record of the old run without an epoch, and refutes above it. Until then the older node keeps the old run's record, which the new process answers Pings for, so it suspects nothing. A 0.3 node that hears that refutation only through older nodes holds it under the old epoch until its next push-pull with a 0.3 node.
 
 ### Probe round
 
@@ -232,6 +248,7 @@ Encoding rules the decoder enforces, so that every value has exactly one encodin
 - A varint is unsigned LEB128, at most 5 bytes, at most u32::MAX, and minimal (no padding with zero continuation groups). Integers outside varints are fixed-width big-endian.
 - A payload holds at least one message, count is checked against the bytes left before any message is read, and no bytes may follow the last message. A known message type whose body is too short is an error, not a skip.
 - Booleans are exactly 0 or 1, states are 0 (Alive) to 3 (Left), and an Alive record has 1 <= vmin <= vmax.
+- The epoch appended to Alive, Suspect and Dead in 0.3 is a u64 right after the version 1 fields. Epoch 0, which a node without one has, is not written, so such a node sends exactly the bytes it did before; a body that ends there reads as epoch 0, and one that ends part way into the 8 bytes is too short. Fields appended later follow it.
 - The whole payload is validated in one allocation-free pass, after which iterating it cannot fail. Postcard and protobuf were rejected: postcard cannot evolve fields, and prost adds allocation and size for little gain on a dozen fixed messages.
 
 | Type | Message | Body fields | Carried on |
@@ -240,9 +257,9 @@ Encoding rules the decoder enforces, so that every value has exactly one encodin
 | 0x02 | PingReq | seq u32, target NodeId, target Addr, requester Addr, want_nack u8 | UDP |
 | 0x03 | Ack | seq u32 | UDP, TCP fallback |
 | 0x04 | Nack | seq u32 | UDP |
-| 0x05 | Alive | inc u32, node NodeId, addr Addr, meta bytes, vmin u8, vmax u8 | gossip, push-pull |
-| 0x06 | Suspect | inc u32, node NodeId, from NodeId | gossip |
-| 0x07 | Dead | inc u32, node NodeId, from NodeId; from = node means Left | gossip |
+| 0x05 | Alive | inc u32, node NodeId, addr Addr, meta bytes, vmin u8, vmax u8, then from 0.3 epoch u64 | gossip, push-pull |
+| 0x06 | Suspect | inc u32, node NodeId, from NodeId, then from 0.3 epoch u64 | gossip |
+| 0x07 | Dead | inc u32, node NodeId, from NodeId, then from 0.3 epoch u64; from = node means Left | gossip |
 | 0x08 | PushPull | join u8, count varint, then count records, each a varint length and a body of state u8 followed by the Alive fields | TCP only |
 | 0x09 to 0x7F | reserved | user broadcasts, compression, future features |  |
 
@@ -273,7 +290,21 @@ UDP carries everything small and frequent: probes, acks, nacks and piggybacked g
 
 ### Join and push-pull
 
-A push-pull exchange sends the full member table both ways and merges it with the precedence rules above. On join it also tells the newcomer what the cluster believes about it, which is how a restarted node learns that it must raise its incarnation.
+A push-pull exchange sends the full member table both ways and merges it with the precedence rules above. On join it also tells the newcomer what the cluster believes about it. With epochs, a restarted node's join already replaces its old life: the seed merges the joiner's record, a later life, before it answers, so the new life spreads from there at incarnation 0 and the reply holds it, with nothing to learn.
+
+```mermaid
+sequenceDiagram
+    participant N as Restarted node N, epoch 1790000100000
+    participant S as Seed S
+    participant O as Other members
+    N->>S: PushPull(join=1, [Alive(N, epoch 1790000100000, inc 0)])
+    Note over S: a later life than its Alive(N, epoch 1790000000000, inc 7): MemberLeft, MemberJoined
+    S-->>N: PushPull(join=0, full table incl. Alive(N, epoch 1790000100000, inc 0))
+    S->>O: gossip Alive(N, epoch 1790000100000, inc 0)
+    Note over O: later life: MemberLeft, MemberJoined; Dead(N, epoch 1790000000000, inc 7) from a late node is dropped
+```
+
+Between nodes without epochs, older than 0.3 or relaying through one, the join is how a restarted node learns that it must raise its incarnation:
 
 ```mermaid
 sequenceDiagram
@@ -528,9 +559,9 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| udp_max_payload | 1,400 bytes | largest datagram sent; at least a full Alive beside a Ping, 813 bytes encrypted with 512 bytes of metadata |
+| udp_max_payload | 1,400 bytes | largest datagram sent; at least a full Alive beside a Ping, 821 bytes encrypted with 512 bytes of metadata |
 | max_stream_frame | 8 MiB | largest TCP frame accepted |
-| max_meta_bytes | 512 bytes | metadata cap; at most 1,099 bytes encrypted with the default datagram |
+| max_meta_bytes | 512 bytes | metadata cap; at most 1,091 bytes encrypted with the default datagram |
 | tcp_timeout | 10 s | bound on each TCP exchange |
 | tcp_header_timeout | 1 s | time an inbound connection has to send the start of a frame for this node, at most tcp_timeout |
 | max_inbound_streams | 64 | concurrent TCP exchanges accepted; a new one beyond this drops the oldest of the address with the most |
@@ -559,13 +590,13 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | Network partition | Each side marks the other Dead; reconnect_interval push-pulls to recent dead members merge the sides after healing, and refutation restores Alive | kinship-sim `sync::healed_partitions_reconverge_thousand_seeds`, which records the convergence time; partitions that never heal in `swim::thousand_seeds_fifty_nodes`; `review::kp05_a_node_confirms_only_suspicions_its_own_probe_raised`, which reads every node's datagrams for a Suspect it signs about a member it never probed unanswered; kinship-core `sync::tests::a_merged_suspicion_counts_no_reporter_and_is_not_gossiped` |
 | Partition longer than dead_reclaim | Tombstones are gone, so reconnect cannot find the other side. Every rejoin_interval each node push-pulls with any configured seed that is not a live member, so a seed on the far side merges the two; with no seed there, the application calls join() through one | kinship-sim `failure::a_partition_longer_than_dead_reclaim_needs_a_join_thousand_seeds`: the sides stay apart after the heal until one join through a seed merges them; kinship `cluster::a_node_alone_rejoins_its_seeds_in_the_background` and `cluster::a_seed_that_is_not_a_member_is_rejoined` |
 | A seed name that does not resolve (DNS down, a typo, a Service with no ready pods) | Logged and skipped; the name is looked up again at every join and rejoin, and the node joins through the seeds that did resolve. A start fails with JoinError (Rust `Error::Unresolved`) only if no seed resolved within resolve_timeout | kinship `cluster::a_start_whose_seed_names_never_resolve_fails` and `cluster::a_seed_given_by_name_is_looked_up_at_every_join_and_rejoin`; kinship-net `seed::tests::an_unresolvable_name_fails_alone_and_a_join_gives_up_after_its_wait`; `test_cluster.py::test_a_start_whose_seed_names_never_resolve_raises_join_error` and `test_cluster.py::test_seeds_may_be_dns_names` |
-| Restart with the same name | The old tombstone wins at first; the push-pull reply teaches the node its old incarnation and it refutes above it | kinship-sim `failure::a_restarted_node_learns_its_incarnation_and_rejoins_thousand_seeds`, restarting before anyone suspects it or after its tombstone spread, and never reported dead after the restart; kinship-core `sync::tests::a_restarted_node_learns_its_old_incarnation_and_refutes` |
+| Restart with the same name | The new run's later epoch replaces the old run at once on every node, at incarnation 0: MemberLeft for the old run, unless it had died, then MemberJoined. Rumours about the old run, its death or a recording of its Alive, change nothing about the new one. A node whose clock reads behind its last run's epoch moves past it during its join. Between nodes without epochs the old tombstone wins at first; the push-pull reply teaches the node its old incarnation and it refutes above it | kinship-sim `failure::a_restarted_node_replaces_its_old_life_at_a_lower_incarnation_thousand_seeds` and, without epochs, `failure::a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins_thousand_seeds`, each restarting before anyone suspects it or after its tombstone spread, never reported dead after the restart; `epoch::rumours_about_an_earlier_life_neither_kill_nor_revive_the_later_one_thousand_seeds`, the old run's Suspect and Dead far above in incarnation while the new run lives and its Alive once it died; `epoch::older_nodes_without_epochs_mix_with_newer_ones_thousand_seeds`, half the nodes as before 0.3; kinship-core `sync::tests::a_restarted_node_replaces_its_old_life_at_a_lower_incarnation`, `sync::tests::a_node_whose_clock_is_behind_its_last_life_moves_past_it`, `sync::tests::a_restarted_node_learns_its_old_incarnation_and_refutes`, `tests::a_later_life_replaces_the_member_whatever_its_incarnation`, `tests::a_stale_epoch_never_brings_a_dead_member_back` and `tests::an_epoch_nobody_sent_defers_to_incarnations`; `test_cluster.py::test_a_node_that_restarts_with_its_name_comes_back_at_a_new_epoch` |
 | Two live nodes with the same name | Alive with the same name and a different address is not applied, for a live member and for a Dead or Left one until its tombstone is reaped; a NameConflict event fires on both sides. A member that comes back at a new address is admitted there once its tombstone is reaped | kinship-sim `failure::a_second_node_with_a_live_name_never_takes_it_thousand_seeds`; kinship-core `tests::a_second_live_node_cannot_take_a_name`, `tests::a_tombstone_keeps_its_name_at_its_address_until_it_is_reaped` and `open_findings::ki03_a_member_cannot_move_a_dead_node_to_another_address`; `test_cluster.py::test_two_live_nodes_with_one_name_both_see_the_conflict` |
 | Key mismatch during rotation | Packets that fail authentication are dropped and counted under decrypt_failures; the node looks dead to peers without the key | kinship-sim `keyring::a_node_that_falls_behind_dies_and_rejoins_thousand_seeds` and `keyring::rotating_every_node_never_raises_a_suspicion_thousand_seeds`; kinship `keyring::rotating_a_cluster_keeps_every_node_alive` |
 | Garbage, truncated or hostile packets | Bounds-checked decoder drops them and counts decode_errors; never panics | cargo-fuzz targets `decode_datagram`, `decode_stream_frame` and `decode_payload` in `crates/kinship-proto/fuzz`, and `node_input` in `crates/kinship-core/fuzz`, which feeds Node::handle_datagram and handle_stream and checks that the metrics only count up; kinship-core `tests::counts_good_and_bad_datagrams` |
 | Recorded packets replayed by an attacker without the key | Packets stamped before the replay window are dropped before decryption, copies inside it after authentication, and a stale push-pull is answered with the node's own record only; both count as replays_dropped | kinship-sim `replay::a_replayed_alive_never_resurrects_a_member_that_left`, `replay::a_replayed_rumour_never_kills_a_member_that_restarted` and `review::kp01_a_restarted_node_refuses_recordings_older_than_the_window`, two seeds restarting together, and `review::ki06_an_honest_node_far_ahead_stretches_the_window_by_at_most_the_lag_limit`; kinship-core `open_findings::ki06_a_member_far_ahead_stretches_the_replay_window_by_at_most_the_lag_limit`, `replay::tests::a_jump_past_the_lag_limit_is_not_waited_for`, `tests::copies_and_stale_datagrams_are_dropped_as_replays`, `tests::until_it_has_joined_a_node_moves_its_floor_with_every_time_it_adopts`, `sync::tests::recorded_push_pulls_are_answered_with_no_more_than_one_record` and `sync::tests::a_node_behind_cluster_time_joins_in_two_exchanges` |
 | Partial stream frames or a connection flood from a peer without the key | Inbound connections share a budget of twice max_stream_frame, and those from one address a share of one frame; a read past the address's share drops its connection, and one past the budget evicts a partial frame of the address holding the most. One address keeps at most 16 connections, and a new one when all 64 are taken displaces the address with the most. A connection that does not start with a header for this node within a second is dropped | kinship-net `streams::inbound_connections_share_a_bounded_buffer`, `streams::a_peer_that_fills_the_inbound_budget_cannot_refuse_a_real_join`, `streams::inbound_connections_are_capped_per_address_then_taken_from_the_address_with_the_most`, `streams::a_connection_must_start_with_a_header_for_this_node` and `conn::tests::an_address_holds_at_most_its_share_and_room_comes_from_the_address_holding_the_most` |
-| Wall clock jumps (NTP, suspend) | Only monotonic time is used; a suspend looks like a long pause and is absorbed by LHM and refutation | kinship-sim `failure::a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds`, a jump alone or after a suspend; the `clippy.toml` of kinship-core, which reads no clock, and of kinship-net reject std::time::SystemTime and std::time::Instant::now |
+| Wall clock jumps (NTP, suspend) | Only monotonic time is used; a suspend looks like a long pause and is absorbed by LHM and refutation | kinship-sim `failure::a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds`, a jump alone or after a suspend; the `clippy.toml` of kinship-core, which reads no clock, and of kinship-net reject std::time::SystemTime and std::time::Instant::now, but for kinship-net's one read of the wall clock, which picks the epoch at start and times nothing |
 | Oversized metadata or member table | set_meta raises ValueError; limits under which a full Alive does not fit a datagram beside a Ping are refused at construction; a rumour that fits no datagram is dropped and counted; push-pull frames over max_stream_frame are refused and counted; new members beyond max_members, or beyond max_new_members_per_packet in one packet, are refused and counted, and the broadcast queue's member index keeps a bulk merge O(n log n) | kinship-core `open_findings::ki04_one_push_pull_floods_the_member_table`, 20,000 invented members in one frame, and 20,000 admitted in milliseconds when configured; `tests::one_datagram_admits_at_most_its_share_of_new_members`, `tests::the_table_holds_at_most_max_members_this_node_and_tombstones_included`, `sync::tests::one_push_pull_frame_shares_one_admission_budget`, `config::tests::member_limits_default_and_must_be_positive` and the `broadcast::tests` of the queue's order, replacement, packing and live-only sends; kinship-core `tests::new_rejects_invalid_config_and_meta`, `config::tests::the_largest_alive_must_fit_a_datagram_beside_a_ping`, `broadcast::tests::a_rumour_too_large_for_any_datagram_is_dropped_and_counted`, `sync::tests::state_too_large_for_a_frame_is_refused` and `sync::tests::oversized_frames_are_dropped_before_they_are_copied`; kinship-sim `review::kp03_a_member_with_full_metadata_survives_a_pause`, at the smallest datagram accepted; kinship-net `streams::an_oversized_frame_is_refused_from_its_length_prefix`; `test_cluster.py::test_metadata_set_update_and_limits` and `test_config.py::test_bad_fields_raise_config_error_naming_the_field` |
 | Actor panic | The panic is caught, the node moves to closed, pending and later calls fail with Closed (KinshipClosed in Python), and the events iterator ends with that error | kinship-net `tests::an_actor_panic_fails_pending_and_later_calls_and_marks_events_failed`, through a hook behind the hidden test-hooks feature; `test_panic.py::test_an_actor_panic_ends_the_event_iterator_with_kinship_closed`, run in CI against a second wheel built with that feature, never the release one |
 | os.fork after start | The child raises on first use instead of hanging on a dead runtime | `test_blocking.py::test_a_forked_child_raises_instead_of_hanging` and `test_a_forked_child_can_start_its_own_cluster` |
