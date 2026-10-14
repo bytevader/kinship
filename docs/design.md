@@ -649,13 +649,13 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 | join_retries | 3 | attempts per seed, with exponential backoff from probe_interval |
 | max_members | 8,192 | members a node holds, itself and tombstones included; Alives for new names are refused beyond it |
 | max_new_members_per_packet | 1,024 | members new to a node that one datagram or push-pull frame can add |
-| max_user_message | 64 KiB | data in one direct message; larger ones go over TCP, and must fit a frame beside the sender's Alive |
+| max_user_message | 64 KiB | data in one direct message; one too large for a datagram goes over TCP, so it must fit one max_stream_frame frame |
 | max_user_broadcast | 256 bytes | data in one broadcast; must fit a datagram beside the largest Ping, at most 1,108 bytes encrypted with the default datagram |
 | user_broadcast_queue | 256 | broadcasts a node holds to send, its own and those it relays; beyond it the one nearest to done is dropped |
 | event_buffer | 1,024 | events held for Python before the oldest drop |
 | runtime_threads | 1 | tokio worker threads, set once per process |
 
-Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. A direct message of max_user_message bytes between 64-byte names must fit a max_stream_frame frame beside the sender's largest Alive, naming max_stream_frame when it is below its default and max_user_message otherwise; a broadcast of max_user_broadcast bytes from a 64-byte name must fit a datagram beside the largest Ping, naming max_user_broadcast; and user_broadcast_queue must be at least 1. Invalid combinations fail construction with the field names in the message.
+Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. A direct message of max_user_message bytes between 64-byte names must fit one max_stream_frame frame, naming max_stream_frame when it is below its default and max_user_message otherwise; a broadcast of max_user_broadcast bytes from a 64-byte name must fit a datagram beside the largest Ping, naming max_user_broadcast; and user_broadcast_queue must be at least 1. Invalid combinations fail construction with the field names in the message.
 
 ## Failure modes
 

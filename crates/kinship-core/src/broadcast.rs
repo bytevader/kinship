@@ -12,6 +12,7 @@ use crate::replay::STAMP_LEN;
 use crate::rng::Nonces;
 use crate::suspicion::retransmit_limit;
 use crate::time::Instant;
+use crate::user::UserQueue;
 
 /// An Alive, Suspect or Dead rumour waiting to be spread, owned so it can outlive the packet
 /// it arrived in.
@@ -218,6 +219,11 @@ impl Broadcasts {
         &self.queue[&rank].gossip
     }
 
+    /// Bytes the rumour queued at `rank` takes in a payload.
+    fn len_of(&self, rank: Rank) -> usize {
+        self.queue[&rank].len
+    }
+
     /// Entries that fit in `budget` bytes, best first: in queue order, skipping any that do
     /// not fit what is left so that smaller ones behind it still can. Stops once what is left
     /// is too small for any rumour, so a long queue costs only what a packet takes from it.
@@ -281,7 +287,7 @@ fn smallest_rumour() -> usize {
 }
 
 /// Bytes a payload's message count can take: counts stay below 2^14 in any packet.
-const COUNT_LEN: usize = 2;
+pub(crate) const COUNT_LEN: usize = 2;
 
 /// Bytes a datagram sealed by `codec` has for its messages, past their count.
 pub(crate) fn datagram_room(codec: &Codec) -> usize {
@@ -294,6 +300,8 @@ pub(crate) fn datagram_room(codec: &Codec) -> usize {
 pub(crate) struct Outbox {
     pub codec: Codec,
     pub broadcasts: Broadcasts,
+    /// User broadcasts, which take the room membership rumours leave.
+    pub user: UserQueue,
     pub transmits: VecDeque<Transmit>,
     /// The random bytes of nonces, apart from the protocol's RNG, which they must not give away
     /// and whose choices sealing must not shift.
@@ -307,6 +315,7 @@ impl Outbox {
         Self {
             codec,
             broadcasts: Broadcasts::default(),
+            user: UserQueue::default(),
             transmits: VecDeque::new(),
             nonces,
             stamp: 0,
@@ -325,9 +334,10 @@ impl Outbox {
     }
 
     /// Sends `head` to `to` in one datagram, filling the space left with queued gossip that
-    /// has been sent fewer than `limit` times (none if `limit` is `None`). `live` says whether
-    /// `to` is a member this node holds live, Alive or Suspect. Sends nothing if there is
-    /// nothing to send. Returns whether a datagram was queued.
+    /// has been sent fewer than `limit` times (none if `limit` is `None`): membership rumours
+    /// first, then, to a member held live, user broadcasts in the room they leave. `live` says
+    /// whether `to` is a member this node holds live, Alive or Suspect. Sends nothing if there
+    /// is nothing to send. Returns whether a datagram was queued.
     pub fn send(
         &mut self,
         to: SocketAddr,
@@ -341,16 +351,29 @@ impl Outbox {
             Some(_) => self.broadcasts.select(max.saturating_sub(used)),
             None => Vec::new(),
         };
-        if head.is_empty() && picked.is_empty() {
+        // Membership always wins: user broadcasts only take what the rumours leave.
+        let users = match limit {
+            Some(_) if live && !self.user.is_empty() => {
+                let rumours: usize = picked.iter().map(|&r| self.broadcasts.len_of(r)).sum();
+                self.user.select(max.saturating_sub(used + rumours))
+            }
+            _ => Vec::new(),
+        };
+        if head.is_empty() && picked.is_empty() && users.is_empty() {
             return false;
         }
         let nonce = self.nonce();
-        let mut msgs = Vec::with_capacity(head.len() + picked.len());
+        let mut msgs = Vec::with_capacity(head.len() + picked.len() + users.len());
         msgs.extend_from_slice(head);
         msgs.extend(
             picked
                 .iter()
                 .map(|&rank| self.broadcasts.gossip(rank).message()),
+        );
+        msgs.extend(
+            users
+                .iter()
+                .map(|&rank| self.user.broadcast(rank).message()),
         );
         let mut payload = Vec::new();
         // Only an oversized head can fail, and no head is near the limit.
@@ -364,6 +387,9 @@ impl Outbox {
         }
         if let Some(limit) = limit {
             self.broadcasts.sent(&picked, limit, live);
+            if !users.is_empty() {
+                self.user.sent(&users, limit);
+            }
         }
         self.transmits.push_back(Transmit::Datagram { to, payload });
         true
@@ -441,9 +467,10 @@ impl Node {
 
     /// Sends queued rumours to `gossip_nodes` random members, those declared dead less than
     /// `gossip_to_the_dead` ago included, so a member wrongly declared dead hears about it and
-    /// can refute. Members that left are not sent to: they have closed.
+    /// can refute. Members that left are not sent to: they have closed. User broadcasts go only
+    /// to the live ones among them.
     pub(crate) fn gossip(&mut self, now: Instant) {
-        if self.out.broadcasts.is_empty() {
+        if self.out.broadcasts.is_empty() && self.out.user.is_empty() {
             return;
         }
         let window = self.cfg.gossip_to_the_dead;
@@ -461,7 +488,10 @@ impl Node {
             .collect();
         let limit = self.retransmit_limit();
         for (to, live) in targets {
-            if !self.send_to(to, live, &[], Some(limit)) {
+            // With nothing left to send, the rest get nothing either; a member that is not live
+            // gets no user broadcasts, which the next one may.
+            let empty = self.out.broadcasts.is_empty() && self.out.user.is_empty();
+            if !self.send_to(to, live, &[], Some(limit)) && empty {
                 break;
             }
         }

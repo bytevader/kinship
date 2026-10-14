@@ -30,6 +30,8 @@ pub(crate) enum Purpose {
     Sync,
     /// The TCP fallback ping of the probe round with this sequence number.
     Ping { seq: u32 },
+    /// User messages too large for a datagram; the receiver closes once it handled them.
+    Message,
 }
 
 /// A connection this node opened and is waiting on.
@@ -122,8 +124,13 @@ impl Node {
             StreamEvent::Frame(frame) => self.on_frame(conn, frame),
             StreamEvent::Closed | StreamEvent::Failed => {
                 if let Some(o) = self.sync.streams.remove(&conn) {
-                    // The peer hung up or the connection broke before it answered.
-                    self.exchange_failed(o.purpose);
+                    if o.purpose == Purpose::Message {
+                        // The receiver closes once it has handled the messages.
+                        self.user_stream_ended(conn, ev == StreamEvent::Closed);
+                    } else {
+                        // The peer hung up or the connection broke before it answered.
+                        self.exchange_failed(o.purpose);
+                    }
                 }
             }
         }
@@ -173,7 +180,16 @@ impl Node {
                     // Every record in the frame shares one admission budget for new members.
                     let mut budget = self.admission();
                     let mut answered = false;
+                    // User messages wait for the rest, so that an Alive in the frame introduces
+                    // their sender; only a connection a peer opened carries them.
+                    let mut user = Vec::new();
                     for msg in payload.iter() {
+                        if matches!(msg, Message::UserMessage(_) | Message::UserBroadcast(_)) {
+                            if conn.is_inbound() {
+                                user.push(msg);
+                            }
+                            continue;
+                        }
                         answered = if conn.is_inbound() {
                             self.serve(now, conn, &msg, &mut budget)
                         } else {
@@ -182,6 +198,9 @@ impl Node {
                         if answered {
                             break;
                         }
+                    }
+                    for msg in &user {
+                        self.on_user(msg);
                     }
                     answered
                 } else {
@@ -222,6 +241,11 @@ impl Node {
                     self.metrics.misdirected += 1;
                 }
                 true
+            }
+            // The sender's Alive ahead of its user messages, which asks for no answer.
+            Message::Alive(a) => {
+                self.on_alive(now, a, budget);
+                false
             }
             _ => false,
         }
@@ -273,7 +297,10 @@ impl Node {
     /// reply has failed.
     fn end_stream(&mut self, conn: StreamId, answered: bool) {
         if let Some(o) = self.sync.streams.remove(&conn) {
-            if !answered {
+            if o.purpose == Purpose::Message {
+                // Timed out, or answered with a frame the receiver never sends.
+                self.user_stream_ended(conn, false);
+            } else if !answered {
                 self.exchange_failed(o.purpose);
             }
         }
@@ -287,7 +314,7 @@ impl Node {
                 self.seed_done(self.now, cmd, seed, false);
             }
             Purpose::Sync => self.metrics.push_pull_failures += 1,
-            Purpose::Ping { .. } => {}
+            Purpose::Ping { .. } | Purpose::Message => {}
         }
     }
 
@@ -350,7 +377,7 @@ impl Node {
     }
 
     /// Opens a connection to `to` and remembers why.
-    fn connect(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) -> StreamId {
+    pub(crate) fn connect(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) -> StreamId {
         let conn = StreamId::outbound(self.sync.next_stream);
         self.sync.next_stream += 1;
         self.out.transmits.push_back(Transmit::Connect { conn, to });
@@ -1162,6 +1189,8 @@ mod tests {
     fn state_too_large_for_a_frame_is_refused() {
         let mut cfg = Config::lan(Security::InsecurePlaintext);
         cfg.limits.max_stream_frame = 256;
+        // A frame this small holds only a small user message.
+        cfg.max_user_message = 64;
         let me = Identity::new("b", addr(2)).unwrap();
         let mut b = Node::new(cfg, me, Instant::ZERO, 2, &[2; 32]).unwrap();
         for i in 0..20 {
