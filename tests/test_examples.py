@@ -55,6 +55,16 @@ class TestExamples:
         }
         assert ": 404, " in out
 
+    def test_messages_reach_their_members_once_large_ones_over_tcp(self) -> None:
+        out = run("messages.py")
+        got = [line for line in out.splitlines() if " got a " in line]
+        broadcasts = [line.split()[0] for line in got if "broadcast from node-a" in line]
+        assert sorted(broadcasts) == ["node-b", "node-c"], "once each, and not node-a"
+        assert any(line.startswith("node-c got a message from node-b: b'report?'") for line in got)
+        reply = next(line for line in got if line.startswith("node-b got a message from node-c"))
+        assert reply.endswith(", 8890 bytes"), "more than a datagram holds"
+        assert "node-b: 1 sent, 2 received" in out
+
     def test_sync_workers_route_around_a_draining_node(self) -> None:
         out = run("sync_workers.py")
         before, after = out.split("node-a routes new requests around node-b:")

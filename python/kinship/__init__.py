@@ -13,7 +13,9 @@ from kinship._errors import (
     KeyringError,
     KinshipClosed,
     KinshipError,
+    MessageTooLarge,
     MetaTooLarge,
+    NotAMember,
 )
 from kinship._kinship import Config, __version__, wire_version
 from kinship._logging import log_to_python
@@ -30,6 +32,7 @@ from kinship._types import (
     NameConflict,
     State,
     Stats,
+    UserMessage,
 )
 
 __all__ = [
@@ -51,10 +54,13 @@ __all__ = [
     "MemberRecovered",
     "MemberSuspect",
     "MemberUpdated",
+    "MessageTooLarge",
     "MetaTooLarge",
     "NameConflict",
+    "NotAMember",
     "State",
     "Stats",
+    "UserMessage",
     "__version__",
     "blocking",
     "log_to_python",

@@ -19,6 +19,16 @@ class MetaTooLarge(KinshipError, ValueError):
     """Encoded metadata is larger than ``max_meta_bytes`` (512 by default)."""
 
 
+class MessageTooLarge(KinshipError, ValueError):
+    """A message is larger than ``max_user_message`` (64 KiB by default), or a broadcast than
+    ``max_user_broadcast`` (256 bytes)."""
+
+
+class NotAMember(KinshipError, LookupError):
+    """``send()`` to a name this node does not hold as a live member at that epoch: one it does
+    not know, one that died or left, a run that has since restarted, or this node itself."""
+
+
 class JoinError(KinshipError):
     """``join()`` reached no seed."""
 

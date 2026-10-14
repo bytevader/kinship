@@ -135,6 +135,24 @@ class NameConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class UserMessage:
+    """Data from ``sender``: sent to this node alone, or to every member if ``broadcast``.
+
+    ``sender`` is the member as this node holds it when the message arrives, so its state can
+    be suspect, or dead or left for a message sent just before. Messages are authenticated to
+    the cluster, not to their sender: any member holding the key can claim any name.
+    """
+
+    sender: Member
+    data: bytes
+    broadcast: bool
+
+    def __repr__(self) -> str:
+        kind = "broadcast" if self.broadcast else "message"
+        return f"UserMessage({kind} from {self.sender.name}, {len(self.data)} bytes)"
+
+
+@dataclass(frozen=True, slots=True)
 class EventsLost:
     """The consumer fell behind and ``count`` events were dropped; resync from ``members()``."""
 
@@ -152,6 +170,7 @@ Event: TypeAlias = (
     | MemberLeft
     | MemberUpdated
     | NameConflict
+    | UserMessage
     | EventsLost
 )
 
@@ -165,10 +184,13 @@ _MEMBER_EVENTS: dict[str, Any] = {
 
 
 def _event(raw: tuple[Any, ...]) -> Event:
-    kind, member, previous_meta, other_addr, count = raw
+    kind, member, previous_meta, other_addr, count, message = raw
     if kind == "EventsLost":
         return EventsLost(count)
     m = _member(member)
+    if kind == "UserMessage":
+        data, broadcast = message
+        return UserMessage(m, data, broadcast)
     if kind == "MemberUpdated":
         return MemberUpdated(m, _meta(previous_meta))
     if kind == "NameConflict":
@@ -204,3 +226,8 @@ class Stats:
     gossip_too_large: int
     tcp_pings: int
     tcp_ping_acks: int
+    user_messages_sent: int
+    user_messages_received: int
+    user_messages_dropped: int
+    user_messages_too_large: int
+    user_queue_overflow: int
