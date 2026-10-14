@@ -715,13 +715,10 @@ fn an_epoch_is_read_when_present_and_zero_when_absent() {
         [suspect(1_790_000_000_000)]
     );
     assert_eq!(parse(&cut).unwrap_err(), DecodeError::Truncated);
-    // Epoch 0 is not sent, so a node without one sends the bytes 0.2 did.
-    let mut sealed = Vec::new();
-    let codec = Codec::insecure_plaintext(b"", Limits::default()).unwrap();
-    codec
-        .seal(PacketKind::Datagram, &[suspect(0)], &NONCE, &mut sealed)
-        .unwrap();
-    assert!(sealed.ends_with(&without));
+    // Epoch 0 is not sent, so a node without one sends as many bytes as 0.2 did: its type,
+    // its length and the version 1 body. The golden vectors pin those bytes.
+    assert_eq!(suspect(0).encoded_len(), 2 + without.len());
+    assert_eq!(suspect(1).encoded_len(), 2 + with.len());
 }
 
 #[test]
