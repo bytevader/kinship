@@ -125,7 +125,7 @@ async with kinship.Cluster(cfg) as cluster:   # binds, then joins cfg.seeds
 | `await cluster.set_meta(meta)` | `None` | Replace this node's metadata and gossip it. |
 | `await cluster.update_meta(**changes)` | `None` | Change some metadata keys; a value of `None` deletes the key. |
 | `cluster.keyring` | `Keyring` | Runtime key rotation on this node; see Encryption. |
-| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, `decrypt_failures`, `decode_errors`, `replays_dropped`. |
+| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, restarts seen, `decrypt_failures`, `decode_errors`, `replays_dropped`. |
 | `await cluster.leave(timeout=5.0)` | `None` | Tell the cluster this node is leaving and wait for it to spread. |
 | `await cluster.close()` | `None` | Stop the node and close sockets. Without `leave()` first, peers see a crash. |
 
@@ -140,6 +140,9 @@ A `Member` is frozen and hashable by name:
 | `state` | `kinship.State` | `ALIVE`, `SUSPECT`, `DEAD` or `LEFT` |
 | `incarnation` | `int` | Raised only by the member itself, on refutation or metadata change |
 | `meta` | `Mapping[str, str]` | Metadata tags, read-only |
+| `epoch` | `int` | Which run of the node this is: the milliseconds of its wall clock when the process started. `0` for a node on kinship older than 0.3, which sends none |
+
+The epoch tells one run of a node from the next. A node that restarts under the same name comes back with a higher epoch, and every node replaces the old run with the new one at once, whatever their incarnations: the new process counts those from 0 again. Rumours about the old run, such as its death or a recording of its Alive, change nothing about the new one, and cannot bring it back once it has died. If the clock of the restarted machine reads behind the old run's epoch, the node raises its epoch past it when the cluster tells it about the old run, during its join. Use `(member.name, member.epoch)` wherever you need to know that you still talk to the same process, or `ring.fence(key)` for writes.
 
 ## Events
 
@@ -164,7 +167,7 @@ async for event in cluster.events():
 | `MemberSuspect` | `member` | A node missed its probes and is suspected |
 | `MemberRecovered` | `member` | A suspect node refuted the suspicion and is alive again |
 | `MemberDead` | `member` | A suspicion expired without a refutation |
-| `MemberLeft` | `member` | A node left on purpose |
+| `MemberLeft` | `member` | A node left on purpose, or restarted: its old run left, and `MemberJoined` follows with the new `epoch` |
 | `MemberUpdated` | `member`, `previous_meta` | A node changed its metadata |
 | `NameConflict` | `member`, `other_addr` | Two nodes claim the same name, a live one or one that recently died or left; the one at `other_addr` is ignored |
 | `EventsLost` | `count` | Your consumer fell behind and `count` events were dropped |
@@ -283,10 +286,27 @@ class ShardedCache:
 | `ring.owner(key, *, new_work=False)` | `Member` | The member that owns `key`, a `str` or `bytes`. Raises `LookupError` if no member matches. |
 | `ring.replicas(key, n, *, new_work=False)` | `list[Member]` | The `n` best members for `key`, owner first: where to put replicas. |
 | `ring.members()` | `tuple[Member, ...]` | The members on the ring now, sorted by name. |
+| `ring.fence(key, *, new_work=False)` | `tuple[str, int]` | `(owner_name, epoch)` of the member that owns `key`, as `owner()` picks it: a fencing token for writes, below. Raises `LookupError` if no member matches. |
 | `ring.changes()` | iterator of `RingChanged` | A new subscription to changes in the ring, built on `events()`. |
-| `ring.moved(keys, before, after)` | `dict` | `{key: (old_owner, new_owner)}` for the keys whose owner differs between two `members()` snapshots; keys that stayed put are left out. |
+| `ring.moved(keys, before, after)` | `dict` | `{key: (old_owner, new_owner)}` for the keys whose owner differs between two `members()` snapshots, a restarted owner included; keys that stayed put are left out. |
 
-Suspect members keep their keys, so a node that only stalls causes no reshuffle; dead and departed members own nothing. To route new work, such as a new session or a write, pass `new_work=True`: a suspect owner is skipped, and the work goes to the member that would take over its keys if it died.
+Suspect members keep their keys, so a node that only stalls causes no reshuffle; dead and departed members own nothing. To route new work, such as a new session or a write, pass `new_work=True`: a suspect owner is skipped, and the work goes to the member that would take over its keys if it died. A member that restarts leaves the ring and joins it again under the same name, and its keys count as moved, since the new run has none of the old one's state.
+
+### Fencing writes
+
+A process can keep writing after the cluster has moved on: it stalled in a long pause, or it is the old run of a node that has already restarted. `ring.fence(key)` gives every write a token that such a writer cannot fake, because a restart raises the epoch:
+
+```python
+token = ring.fence(key, new_work=True)     # ("cache-03", 1790000000000), as writes route
+if token[0] == cluster.local.name:
+    await store.write(key, value, token)   # send the token with the write
+
+# On a member that applies writes, a replica or the owner itself:
+if ring.fence(key, new_work=True) != token:
+    raise StaleOwner(token)                # another owner, or another run of it, in our view
+```
+
+A store outside the cluster keeps the token of the last write it accepted for each key and refuses a write with the same owner name and a lower epoch, in the same conditional write (compare-and-set) as the data, so that two writers cannot both pass the check. The token is only as current as membership: until views converge, after a partition for instance, two nodes can each hold a token that their own view confirms, so kinship fences off stale and restarted writers but is not a lock or consensus. Members on kinship older than 0.3 have epoch 0, which tells their runs apart only by name.
 
 `changes()` yields `RingChanged(added, removed, suspect, recovered, members)` whenever a member on the ring joins or goes, becomes suspect or recovers, including a metadata update that makes a member start or stop matching `where`. `members` is the ring's new snapshot, ready for `moved()`. After `EventsLost` it re-reads the members and always yields, because lost events may have moved keys. On `kinship.Cluster` it is an async iterator; on `kinship.blocking.Cluster`, `for change in ring.changes(timeout=1.0)` blocks and yields `None` on each quiet tick, like `events()`. Events never describe the local node, so a change to this node's own metadata shows up with the next event.
 
@@ -529,7 +549,9 @@ cargo run -p kinship --example kinship-agent -- --bind 127.0.0.1:7947 localhost:
 use kinship_core::{Command, Config, Event, Identity, Instant, Node, StreamEvent, Transmit};
 
 // Both from the OS RNG: the seed for protocol choices, 32 bytes for the nonces' ChaCha20 key.
-let mut node = Node::new(cfg, Identity::new("a", my_addr)?, Instant::ZERO, seed, &nonce_key)?;
+// The epoch is the wall clock's milliseconds at start, so a restart reads as a new life.
+let me = Identity::new("a", my_addr)?.with_epoch(unix_millis);
+let mut node = Node::new(cfg, me, Instant::ZERO, seed, &nonce_key)?;
 let join = node.command(now, Command::Join { seeds: vec![seed_addr] });   // a CommandId
 
 // Feed every input with the current time:
