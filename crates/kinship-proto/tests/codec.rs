@@ -4,7 +4,8 @@ use core::net::SocketAddr;
 
 use kinship_proto::{
     Alive, Codec, DecodeError, EncodeError, FrameReader, Key, KeyError, Limits, Message, NodeId,
-    PacketKind, Payload, Ping, PushPull, Record, Records, State, Suspect, kind,
+    PacketKind, Payload, Ping, PushPull, Record, Records, State, Suspect, UserBroadcast,
+    UserMessage, kind,
 };
 
 const NONCE: [u8; 24] = [7; 24];
@@ -55,6 +56,25 @@ fn alive<'a>(name: &'a str, meta: &'a [u8]) -> Alive<'a> {
     }
 }
 
+fn user_message(data: &[u8]) -> Message<'_> {
+    Message::UserMessage(UserMessage {
+        to: id("b"),
+        to_epoch: 1_790_000_000_000,
+        from: id("a"),
+        from_epoch: 0,
+        data,
+    })
+}
+
+fn user_broadcast(data: &[u8]) -> Message<'_> {
+    Message::UserBroadcast(UserBroadcast {
+        from: id("a"),
+        from_epoch: 1_790_000_000_001,
+        seq: u64::MAX,
+        data,
+    })
+}
+
 fn seal(c: &Codec, kind: PacketKind, msgs: &[Message<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     c.seal(kind, msgs, &NONCE, &mut out).unwrap();
@@ -95,6 +115,8 @@ fn round_trips_in_every_mode() {
             join: true,
             records: Records::Slice(&records),
         }),
+        user_message(b"hello"),
+        user_broadcast(b""),
     ];
     for codec in [plain(b"c"), enc(b"c", &[1])] {
         for kind in [PacketKind::Datagram, PacketKind::Stream] {
@@ -125,7 +147,14 @@ fn overhead_is_48_encrypted_and_12_plain() {
 #[test]
 fn encoded_len_matches_what_is_written() {
     let a = alive("n1", &[0; 100]);
-    for m in [ping(), Message::Alive(a), Message::Nack { seq: u32::MAX }] {
+    let data = [1; 300];
+    for m in [
+        ping(),
+        Message::Alive(a),
+        Message::Nack { seq: u32::MAX },
+        user_message(&data),
+        user_broadcast(&data[..7]),
+    ] {
         let bytes = seal(&plain(b""), PacketKind::Datagram, &[m]);
         assert_eq!(bytes.len(), 12 + 1 + m.encoded_len());
     }
@@ -632,7 +661,7 @@ fn unknown_message_types_are_skipped_in_place() {
     let inner = raw_payload(&[
         (0x00, b"reserved zero"),
         (kind::ACK, &ack),
-        (0x09, b"future"),
+        (0x0b, b"future"),
         (0x7f, b""),
         (0x80, b"user range"),
         (0xff, b"x"),
@@ -719,6 +748,76 @@ fn an_epoch_is_read_when_present_and_zero_when_absent() {
     // its length and the version 1 body. The golden vectors pin those bytes.
     assert_eq!(suspect(0).encoded_len(), 2 + without.len());
     assert_eq!(suspect(1).encoded_len(), 2 + with.len());
+}
+
+#[test]
+fn user_messages_write_every_field_and_carry_any_data() {
+    // A 0.4 type writes its epochs whatever they are, 0 included: no node sent it without them.
+    let body = |data: &[u8]| {
+        let mut b = vec![1, b'b'];
+        b.extend_from_slice(&1_790_000_000_000u64.to_be_bytes());
+        b.extend_from_slice(&[1, b'a']);
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.push(u8::try_from(data.len()).unwrap());
+        b.extend_from_slice(data);
+        b
+    };
+    assert_eq!(user_message(b"hi").encoded_len(), 2 + body(b"hi").len());
+    let inner = raw_payload(&[(kind::USER_MESSAGE, &body(b"hi"))]);
+    assert_eq!(parse_raw(&inner).unwrap(), [user_message(b"hi")]);
+    // The decoder bounds data by the packet only; the core checks its own limits, so a large
+    // message is dropped alone rather than failing the packet that carries it.
+    let big = vec![9; Limits::default().max_meta_bytes + 1];
+    let bytes = seal(
+        &plain(b"c"),
+        PacketKind::Stream,
+        &[user_message(&big), ping()],
+    );
+    assert_eq!(
+        open_all(&plain(b"c"), PacketKind::Stream, &bytes)
+            .unwrap()
+            .len(),
+        2
+    );
+    // Appended fields after the data are skipped, as in every body.
+    let mut longer = body(b"hi");
+    longer.extend_from_slice(b"future");
+    let inner = raw_payload(&[(kind::USER_MESSAGE, &longer)]);
+    assert_eq!(parse_raw(&inner).unwrap(), [user_message(b"hi")]);
+}
+
+#[test]
+fn short_or_bad_user_bodies_are_errors() {
+    let mut whole = vec![1, b'a'];
+    whole.extend_from_slice(&5u64.to_be_bytes());
+    whole.extend_from_slice(&7u64.to_be_bytes());
+    whole.extend_from_slice(&[2, b'h', b'i']);
+    let inner = raw_payload(&[(kind::USER_BROADCAST, &whole)]);
+    assert!(matches!(
+        parse_raw(&inner).unwrap()[..],
+        [Message::UserBroadcast(UserBroadcast {
+            seq: 7,
+            from_epoch: 5,
+            data: b"hi",
+            ..
+        })]
+    ));
+    // Cut inside the seq, inside the epoch, and inside the data.
+    for (cut, err) in [
+        (12, DecodeError::Truncated),
+        (5, DecodeError::Truncated),
+        (whole.len() - 1, DecodeError::BadLength),
+    ] {
+        let inner = raw_payload(&[(kind::USER_BROADCAST, &whole[..cut])]);
+        assert_eq!(parse_raw(&inner).unwrap_err(), err, "cut at {cut}");
+    }
+    // A sender name that is not a node id.
+    let mut bad = vec![0];
+    bad.extend_from_slice(&whole[2..]);
+    let inner = raw_payload(&[(kind::USER_BROADCAST, &bad)]);
+    assert_eq!(parse_raw(&inner).unwrap_err(), DecodeError::BadNodeId);
+    let inner = raw_payload(&[(kind::USER_MESSAGE, &[1, b'b', 0, 0])]);
+    assert_eq!(parse_raw(&inner).unwrap_err(), DecodeError::Truncated);
 }
 
 #[test]

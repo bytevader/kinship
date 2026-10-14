@@ -10,7 +10,7 @@ use core::net::SocketAddr;
 
 use kinship_proto::{
     Alive, Codec, Dead, Key, Limits, Message, NodeId, PacketKind, Ping, PingReq, PushPull, Record,
-    Records, State, Suspect, tags,
+    Records, State, Suspect, UserBroadcast, UserMessage, tags,
 };
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -307,6 +307,45 @@ fn encrypted_packet() {
         .iter()
         .collect();
     assert_eq!(got, msgs, "decoding drifted");
+}
+
+#[test]
+fn user_message() {
+    let m = Message::UserMessage(UserMessage {
+        to: id("b"),
+        to_epoch: 1_790_000_000_000,
+        from: id("a"),
+        from_epoch: 1_790_000_000_001,
+        data: b"hi",
+    });
+    check(
+        &[m],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "0109170162000001a0c4506c000161000001a0c4506c01026869",
+    );
+    check(
+        &[m],
+        PacketKind::Stream,
+        PLAIN_STREAM,
+        "0109170162000001a0c4506c000161000001a0c4506c01026869",
+    );
+}
+
+#[test]
+fn user_broadcast() {
+    let m = Message::UserBroadcast(UserBroadcast {
+        from: id("a"),
+        from_epoch: 1_790_000_000_001,
+        seq: 7,
+        data: b"x",
+    });
+    check(
+        &[m],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "010a140161000001a0c4506c0100000000000000070178",
+    );
 }
 
 #[test]
