@@ -125,6 +125,7 @@ impl Node {
                 inc: e.member.incarnation,
                 node: id(&name),
                 from: id(&me),
+                epoch: e.member.epoch,
             };
             self.on_dead(now, &dead);
         }

@@ -43,6 +43,7 @@ fn alive_a() -> Alive<'static> {
         meta: META,
         vmin: 1,
         vmax: 1,
+        epoch: 0,
     }
 }
 
@@ -130,6 +131,7 @@ fn suspect_dead_and_left() {
             inc: 4,
             node: id("x"),
             from: id("y"),
+            epoch: 0,
         })],
         PacketKind::Datagram,
         PLAIN_DGRAM,
@@ -139,6 +141,7 @@ fn suspect_dead_and_left() {
         inc: 5,
         node: id("x"),
         from: id("x"),
+        epoch: 0,
     };
     assert!(left.is_left());
     check(
@@ -151,9 +154,65 @@ fn suspect_dead_and_left() {
         !Dead {
             inc: 5,
             node: id("x"),
-            from: id("y")
+            from: id("y"),
+            epoch: 0,
         }
         .is_left()
+    );
+}
+
+/// 1,790,000,000,000 ms after the Unix epoch, in September 2026.
+const EPOCH: u64 = 0x0000_01a0_c450_6c00;
+
+#[test]
+fn epochs_are_appended_to_alive_suspect_dead_and_records() {
+    // Appended in 0.3 as a u64 after the version 1 fields; the vectors above, with epoch 0,
+    // are the bytes those versions sent, and still decode.
+    let alive = Alive {
+        epoch: EPOCH,
+        ..alive_a()
+    };
+    check(
+        &[Message::Alive(alive)],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "01052600000003066e6f64652d61040a0000011f0a0904726f6c65036170690101000001a0c4506c00",
+    );
+    check(
+        &[Message::Suspect(Suspect {
+            inc: 4,
+            node: id("x"),
+            from: id("y"),
+            epoch: EPOCH,
+        })],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "0106100000000401780179000001a0c4506c00",
+    );
+    check(
+        &[Message::Dead(Dead {
+            inc: 5,
+            node: id("x"),
+            from: id("x"),
+            epoch: EPOCH,
+        })],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "0107100000000501780178000001a0c4506c00",
+    );
+    let recs = [Record {
+        state: State::Alive,
+        alive,
+    }];
+    check(
+        &[Message::PushPull(PushPull {
+            join: true,
+            records: Records::Slice(&recs),
+        })],
+        PacketKind::Stream,
+        PLAIN_STREAM,
+        "01082a0101270000000003066e6f64652d61040a0000011f0a0904726f6c65036170690101\
+         000001a0c4506c00",
     );
 }
 
@@ -173,6 +232,7 @@ fn push_pull() {
                 meta: b"",
                 vmin: 1,
                 vmax: 2,
+                epoch: 0,
             },
         },
     ];

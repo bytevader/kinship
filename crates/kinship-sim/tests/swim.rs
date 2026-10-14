@@ -515,8 +515,11 @@ fn same_seed_gives_identical_swim_traces() {
 fn swim_trace_is_pinned_across_platforms() {
     // CI runs this on Linux, macOS and Windows, so a SWIM seed that fails anywhere replays
     // everywhere, encrypted bytes included. Update the value only when the protocol, the codec
-    // or the simulator changes on purpose. It last changed when nonces got a ChaCha20 key of
-    // their own (KS-06): every packet's bytes changed, and every other record stayed the same.
+    // or the simulator changes on purpose. It last changed when members got epochs (0.3):
+    // every Alive, Suspect and Dead carries its member's epoch, 8 bytes, so the 416 of 1,345
+    // datagrams that hold one and every stream frame grew, and events name the epoch; every
+    // other record, timing included, stayed the same. Before that it changed when nonces got
+    // a ChaCha20 key of their own (KS-06), which changed every packet's bytes and nothing else.
     let plan = Plan::random(1, 10);
     let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
     let log: Log = Rc::default();
@@ -525,7 +528,7 @@ fn swim_trace_is_pinned_across_platforms() {
     });
     assert_eq!(
         sim.run().digest(),
-        0x7484_64a6_d060_79fc,
+        0x3dfb_cb2f_34fe_aa03,
         "trace digest changed"
     );
 }

@@ -198,6 +198,7 @@ mod tests {
                 meta: Vec::new(),
                 state,
                 incarnation: 0,
+                epoch: 0,
             },
             since: Instant::ZERO,
             vmin: 1,

@@ -73,6 +73,7 @@ fn ki01_a_member_declares_any_node_dead_at_once() {
         inc: 0,
         node: id("b"),
         from: id("m"),
+        epoch: 0,
     });
     o.handle_datagram(Instant::ZERO, addr(3), &sealed(&[forged], 1));
     let events: Vec<Event> = std::iter::from_fn(|| o.poll_event()).collect();
@@ -110,6 +111,7 @@ fn ki02_a_rumour_at_incarnation_max_is_refuted() {
             inc,
             node: id("v"),
             from: id("m"),
+            epoch: 0,
         });
         let pkt = sealed(&[forged], tail);
         o.handle_datagram(at, addr(3), &pkt);
@@ -143,6 +145,7 @@ fn ki02_a_rumour_at_incarnation_max_is_refuted() {
         inc: 0,
         node: id("v"),
         from: id("w"),
+        epoch: 0,
     });
     let mut nonce = [4; 24];
     nonce[..8].copy_from_slice(&0u64.to_be_bytes());
@@ -171,6 +174,7 @@ fn ki03_a_member_cannot_move_a_dead_node_to_another_address() {
         inc: 0,
         node: id("b"),
         from: id("o2"),
+        epoch: 0,
     });
     let evil = SocketAddr::from(([192, 0, 2, 66], 7946));
     let alive = |inc, addr| {
@@ -181,6 +185,7 @@ fn ki03_a_member_cannot_move_a_dead_node_to_another_address() {
             meta: b"",
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         })
     };
     o.handle_datagram(Instant::ZERO, addr(3), &sealed(&[dead, alive(1, evil)], 1));
@@ -268,6 +273,7 @@ fn push_pull_of(n: usize) -> Vec<u8> {
                 meta: b"",
                 vmin: 1,
                 vmax: 1,
+                epoch: 0,
             },
         })
         .collect();
@@ -308,6 +314,7 @@ fn ks04_plaintext_sends_nothing_to_an_address_that_is_not_a_member() {
             meta: b"zone=eu-west-1;role=cache-node",
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         });
         o.handle_datagram(Instant::ZERO, addr(200), &seal(&[alive]));
     }

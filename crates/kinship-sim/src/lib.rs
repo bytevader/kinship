@@ -38,7 +38,7 @@ use serde::Serialize;
 
 pub use echo::{EchoCommand, EchoConfig, EchoEvent, EchoNode};
 pub use scenario::{Action, Delay, LinkConfig, NodeSet, Scenario};
-pub use sim::{NodeSpec, Sim, Stats, addr_of, name_of};
+pub use sim::{NodeSpec, Sim, Stats, WALL_CLOCK_AT_ZERO_MS, addr_of, name_of};
 pub use trace::{DropReason, Record, Trace, TraceConfig, TraceNode};
 
 /// A sans-IO node the simulator can drive: the same five inputs and three outputs as

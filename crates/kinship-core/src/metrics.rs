@@ -32,6 +32,9 @@ pub struct Metrics {
     /// Alive messages ignored because a member already holds the name at another address: a
     /// live one, or a Dead or Left one whose tombstone is still kept.
     pub name_conflicts: u64,
+    /// Members that came back in a later life, which replaced the one this node held: each is
+    /// a restart, reported as MemberLeft for the old life, if it was live, and MemberJoined.
+    pub restarts: u64,
     /// Alive messages and push-pull records about members new to this node that were not
     /// admitted, because the table held `max_members` or their packet had already added
     /// `max_new_members_per_packet`.

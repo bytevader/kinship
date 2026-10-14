@@ -71,7 +71,20 @@ impl Observed {
         log: Log,
         knows: impl Fn(usize) -> bool,
     ) -> Self {
-        let me = Identity::new(name, spec.addr).unwrap();
+        Self::with_epoch(spec, name, spec.epoch(), cfg, log, knows)
+    }
+
+    /// Like [`Observed::with_name`], but starting at `epoch` rather than at the spec's wall
+    /// clock; with 0 it sends no epoch, as nodes older than 0.3.
+    pub fn with_epoch(
+        spec: &NodeSpec,
+        name: &str,
+        epoch: u64,
+        cfg: Config,
+        log: Log,
+        knows: impl Fn(usize) -> bool,
+    ) -> Self {
+        let me = Identity::new(name, spec.addr).unwrap().with_epoch(epoch);
         let mut node = Node::new(cfg, me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
         for j in (0..spec.nodes).filter(|&j| j != spec.index && knows(j)) {
             node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();

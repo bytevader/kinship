@@ -18,6 +18,10 @@ pub(crate) trait Sink {
         self.put(&v.to_be_bytes());
     }
 
+    fn put_u64(&mut self, v: u64) {
+        self.put(&v.to_be_bytes());
+    }
+
     fn put_varint(&mut self, mut v: u32) {
         while v >= 0x80 {
             self.put_u8((v & 0x7f) as u8 | 0x80);
@@ -102,6 +106,10 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_be_bytes(self.array()?))
     }
 
     /// Reads a minimal LEB128 varint that fits a `u32`.

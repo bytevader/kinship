@@ -232,7 +232,7 @@ impl Config {
 }
 
 /// Encoded size of the largest Ping and the largest Alive a node can hold: 64-byte names, an
-/// IPv6 address and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
+/// IPv6 address, an epoch and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
 fn largest_probe_and_alive(max_meta: usize, cap: usize) -> usize {
     let name = "n".repeat(NodeId::MAX_LEN);
     let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
@@ -251,6 +251,7 @@ fn largest_probe_and_alive(max_meta: usize, cap: usize) -> usize {
         meta: &meta,
         vmin: u8::MAX,
         vmax: u8::MAX,
+        epoch: u64::MAX,
     });
     ping.encoded_len() + alive.encoded_len()
 }
@@ -344,30 +345,30 @@ mod tests {
     #[test]
     fn the_largest_alive_must_fit_a_datagram_beside_a_ping() {
         let key = Security::Keys(vec![Key::from_bytes([1; 32])]);
-        // An Alive with 512 bytes of metadata, a 64-byte name and an IPv6 address is 607
-        // bytes, the largest Ping 156; a sealed datagram adds 48 and the count reserve 2.
+        // An Alive with 512 bytes of metadata, a 64-byte name, an IPv6 address and an epoch is
+        // 615 bytes, the largest Ping 156; a sealed datagram adds 48 and the count reserve 2.
         let mut cfg = Config::lan(key.clone());
-        cfg.limits.udp_max_payload = 813;
+        cfg.limits.udp_max_payload = 821;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.udp_max_payload = 812;
+        cfg.limits.udp_max_payload = 820;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
         cfg.limits.udp_max_payload = 576;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
 
         // With the default datagram, metadata is the limit to blame.
         let mut cfg = Config::lan(key);
-        cfg.limits.max_meta_bytes = 1_099;
+        cfg.limits.max_meta_bytes = 1_091;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.max_meta_bytes = 1_100;
+        cfg.limits.max_meta_bytes = 1_092;
         assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
         cfg.limits.max_meta_bytes = usize::MAX;
         assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
 
         // Plaintext packets carry 12 bytes of header instead of 48.
         let mut cfg = Config::lan(Security::InsecurePlaintext);
-        cfg.limits.udp_max_payload = 777;
+        cfg.limits.udp_max_payload = 785;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.udp_max_payload = 776;
+        cfg.limits.udp_max_payload = 784;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
     }
 }

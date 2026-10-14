@@ -50,7 +50,18 @@ impl NodeSpec {
         Rng::new(self.seed ^ 0x6e6f_6e63_6573).fill(&mut key);
         key
     }
+
+    /// The epoch this instance starts with, as a driver picks one: the milliseconds of a wall
+    /// clock that reads [`WALL_CLOCK_AT_ZERO_MS`] when the shared clock is at zero, so that
+    /// an instance that restarts later starts a later life.
+    pub fn epoch(&self) -> u64 {
+        WALL_CLOCK_AT_ZERO_MS + self.now.as_nanos() / 1_000_000
+    }
 }
+
+/// What the wall clock the simulator lends its nodes reads when the run starts, in
+/// milliseconds since the Unix epoch: September 2026, about when nodes began to send epochs.
+pub const WALL_CLOCK_AT_ZERO_MS: u64 = 1_790_000_000_000;
 
 /// Counters for a run, kept whatever the trace records.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]

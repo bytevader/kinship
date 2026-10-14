@@ -421,6 +421,8 @@ fn kp03(seed: u64) -> Result<(), String> {
         meta: &meta,
         vmin: 1,
         vmax: 1,
+        // The epoch the member started with, as every simulated node sends one.
+        epoch: kinship_sim::WALL_CLOCK_AT_ZERO_MS,
     });
     let codec = Codec::encrypted(
         cfg.cluster.as_bytes(),

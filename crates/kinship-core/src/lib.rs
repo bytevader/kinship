@@ -59,12 +59,14 @@ pub use metrics::Metrics;
 pub use rng::Rng;
 pub use time::Instant;
 
-/// Who this node is: its name, the address peers reach it on, and its metadata.
+/// Who this node is: its name, the address peers reach it on, its metadata, and which life of
+/// that name it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     name: String,
     addr: SocketAddr,
     meta: Vec<u8>,
+    epoch: u64,
 }
 
 impl Identity {
@@ -82,12 +84,24 @@ impl Identity {
             name,
             addr,
             meta: Vec::new(),
+            epoch: 0,
         })
     }
 
     /// Initial metadata; checked against `max_meta_bytes` by [`Node::new`].
     pub fn with_meta(mut self, meta: impl Into<Vec<u8>>) -> Self {
         self.meta = meta.into();
+        self
+    }
+
+    /// The epoch this life of the node starts with: drivers pass the milliseconds of the wall
+    /// clock when the process started, so that a node that restarts with the same name comes
+    /// back with a higher one and replaces its old life everywhere, whatever its incarnation.
+    /// The core reads no clock, so it is the driver's to pick; if the cluster turns out to
+    /// hold this name at a later epoch, from a clock that ran ahead, the node moves past it
+    /// (see [`Member::epoch`]). 0, the default, sends none, as nodes older than 0.3 did.
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.epoch = epoch;
         self
     }
 
@@ -101,6 +115,11 @@ impl Identity {
 
     pub fn meta(&self) -> &[u8] {
         &self.meta
+    }
+
+    /// The epoch the node started with; [`Node::local`] has the one it holds now.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -190,6 +209,7 @@ impl Node {
                 meta: me.meta.clone(),
                 state: State::Alive,
                 incarnation: 0,
+                epoch: me.epoch,
             },
             since: now,
             vmin: 1,
@@ -225,9 +245,9 @@ impl Node {
     }
 
     /// Learns a member as Alive at incarnation 0 without contacting it, as a static member
-    /// list would. Its metadata stays empty until it gossips a newer Alive. Does nothing if the
-    /// name is this node's or already known, and refuses a new one, naming `max_members`, when
-    /// the table already holds that many.
+    /// list would. Its metadata stays empty, and its epoch unknown, until it gossips a newer
+    /// Alive. Does nothing if the name is this node's or already known, and refuses a new one,
+    /// naming `max_members`, when the table already holds that many.
     ///
     /// A node given its members this way counts as joined: it has no seed's reply to wait for,
     /// so a later cluster time it hears is a member running ahead, and its replay floor
@@ -262,6 +282,7 @@ impl Node {
             meta: Vec::new(),
             state: State::Alive,
             incarnation: 0,
+            epoch: 0,
         };
         self.events.push_back(Event::MemberJoined(member.clone()));
         self.table.insert(Entry {
@@ -602,6 +623,7 @@ impl std::fmt::Debug for Node {
             .field("addr", &self.me.addr)
             .field("now", &self.now)
             .field("incarnation", &self.local.member.incarnation)
+            .field("epoch", &self.local.member.epoch)
             .field("members", &self.table.len())
             .finish_non_exhaustive()
     }
@@ -873,6 +895,7 @@ mod tests {
             meta: b"",
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         })
     }
 
@@ -881,6 +904,7 @@ mod tests {
             inc,
             node: id(node),
             from: id(from),
+            epoch: 0,
         })
     }
 
@@ -889,6 +913,7 @@ mod tests {
             inc,
             node: id(node),
             from: id(from),
+            epoch: 0,
         })
     }
 
@@ -1216,6 +1241,7 @@ mod tests {
             meta: b"zone=x",
             vmin: 1,
             vmax: 1,
+            epoch: 0,
         });
         deliver(&mut n, t, &[a]);
         let ev = events(&mut n);
@@ -1223,6 +1249,154 @@ mod tests {
             matches!(&ev[..], [Event::MemberUpdated { member, previous_meta }]
             if member.meta == b"zone=x" && previous_meta.is_empty())
         );
+    }
+
+    /// `msg`, an Alive, Suspect or Dead, about the life of the member at `epoch`.
+    fn at(epoch: u64, msg: Message<'_>) -> Message<'_> {
+        match msg {
+            Message::Alive(a) => Message::Alive(kinship_proto::Alive { epoch, ..a }),
+            Message::Suspect(s) => Message::Suspect(kinship_proto::Suspect { epoch, ..s }),
+            Message::Dead(d) => Message::Dead(kinship_proto::Dead { epoch, ..d }),
+            other => other,
+        }
+    }
+
+    /// How `n` holds `name`: its state, epoch and incarnation.
+    fn life_of(n: &Node, name: &str) -> (State, u64, u32) {
+        let m = n.member(name).unwrap();
+        (m.state, m.epoch, m.incarnation)
+    }
+
+    #[test]
+    fn a_later_life_replaces_the_member_whatever_its_incarnation() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        deliver(&mut n, t, &[at(100, alive("b", 7, 2))]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        // b restarted: its new life counts its incarnations from 0 again.
+        deliver(&mut n, t, &[at(200, alive("b", 0, 2))]);
+        let ev = events(&mut n);
+        assert!(
+            matches!(&ev[..], [Event::MemberLeft(old), Event::MemberJoined(new)]
+                if (old.state, old.epoch, old.incarnation) == (State::Left, 100, 7)
+                && (new.state, new.epoch, new.incarnation) == (State::Alive, 200, 0)),
+            "{ev:?}"
+        );
+        assert_eq!(n.metrics().restarts, 1);
+        // The old life's rumours change nothing, however high their incarnation.
+        let stale = [
+            at(100, suspect("b", 9, "c")),
+            at(100, dead("b", 9, "c")),
+            at(100, alive("b", 9, 2)),
+        ];
+        deliver(&mut n, t, &stale);
+        assert_eq!(kinds(&mut n), Vec::<&str>::new());
+        assert_eq!(life_of(&n, "b"), (State::Alive, 200, 0));
+        // The new life's own follow the incarnation rules.
+        deliver(&mut n, t, &[at(200, suspect("b", 0, "c"))]);
+        assert_eq!(kinds(&mut n), ["suspect"]);
+        // A rumour about a life this node has not heard of yet waits for that life's Alive.
+        deliver(&mut n, t, &[at(300, dead("b", 0, "c"))]);
+        assert_eq!(life_of(&n, "b"), (State::Suspect, 200, 0));
+        // A later life at another address is a second node taking the name (KI-03).
+        deliver(&mut n, t, &[at(300, alive("b", 0, 9))]);
+        assert_eq!(kinds(&mut n), ["conflict"]);
+        assert_eq!(n.member("b").unwrap().addr, addr(2));
+    }
+
+    #[test]
+    fn a_stale_epoch_never_brings_a_dead_member_back() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        deliver(&mut n, t, &[at(100, alive("b", 7, 2))]);
+        deliver(&mut n, t, &[at(200, alive("b", 0, 2))]);
+        deliver(&mut n, t, &[at(200, dead("b", 0, "c"))]);
+        assert_eq!(kinds(&mut n), ["joined", "left", "joined", "dead"]);
+        // The old life's Alive, far above in incarnation and from b's own address: under
+        // incarnations alone it would win over the tombstone.
+        deliver(&mut n, t, &[at(100, alive("b", 1_000, 2))]);
+        assert_eq!(kinds(&mut n), Vec::<&str>::new());
+        assert_eq!(life_of(&n, "b"), (State::Dead, 200, 0));
+        // The dead life's own refutation brings it back.
+        deliver(&mut n, t, &[at(200, alive("b", 1, 2))]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        // A later life replaces a tombstone too; the old life was already reported gone.
+        deliver(&mut n, t, &[at(200, dead("b", 1, "b"))]);
+        deliver(&mut n, t, &[at(300, alive("b", 0, 2))]);
+        assert_eq!(kinds(&mut n), ["left", "joined"]);
+        assert_eq!(life_of(&n, "b"), (State::Alive, 300, 0));
+        assert_eq!(n.metrics().restarts, 2);
+    }
+
+    #[test]
+    fn an_epoch_nobody_sent_defers_to_incarnations() {
+        let mut n = node(Security::InsecurePlaintext);
+        let t = Instant::ZERO;
+        // b as a node older than 0.3 sends it, or as such a node passes on b's Alive.
+        deliver(&mut n, t, &[alive("b", 3, 2)]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        assert_eq!(life_of(&n, "b"), (State::Alive, 0, 3));
+        // The same Alive with its epoch teaches it, and changes nothing else.
+        deliver(&mut n, t, &[at(100, alive("b", 3, 2))]);
+        assert_eq!(kinds(&mut n), Vec::<&str>::new());
+        assert_eq!(life_of(&n, "b"), (State::Alive, 100, 3));
+        // Rumours without an epoch apply to the life held, by incarnation alone.
+        deliver(&mut n, t, &[dead("b", 3, "c")]);
+        assert_eq!(kinds(&mut n), ["dead"]);
+        deliver(&mut n, t, &[alive("b", 4, 2)]);
+        assert_eq!(kinds(&mut n), ["joined"]);
+        assert_eq!(life_of(&n, "b"), (State::Alive, 100, 4));
+    }
+
+    #[test]
+    fn a_node_moves_past_a_later_life_of_its_own_name() {
+        let me = Identity::new("a", addr(1)).unwrap().with_epoch(100);
+        let cfg = Config::local(Security::InsecurePlaintext);
+        let mut n = Node::new(cfg, me, Instant::ZERO, 7, &[7; 32]).unwrap();
+        let t = Instant::ZERO;
+        let local = |n: &Node| (n.local().epoch, n.local().incarnation, n.local_health());
+        // An earlier instance of this node, whose wall clock ran ahead, is remembered at 150:
+        // this one moves past that life, and past its incarnation for nodes older than 0.3.
+        deliver(&mut n, t, &[at(150, alive("a", 4, 1))]);
+        assert_eq!(local(&n), (151, 5, 0));
+        assert_eq!(n.identity().epoch(), 100, "the epoch it started with");
+        let pkts = sent_after(&mut n, "b");
+        assert!(contains(
+            &pkts,
+            addr(2),
+            r#"Alive(Alive { inc: 5, node: "a""#
+        ));
+        assert!(contains(&pkts, addr(2), "epoch: 151 })"), "{pkts:?}");
+        // Rumours about its earlier lives only queue its Alive again, as stale ones do.
+        n.out.broadcasts.forget("a");
+        deliver(
+            &mut n,
+            t,
+            &[at(150, suspect("a", 9, "c")), at(100, dead("a", 9, "c"))],
+        );
+        assert!(n.out.broadcasts.contains("a"));
+        assert_eq!(local(&n), (151, 5, 0));
+        assert_eq!(n.metrics().refutations, 1);
+        // One about its current life is refuted as ever.
+        deliver(&mut n, t, &[at(151, suspect("a", 5, "c"))]);
+        assert_eq!(local(&n), (151, 6, 1));
+        // A Suspect or Dead about a later life moves it on too.
+        deliver(&mut n, t, &[at(500, dead("a", 0, "c"))]);
+        assert_eq!(local(&n), (501, 6, 1));
+        // A later life at another address is a second node with this name, not this one.
+        deliver(&mut n, t, &[at(900, alive("a", 0, 9))]);
+        assert_eq!(kinds(&mut n), ["conflict"]);
+        assert_eq!(local(&n), (501, 6, 1));
+        assert_eq!(n.metrics().refutations, 3);
+    }
+
+    /// Learns `name` at port 2 and returns what `n` then sends at its next gossip tick.
+    fn sent_after(n: &mut Node, name: &str) -> Vec<(SocketAddr, Vec<u8>)> {
+        n.add_member(n.now, name, addr(2)).unwrap();
+        events(n);
+        sent(n);
+        n.gossip(n.now);
+        sent(n)
     }
 
     /// Runs `n`'s timers until `until`, returning what it sent.
@@ -1476,7 +1650,7 @@ mod tests {
                 .map(|(_, p)| String::from_utf8_lossy(p).into_owned())
                 .find(|p| p.contains("Ping("))
                 .unwrap();
-            let own = r#"Suspect(Suspect { inc: 0, node: "b", from: "a" })"#;
+            let own = r#"Suspect(Suspect { inc: 0, node: "b", from: "a", epoch: 0 })"#;
             if buddy {
                 let first = ping.find(own).expect(&ping);
                 assert!(first < ping.find("Ping(").unwrap(), "{ping}");

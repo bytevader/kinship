@@ -51,6 +51,7 @@ fn alive<'a>(name: &'a str, meta: &'a [u8]) -> Alive<'a> {
         meta,
         vmin: 1,
         vmax: 1,
+        epoch: 0,
     }
 }
 
@@ -88,6 +89,7 @@ fn round_trips_in_every_mode() {
             inc: 4,
             node: id("x"),
             from: id("y"),
+            epoch: 0,
         }),
         Message::PushPull(PushPull {
             join: true,
@@ -663,7 +665,8 @@ fn appended_fields_in_push_pull_records_are_ignored() {
     rec.extend_from_slice(&[4, 1, 2, 3, 4, 0x1e, 0xea]); // addr 1.2.3.4:7914
     rec.extend_from_slice(&[0]); // meta
     rec.extend_from_slice(&[1, 1]); // vmin vmax
-    rec.extend_from_slice(b"future"); // appended
+    rec.extend_from_slice(&42u64.to_be_bytes()); // epoch, appended in 0.3
+    rec.extend_from_slice(b"future"); // appended after it
     let mut body = vec![1u8, 1]; // join, count
     body.push(rec.len() as u8);
     body.extend_from_slice(&rec);
@@ -677,6 +680,48 @@ fn appended_fields_in_push_pull_records_are_ignored() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].alive.node.as_str(), "n");
     assert_eq!(recs[0].alive.addr, addr("1.2.3.4:7914"));
+    assert_eq!(recs[0].alive.epoch, 42);
+}
+
+#[test]
+fn an_epoch_is_read_when_present_and_zero_when_absent() {
+    // A Suspect as 0.2 sent it, then with an epoch, then with one cut short.
+    let mut body = 3u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&[1, b'n', 1, b'm']);
+    let without = body.clone();
+    let mut with = body.clone();
+    with.extend_from_slice(&1_790_000_000_000u64.to_be_bytes());
+    let mut cut = with.clone();
+    cut.truncate(with.len() - 1);
+    let suspect = |epoch| {
+        Message::Suspect(Suspect {
+            inc: 3,
+            node: id("n"),
+            from: id("m"),
+            epoch,
+        })
+    };
+    let parse = |body: &[u8]| {
+        let inner = raw_payload(&[(kind::SUSPECT, body)]);
+        parse_raw(&inner).map(|m| m == [suspect(0)] || m == [suspect(1_790_000_000_000)])
+    };
+    let (without_inner, with_inner) = (
+        raw_payload(&[(kind::SUSPECT, &without)]),
+        raw_payload(&[(kind::SUSPECT, &with)]),
+    );
+    assert_eq!(parse_raw(&without_inner).unwrap(), [suspect(0)]);
+    assert_eq!(
+        parse_raw(&with_inner).unwrap(),
+        [suspect(1_790_000_000_000)]
+    );
+    assert_eq!(parse(&cut).unwrap_err(), DecodeError::Truncated);
+    // Epoch 0 is not sent, so a node without one sends the bytes 0.2 did.
+    let mut sealed = Vec::new();
+    let codec = Codec::insecure_plaintext(b"", Limits::default()).unwrap();
+    codec
+        .seal(PacketKind::Datagram, &[suspect(0)], &[0; 24], &mut sealed)
+        .unwrap();
+    assert!(sealed.ends_with(&without));
 }
 
 #[test]
