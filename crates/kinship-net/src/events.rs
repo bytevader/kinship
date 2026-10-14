@@ -36,13 +36,20 @@ pub enum Event {
         member: Member,
         other_addr: SocketAddr,
     },
+    /// Data from `sender`, as this node holds it: a direct message to this node, or one sent to
+    /// every member if `broadcast`. Never one this node sent itself.
+    UserMessage {
+        sender: Member,
+        data: Vec<u8>,
+        broadcast: bool,
+    },
     /// This subscriber fell behind and this many events were dropped, oldest first. Resync from
     /// `members()`.
     EventsLost(u64),
 }
 
 impl Event {
-    /// The member event a core event reports, if it is one.
+    /// The member event or user message a core event reports, if it is one.
     pub(crate) fn from_core(e: kinship_core::Event) -> Option<Self> {
         use kinship_core::Event as E;
         Some(match e {
@@ -59,6 +66,15 @@ impl Event {
                 previous_meta,
             },
             E::NameConflict { member, other_addr } => Self::NameConflict { member, other_addr },
+            E::UserMessage {
+                sender,
+                data,
+                broadcast,
+            } => Self::UserMessage {
+                sender,
+                data,
+                broadcast,
+            },
             _ => return None,
         })
     }

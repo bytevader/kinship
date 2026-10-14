@@ -18,6 +18,7 @@
 //! while let Some(event) = events.recv().await {
 //!     match event {
 //!         Event::MemberDead(m) | Event::MemberLeft(m) => println!("{} is gone", m.name),
+//!         Event::UserMessage { sender, data, .. } => println!("{}: {data:?}", sender.name),
 //!         Event::EventsLost(_) => println!("resync: {} members", cluster.members().len()),
 //!         _ => {}
 //!     }
@@ -129,6 +130,41 @@ impl Cluster {
     /// Replaces this node's metadata and gossips it to the cluster.
     pub async fn set_meta(&self, meta: impl Into<Vec<u8>>) -> Result<(), Error> {
         self.inner.set_meta(meta).await
+    }
+
+    /// Sends `data` to this run of `member`, and returns once it is on its way: one datagram
+    /// when it fits, a TCP connection otherwise, up to `max_user_message` bytes. Best effort,
+    /// never acknowledged; the member hears it as [`Event::UserMessage`].
+    ///
+    /// Fails with [`Error::NotAMember`] unless this node holds `member.name` as a live member
+    /// at `member.epoch`, so a message meant for a run that has since restarted is refused, and
+    /// with [`Error::MessageTooLarge`] over the limit.
+    ///
+    /// ```no_run
+    /// # async fn run(cluster: kinship::Cluster) -> Result<(), kinship::Error> {
+    /// if let Some(peer) = cluster.member("cache-2") {
+    ///     cluster.send(&peer, b"drop user:42".to_vec()).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send(&self, member: &Member, data: impl Into<Vec<u8>>) -> Result<(), Error> {
+        self.inner
+            .send(member.name.as_str(), member.epoch, data)
+            .await
+    }
+
+    /// [`send`](Self::send) to whichever run of the member `name` this node holds.
+    pub async fn send_to(&self, name: &str, data: impl Into<Vec<u8>>) -> Result<(), Error> {
+        self.inner.send(name, 0, data).await
+    }
+
+    /// Gossips `data`, up to `max_user_broadcast` bytes, to every member, and returns once it is
+    /// queued. Every other node hears it once as [`Event::UserMessage`] with `broadcast` set.
+    /// Best effort: membership gossip goes first, and a full queue drops the broadcast nearest
+    /// to done, counted in [`Stats`].
+    pub async fn broadcast(&self, data: impl Into<Vec<u8>>) -> Result<(), Error> {
+        self.inner.broadcast(data).await
     }
 
     /// Protocol counters and the local health score.

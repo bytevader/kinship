@@ -186,6 +186,12 @@ pub enum Error {
     Unresolved,
     /// Metadata is larger than `max_meta_bytes`.
     MetaTooLarge,
+    /// A user message is larger than `max_user_message`, or a broadcast than
+    /// `max_user_broadcast`.
+    MessageTooLarge,
+    /// A user message for a name this node does not hold as a live member at that epoch: one
+    /// it does not know, one that died or left, a run that has since restarted, or itself.
+    NotAMember,
     /// This node has left the cluster.
     Left,
     /// `leave()` ran out of time before the news finished spreading. The node has left anyway.
@@ -210,6 +216,10 @@ impl fmt::Display for Error {
             Self::JoinFailed => f.write_str("no seed answered"),
             Self::Unresolved => f.write_str("no seed resolved to an address"),
             Self::MetaTooLarge => f.write_str("metadata larger than max_meta_bytes"),
+            Self::MessageTooLarge => {
+                f.write_str("message larger than max_user_message or max_user_broadcast")
+            }
+            Self::NotAMember => f.write_str("not a live member at that epoch"),
             Self::Left => f.write_str("this node has left the cluster"),
             Self::Timeout => f.write_str("timed out"),
             Self::Closed => f.write_str("the node is closed"),
@@ -253,6 +263,8 @@ impl From<CommandError> for Error {
             CommandError::KeyNotInstalled => Self::KeyNotInstalled,
             CommandError::KeyInUse => Self::KeyInUse,
             CommandError::LastKey => Self::LastKey,
+            CommandError::MessageTooLarge => Self::MessageTooLarge,
+            CommandError::NotAMember => Self::NotAMember,
             _ => Self::Closed,
         }
     }
@@ -465,6 +477,45 @@ impl Memberlist {
     pub async fn set_meta(&self, meta: impl Into<Vec<u8>>) -> Result<(), Error> {
         let meta = meta.into();
         let rx = self.call(|reply| Request::SetMeta { meta, reply }).await?;
+        rx.await.unwrap_or(Err(Error::Closed))
+    }
+
+    /// Sends `data` to the member `name` at its life `epoch`, or whichever life this node holds
+    /// with epoch 0, and returns once it is handed to the network or queued for a connection.
+    ///
+    /// Best effort: one datagram when it fits, else a TCP connection, never acknowledged or
+    /// retried. Fails with [`Error::MessageTooLarge`] over `max_user_message` and with
+    /// [`Error::NotAMember`] unless this node holds that life of `name` as a live member.
+    /// The receiver hears it as [`Event::UserMessage`].
+    pub async fn send(
+        &self,
+        name: impl Into<String>,
+        epoch: u64,
+        data: impl Into<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let (to, data) = (name.into(), data.into());
+        let rx = self
+            .call(|reply| Request::Send {
+                to,
+                epoch,
+                data,
+                reply,
+            })
+            .await?;
+        rx.await.unwrap_or(Err(Error::Closed))
+    }
+
+    /// Queues `data` to be gossiped to every member, and returns once it is queued.
+    ///
+    /// Best effort, and at most once on each node, which hears it as [`Event::UserMessage`]
+    /// with `broadcast` set; never this node. Fails with [`Error::MessageTooLarge`] over
+    /// `max_user_broadcast`. A full queue drops the broadcast nearest to done and counts it
+    /// in [`Stats`].
+    pub async fn broadcast(&self, data: impl Into<Vec<u8>>) -> Result<(), Error> {
+        let data = data.into();
+        let rx = self
+            .call(|reply| Request::Broadcast { data, reply })
+            .await?;
         rx.await.unwrap_or(Err(Error::Closed))
     }
 

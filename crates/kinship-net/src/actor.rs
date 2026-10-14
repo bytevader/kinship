@@ -58,6 +58,16 @@ pub(crate) enum Request {
         meta: Vec<u8>,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Send {
+        to: String,
+        epoch: u64,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    Broadcast {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Keyring {
         change: KeyChange,
         reply: oneshot::Sender<Result<(), Error>>,
@@ -511,6 +521,13 @@ impl<T: Transport> Actor<T> {
             Request::Join { seeds, reply } => (Command::Join { seeds }, Pending::Join(reply)),
             Request::Leave { reply } => (Command::Leave, Pending::Done(reply)),
             Request::SetMeta { meta, reply } => (Command::SetMeta(meta), Pending::Done(reply)),
+            Request::Send {
+                to,
+                epoch,
+                data,
+                reply,
+            } => (Command::Send { to, epoch, data }, Pending::Done(reply)),
+            Request::Broadcast { data, reply } => (Command::Broadcast(data), Pending::Done(reply)),
             Request::Keyring { change, reply } => {
                 let (cmd, did, key) = change.command();
                 (cmd, Pending::Keyring { reply, did, key })

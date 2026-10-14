@@ -84,6 +84,16 @@ impl KError {
                 "MetaTooLarge",
                 ("encoded metadata is larger than max_meta_bytes",),
             ),
+            Self::Net(E::MessageTooLarge) => raise(
+                py,
+                "MessageTooLarge",
+                ("message larger than max_user_message, or broadcast than max_user_broadcast",),
+            ),
+            Self::Net(E::NotAMember) => raise(
+                py,
+                "NotAMember",
+                ("not a live member at that epoch: unknown, dead, left, restarted or this node",),
+            ),
             Self::Net(E::Left) => raise(py, "KinshipClosed", ("this node has left the cluster",)),
             Self::Net(e @ (E::NotEncrypted | E::KeyNotInstalled | E::KeyInUse | E::LastKey)) => {
                 raise(py, "KeyringError", (e.to_string(),))
