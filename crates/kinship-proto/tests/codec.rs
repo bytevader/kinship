@@ -719,7 +719,7 @@ fn an_epoch_is_read_when_present_and_zero_when_absent() {
     let mut sealed = Vec::new();
     let codec = Codec::insecure_plaintext(b"", Limits::default()).unwrap();
     codec
-        .seal(PacketKind::Datagram, &[suspect(0)], &[0; 24], &mut sealed)
+        .seal(PacketKind::Datagram, &[suspect(0)], &NONCE, &mut sealed)
         .unwrap();
     assert!(sealed.ends_with(&without));
 }
