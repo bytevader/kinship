@@ -9,7 +9,7 @@ kinship is a SWIM membership and failure detector with full Lifeguard, built as 
 The design follows the [research report](https://claude.ai/code/artifact/2da21f6f-4e88-43d4-9fa4-c8ae09fb5cd4) and the [build decision and brief](https://claude.ai/code/artifact/dbd827ee-ecea-4b2b-8560-ccae11b3b04d). Three properties drive every choice:
 
 1. **The protocol never waits on Python.** Probes, acks and timers run on a Rust thread, so a blocked asyncio loop cannot cause false deaths (the week 10 kill gate).
-2. **The core is pure.** All time, randomness and I/O enter through function arguments, so one seeded simulator can replay any run byte for byte (the week 6 kill gate) and feed the visualizer.
+2. **The core is pure.** All time, randomness and I/O enter through function arguments, so one seeded simulator can replay any run byte for byte (the week 6 kill gate).
 3. **Secure by default.** Every packet and stream is authenticated and encrypted unless the user opts out by name.
 
 **Goals for 0.1:** membership with alive, suspect, dead and left states; Lifeguard (local health, dynamic suspicion, buddy system, nacks); small opaque metadata per node; encrypted UDP and TCP; Python 3.11+ asyncio API plus a blocking API for sync code; Linux, macOS and Windows wheels, abi3 plus free-threaded 3.14t.
@@ -28,13 +28,13 @@ flowchart TD
     net[kinship-net<br/>tokio driver, UDP and TCP]
     py[kinship-py<br/>PyO3 bindings, Python package kinship]
     facade[kinship<br/>public Rust facade]
-    viz[tools/visualizer<br/>reads sim and live traces]
+    viz[deploy/compose<br/>live cluster dashboard]
     core --> proto
     sim --> core
     net --> core
     py --> net
     facade --> net
-    viz -.-> sim
+    viz -.-> py
 ```
 
 | Crate | Owns | Depends on tokio |
@@ -501,7 +501,7 @@ Users pick a preset and override a few fields; the timing defaults are memberlis
 | --- | --- | --- |
 | lan() | one datacenter or VPC, the default | baseline |
 | wan() | nodes across regions or flaky links | probe_interval 5 s, probe_timeout 3 s, suspicion_mult 6, push_pull_interval 60 s, gossip_interval 500 ms |
-| local() | one host, tests and the visualizer | probe_interval 200 ms, probe_timeout 100 ms, suspicion_mult 3, push_pull_interval 15 s |
+| local() | one host, tests and demos | probe_interval 200 ms, probe_timeout 100 ms, suspicion_mult 3, push_pull_interval 15 s |
 
 ### Identity and network
 

@@ -4,6 +4,14 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **armv7 wheels.** Linux abi3 wheels for manylinux_2_28 and musllinux_1_2, with musllinux tests under QEMU in Alpine.
+
+### Fixed
+
+- Replace references to the unimplemented visualizer with the Compose demo dashboard or existing test and demo uses.
+
 ## [0.3.0] - 2026-10-14
 
 ### Added
