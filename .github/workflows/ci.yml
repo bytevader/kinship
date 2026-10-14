@@ -478,9 +478,10 @@ jobs:
         timeout-minutes: 20
         env:
           IMAGE_PREFIX: ${{ matrix.arch == 'armv7' && 'arm32v7/' || '' }}
+          PLATFORM: ${{ matrix.arch == 'armv7' && 'linux/arm/v7' || matrix.arch == 'aarch64' && 'linux/arm64' || 'linux/amd64' }}
         run: |
           for python in 3.11 3.14; do
-            docker run --rm -v "$PWD:/io" -w /io "${IMAGE_PREFIX}python:${python}-alpine" sh -euc '
+            docker run --rm --platform "$PLATFORM" -v "$PWD:/io" -w /io "${IMAGE_PREFIX}python:${python}-alpine" sh -euc '
               python -m pip install pytest pytest-asyncio
               python -m pip install --no-index --find-links dist kinship
               python -m pytest
