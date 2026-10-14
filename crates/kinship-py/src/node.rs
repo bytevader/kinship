@@ -16,9 +16,9 @@ use crate::config::{self, Config};
 use crate::errors::{KError, finish};
 use crate::runtime::{self, awaitable, block_on, check_pid, seconds};
 
-/// A member as `(name, addr, state, incarnation, meta)`, with `state` 0 to 3 for alive,
+/// A member as `(name, addr, state, incarnation, meta, epoch)`, with `state` 0 to 3 for alive,
 /// suspect, dead and left, and `meta` as `(key, value)` pairs.
-type RawMember = (String, String, u8, u32, Vec<(String, String)>);
+type RawMember = (String, String, u8, u32, Vec<(String, String)>, u64);
 
 /// An event as `(kind, member, previous_meta, other_addr, count)`.
 type RawEvent = (
@@ -54,6 +54,7 @@ fn raw_member(m: Member) -> RawMember {
         state,
         m.incarnation,
         meta_pairs(&m.meta),
+        m.epoch,
     )
 }
 
@@ -373,6 +374,7 @@ impl Node {
             ("refutations", m.refutations),
             ("misdirected", m.misdirected),
             ("name_conflicts", m.name_conflicts),
+            ("restarts", m.restarts),
             ("members_refused", m.members_refused),
             ("push_pulls", m.push_pulls),
             ("push_pull_failures", m.push_pull_failures),

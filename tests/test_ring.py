@@ -18,6 +18,55 @@ def member(name: str, state: kinship.State = ALIVE, **meta: str) -> kinship.Memb
     return kinship.Member(name, "127.0.0.1:1", state, 0, meta)
 
 
+def run_of(m: kinship.Member, epoch: int, state: kinship.State = ALIVE) -> kinship.Member:
+    """`m` in another run of its process, the one that started at `epoch`."""
+    return kinship.Member(m.name, m.addr, state, 0, m.meta, epoch)
+
+
+def test_fence_names_the_owner_and_its_epoch() -> None:
+    nodes = [run_of(member(n), 1_000 + i) for i, n in enumerate(("node-a", "node-b", "node-c"))]
+    cluster = FakeCluster(*nodes)
+    ring = Ring(cluster)
+    for key in KEYS[:20]:
+        owner = ring.owner(key)
+        assert ring.fence(key) == (owner.name, owner.epoch)
+    # The owner restarts: same name, a later epoch, so the token it handed out no longer
+    # matches the ring's, and every key it owns counts as moved.
+    token = ring.fence("user:42")
+    before = ring.members()
+    restarted = run_of(ring.owner("user:42"), 2_000)
+    cluster.set(restarted)
+    assert ring.fence("user:42") == (token[0], 2_000) != token
+    moved = ring.moved(KEYS, before, ring.members())
+    owned = {k for k in KEYS if rendezvous.owner(k, before).name == restarted.name}
+    assert set(moved) == owned
+    assert all((old.epoch, new.epoch) == (token[1], 2_000) for old, new in moved.values())
+    # An epoch learned later for the same run, 0 until then, moves nothing.
+    unknown = [run_of(m, 0) for m in before]
+    assert ring.moved(KEYS, unknown, before) == {}
+    with pytest.raises(LookupError):
+        Ring(cluster, where={"role": "none"}).fence("k")
+    # Like owner(), new_work skips a suspect owner.
+    cluster.set(run_of(ring.owner("user:42"), 2_000, SUSPECT))
+    fallback = ring.owner("user:42", new_work=True)
+    assert ring.fence("user:42", new_work=True) == (fallback.name, fallback.epoch) != token
+
+
+async def test_changes_sees_a_restart_as_a_departure_and_a_join() -> None:
+    a, b = run_of(member("node-a"), 10), run_of(member("node-b"), 20)
+    cluster = FakeCluster(a, b)
+    ring = Ring(cluster)
+    # As a node reports it: the old run leaves, the new one joins.
+    cluster.emit(kinship.MemberLeft, run_of(b, 20, LEFT))
+    cluster.emit(kinship.MemberJoined, run_of(b, 30))
+    # The same while events were lost.
+    cluster.lose(run_of(b, 40), 2)
+    seen = [ch async for ch in ring.changes()]
+    summary = [([m.epoch for m in ch.added], [m.epoch for m in ch.removed]) for ch in seen]
+    assert summary == [([], [20]), ([30], []), ([40], [30])]
+    assert seen[-1].members == (a, run_of(b, 40))
+
+
 class FakeCluster:
     """Just enough of kinship.Cluster for a Ring: members(), local and events()."""
 

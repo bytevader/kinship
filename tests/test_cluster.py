@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,7 @@ from conftest import (
     next_matching,
     wait_until,
 )
+from kinship.ring import Ring
 
 
 async def test_quickstart_join_crash_and_leave() -> None:
@@ -295,3 +297,59 @@ async def test_two_live_nodes_with_one_name_both_see_the_conflict() -> None:
             # Neither applied the other's Alive: each still holds the name at its own address.
             assert a.member("box") == a.local and b.member("box") == b.local
             assert names(a) == {"box"}
+
+
+async def _start_at(addr: str, **fields: Any) -> kinship.Cluster:
+    """A node bound to `addr`, which the node closed just before held: retried while the OS
+    still holds the port."""
+    deadline = time.monotonic() + WAIT
+    while True:
+        try:
+            return await kinship.Cluster(kinship.Config.local(bind=addr, **fields)).start()
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            await asyncio.sleep(0.1)
+
+
+async def test_a_node_that_restarts_with_its_name_comes_back_at_a_new_epoch() -> None:
+    """A node closed without leaving and started again under its name, at its address, starts
+    a new life: a later epoch, at an incarnation below the old life's. The others see the old
+    life end and the new one join, and a ring's fencing token for its keys changes with it."""
+    async with kinship.Cluster(local()) as a:
+        ring = Ring(a, where={"role": "worker"})
+        b = await kinship.Cluster(
+            local(name="worker", seeds=[a.local.addr], meta={"role": "worker"})
+        ).start()
+        addr = b.local.addr
+        await b.update_meta(v="1")
+        await b.update_meta(v="2")
+        await wait_until(lambda: (m := a.member("worker")) is not None and m.incarnation >= 2)
+        old = a.member("worker")
+        assert old is not None and old.epoch == b.local.epoch > 0
+        token = ring.fence("job:7")
+        assert token == ("worker", old.epoch)
+        events = a.events()
+        await b.close()  # no leave: to a, the old life just stops answering
+
+        b = await _start_at(addr, name="worker", seeds=[a.local.addr], meta={"role": "worker"})
+        try:
+            assert b.local.epoch > old.epoch
+            assert b.local.incarnation < old.incarnation, "nothing to learn from its old life"
+            # The old life ends, as left or, if a declared it dead first, as dead; then the new
+            # life joins.
+            seen: list[kinship.Event] = []
+            while not any(isinstance(e, kinship.MemberJoined) for e in seen):
+                event = await next_event(events)
+                if not isinstance(event, kinship.EventsLost) and event.member.name == "worker":
+                    seen.append(event)
+            ended = [e for e in seen if isinstance(e, kinship.MemberLeft | kinship.MemberDead)]
+            joined = seen[-1]
+            assert ended and ended[-1].member.epoch == old.epoch, seen
+            assert joined.member.epoch == b.local.epoch, seen
+            await wait_until(lambda: ring.fence("job:7") == ("worker", b.local.epoch))
+            assert ring.fence("job:7") != token
+            m = a.member("worker")
+            assert m is not None and m.addr == addr and m.state is kinship.State.ALIVE
+        finally:
+            await b.close()

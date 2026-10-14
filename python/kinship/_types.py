@@ -28,13 +28,20 @@ _STATES = tuple(State)
 
 @dataclass(frozen=True, slots=True, eq=True, repr=False)
 class Member:
-    """One cluster member. Frozen, hashable by name, with read-only ``meta``."""
+    """One cluster member. Frozen, hashable by name, with read-only ``meta``.
+
+    ``epoch`` names this life of the member: the milliseconds of its wall clock when its
+    process started, raised past any earlier life of the same name. A member that restarts
+    comes back with a higher epoch, so ``(name, epoch)`` tells one run of a node from the
+    next. It is 0 for members on kinship older than 0.3, which do not send one.
+    """
 
     name: str
     addr: str
     state: State
     incarnation: int
     meta: Mapping[str, str] = field(default_factory=lambda: _EMPTY)
+    epoch: int = 0
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -42,7 +49,7 @@ class Member:
     def __repr__(self) -> str:
         return (
             f"Member(name={self.name!r}, addr={self.addr!r}, state={self.state!r}, "
-            f"incarnation={self.incarnation}, meta={dict(self.meta)!r})"
+            f"incarnation={self.incarnation}, epoch={self.epoch}, meta={dict(self.meta)!r})"
         )
 
 
@@ -50,9 +57,9 @@ def _meta(pairs: list[tuple[str, str]]) -> Mapping[str, str]:
     return MappingProxyType(dict(pairs)) if pairs else _EMPTY
 
 
-def _member(raw: tuple[str, str, int, int, list[tuple[str, str]]]) -> Member:
-    name, addr, state, incarnation, meta = raw
-    return Member(name, addr, _STATES[state], incarnation, _meta(meta))
+def _member(raw: tuple[str, str, int, int, list[tuple[str, str]], int]) -> Member:
+    name, addr, state, incarnation, meta, epoch = raw
+    return Member(name, addr, _STATES[state], incarnation, _meta(meta), epoch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +195,7 @@ class Stats:
     refutations: int
     misdirected: int
     name_conflicts: int
+    restarts: int
     members_refused: int
     push_pulls: int
     push_pull_failures: int

@@ -4,7 +4,7 @@ from typing import Any, Literal, final
 
 __version__: str
 
-_RawMember = tuple[str, str, int, int, list[tuple[str, str]]]
+_RawMember = tuple[str, str, int, int, list[tuple[str, str]], int]
 _RawEvent = tuple[
     str,
     _RawMember | None,
