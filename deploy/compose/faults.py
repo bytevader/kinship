@@ -9,7 +9,7 @@ import time
 import httpx
 
 NAMES = tuple(f"node-{i}" for i in range(1, 6))
-APP_ACTIONS = frozenset({"stall", "crash", "leave", "drain", "undrain"})
+APP_ACTIONS = frozenset({"stall", "crash", "bounce", "leave", "drain", "undrain"})
 FAULT_ACTIONS = APP_ACTIONS - {"undrain"} | {"pause", "kill", "disconnect"}
 DOCKER_ACTIONS = frozenset(
     {"pause", "unpause", "kill", "restart", "start", "disconnect", "connect"}
@@ -21,6 +21,7 @@ RECOVERY = {
     "disconnect": "connect",
     "leave": "start",
     "crash": "start",
+    "bounce": "start",
 }
 
 
@@ -116,7 +117,8 @@ class FaultController:
                 action == RECOVERY.get(current["action"])
                 or (
                     action == "restart"
-                    and current["action"] in {"stall", "crash", "kill", "leave", "drain", "pause"}
+                    and current["action"]
+                    in {"stall", "crash", "bounce", "kill", "leave", "drain", "pause"}
                 )
             ):
                 # A successful Docker start isn't HTTP readiness: the worker has
@@ -221,7 +223,7 @@ class ChaosScheduler:
                 return
             actions = ["stall", "drain"]
             if self.controller.docker_enabled:
-                actions += ["pause", "kill", "disconnect", "leave", "crash"]
+                actions += ["pause", "kill", "disconnect", "leave", "crash", "bounce"]
             node, action = self.chooser(candidates), self.chooser(actions)
             # Reserve the slot before IO: even an ambiguous transport failure may
             # have applied the fault. Recovery must succeed before another starts.

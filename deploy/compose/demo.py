@@ -34,6 +34,7 @@ def member_record(member: kinship.Member) -> dict:
         "addr": member.addr,
         "state": member.state.name,
         "incarnation": member.incarnation,
+        "epoch": member.epoch,
         "meta": dict(member.meta),
     }
 
@@ -48,7 +49,9 @@ class View:
         self.log: deque[dict] = deque(maxlen=200)
         self.clients: set[asyncio.Queue] = set()
         self.revision = 0
-        self.counts = {"successes": 0, "misses": 0, "errors": 0, "unreachable": 0}
+        self.counts = {"successes": 0, "misses": 0, "errors": 0, "unreachable": 0, "fenced": 0}
+        # The run of each node last seen, to tell a restart from a node coming back.
+        self.epochs: dict[str, int] = {}
         self.member_counts: dict[str, dict] = {}
         self.moved_at: dict[str, int] = {}
         self.load_enabled = False
@@ -58,6 +61,8 @@ class View:
         self.control_lock = asyncio.Lock()
 
     def resync(self) -> None:
+        for member in self.cluster.members():
+            self.epochs.setdefault(member.name, member.epoch)
         for name in list(self.members):
             member = self.cluster.member(name)
             if member is not None:
@@ -96,7 +101,7 @@ class View:
                 "node": name,
                 "action": reservation["action"],
                 # Docker treats a kill as a manual stop, so on-failure doesn't restart it.
-                "automatic": reservation["action"] in {"stall", "crash"}
+                "automatic": reservation["action"] in {"stall", "crash", "bounce"}
                 or reservation.get("phase") == "recovering",
             }
         return json.dumps(
@@ -146,6 +151,21 @@ class View:
                 if isinstance(event, kinship.NameConflict):
                     detail += f" (conflicting address {event.other_addr})"
             self.add_log(type(event).__name__, detail, "membership")
+            if isinstance(event, kinship.MemberJoined):
+                self.new_run(event.member)
+
+    def new_run(self, member: kinship.Member) -> None:
+        """Logs a node that joined in a run it was not in before: it restarted."""
+        before = self.epochs.get(member.name)
+        self.epochs[member.name] = member.epoch
+        if before and member.epoch and member.epoch != before:
+            started = datetime.fromtimestamp(member.epoch / 1000, UTC).strftime("%H:%M:%S")
+            self.add_log(
+                "Restart",
+                f"{member.name} is a new run, started {started} UTC (epoch {before} → "
+                f"{member.epoch}); its old run is gone, whatever its incarnation was",
+                "membership",
+            )
 
     async def ring_changes(self, changes, before) -> None:
         async for change in changes:
@@ -206,6 +226,9 @@ async def load_generator(view: View, http: httpx.AsyncClient) -> None:
             )
             if response.status_code == 404:
                 view.counts["misses"] += 1
+            elif response.status_code == 409:
+                # A forwarded write carried the fencing token of an owner's earlier run.
+                view.counts["fenced"] += 1
             elif 200 <= response.status_code < 300:
                 view.counts["successes"] += 1
             else:

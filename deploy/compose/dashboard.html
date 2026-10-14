@@ -115,7 +115,7 @@
     .feedback { min-height: 18px; font-size: 12px; color: var(--muted); }
 
     /* Stats */
-    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
     .stat { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
     .stat strong { display: block; font-size: 24px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
     .stat span { color: var(--muted); font-size: 12px; }
@@ -153,7 +153,7 @@
     footer { margin-top: 28px; color: var(--faint); font-size: 12px; }
     code { font: 12px ui-monospace, monospace; color: #cbd5e1; }
 
-    @media (max-width: 1100px) { #nodes { grid-template-columns: repeat(3, minmax(0, 1fr)); } #keys { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+    @media (max-width: 1100px) { #nodes, .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } #keys { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
     @media (max-width: 720px) {
       .wrap { padding: 0 16px 40px; }
       #nodes { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -200,6 +200,7 @@
       <div class="stat miss"><strong id="misses">0</strong><span>misses: the key's value was lost with its owner</span></div>
       <div class="stat err"><strong id="errors">0</strong><span>errors: the key's owner didn't answer</span></div>
       <div class="stat err"><strong id="unreachable">0</strong><span>unreachable: the node asked didn't answer</span></div>
+      <div class="stat miss"><strong id="fenced">0</strong><span>fenced: writes refused, sent for an owner's earlier run</span></div>
       <div class="stat"><strong id="dashboard-view">–</strong><span id="dashboard-note">members the dashboard sees</span></div>
     </div>
 
@@ -220,6 +221,7 @@
     const FAULTS = [
       ['stall', 'Stall', 'Block its event loop for 20 s. kinship keeps running on its own thread, so it stays ALIVE'],
       ['crash', 'Crash', 'Exit without leaving. Peers suspect it, declare it DEAD, and Docker restarts it'],
+      ['bounce', 'Bounce', 'Exit without leaving and come straight back as a new run: peers swap the old run for the new one at once'],
       ['leave', 'Leave', 'Leave the cluster gracefully and exit. Peers mark it LEFT at once'],
       ['drain', 'Drain', 'Set role=draining: still ALIVE, but its keys move to the other cache nodes'],
     ];
@@ -229,16 +231,17 @@
       ['restart', 'Restart', 'Stop it cleanly (it leaves) and start it again'],
       ['disconnect', 'Partition', 'Cut it off the network: each side declares the other dead'],
     ];
-    const RECOVERY = { drain: 'undrain', pause: 'unpause', kill: 'start', leave: 'start', crash: 'start', disconnect: 'connect' };
+    const RECOVERY = { drain: 'undrain', pause: 'unpause', kill: 'start', leave: 'start', crash: 'start', bounce: 'start', disconnect: 'connect' };
     const KINDS = {
       fault: 'Fault', fault_applied: 'Fault applied', fault_error: 'Fault failed', FaultError: 'Fault failed',
-      recovery: 'Recovery', recovery_error: 'Recovery failed', Load: 'Load', Chaos: 'Chaos',
+      recovery: 'Recovery', recovery_error: 'Recovery failed', Load: 'Load', Chaos: 'Chaos', Restart: 'New run',
     };
     const RECOVER_LABELS ={ undrain: 'Undrain', unpause: 'Unpause', start: 'Start', connect: 'Reconnect' };
     const CHAOS_RECOVERS = 'Random chaos recovers it on a timer.';
     const HINTS = {
       stall: (n, manual) => `${n}'s event loop is blocked for 20 seconds, so its HTTP calls time out. Its card stays ALIVE: kinship answers probes from its own thread, and a slow app is not a dead node.`,
       crash: (n, manual) => `${n} exited without leaving. Watch it turn SUSPECT, then DEAD, while its keys take on other colours. Docker restarts it after a 15-second startup delay and it rejoins.`,
+      bounce: (n, manual) => `${n} exited and Docker is starting it again without the startup delay, usually before anyone declares it dead. Its new run has a later epoch, so every node swaps the old run for it at once: MemberLeft, MemberJoined, no DEAD, even though its incarnation started again at 0. Its keys keep their colour but start cold, and a write still fenced with the old run's epoch is refused.`,
       leave: (n, manual) => `${n} left gracefully, so peers marked it LEFT at once, with no suspicion. ${manual ? `Press Start to bring it back, or run docker compose start ${n}.` : CHAOS_RECOVERS}`,
       drain: (n, manual) => `${n} is still ALIVE but no longer role=cache, so the ring handed its keys to the others without anyone failing. ${manual ? 'Press Undrain to take them back.' : CHAOS_RECOVERS}`,
       pause: (n, manual) => `Docker froze ${n}, kinship included. Its keys get a dashed outline while it is SUSPECT, then move when it is DEAD. ${manual ? 'Press Unpause: it' : 'When it is unpaused it'} refutes, rejoins, and drops values that may be stale.`,
@@ -346,6 +349,11 @@
         v.card.className = `node ${st}${faulted ? ' faulted' : ''}`;
         v.badge.textContent = st;
         v.meta.replaceChildren(document.createTextNode(m ? `${m.meta.zone ?? ''} · ${m.addr.split(':')[0]}` : 'not seen yet'));
+        // The epoch is when this run of the node started; a restart shows as a new time.
+        if (m?.epoch) {
+          const run = el('span', 'run', ` · run since ${new Date(m.epoch).toLocaleTimeString()}`);
+          run.title = `epoch ${m.epoch}, incarnation ${m.incarnation}`; v.meta.append(run);
+        }
         if (role && role !== 'cache') v.meta.append(document.createTextNode(' · '), el('span', 'draining', role));
         v.keys.textContent = owned[name];
         // A full bar is twice a fair share (64 / 5 keys), so an even split sits near half.
@@ -377,7 +385,7 @@
 
       const dash = s.member_counts.dashboard;
       $('#dashboard-view').textContent = dash ? dash.count : '–';
-      for (const id of ['successes', 'misses', 'errors', 'unreachable']) $(`#${id}`).textContent = s.counts[id].toLocaleString();
+      for (const id of ['successes', 'misses', 'errors', 'unreachable', 'fenced']) $(`#${id}`).textContent = s.counts[id].toLocaleString();
 
       for (const k of s.keys) {
         const cell = keyCells.get(k.key); if (!cell) continue;

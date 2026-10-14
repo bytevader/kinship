@@ -5,12 +5,15 @@ from __future__ import annotations
 import os
 import socket
 import time
+from pathlib import Path
 
 import kinship
 
 NAMES = tuple(f"node-{i}" for i in range(1, 6))
 URLS = {name: f"http://{name}:8000" for name in NAMES}
 KEYS = tuple(f"key-{i:02d}" for i in range(64))
+#: Left by the bounce fault, so that the run Docker starts next skips the startup delay.
+BOUNCE_MARKER = Path("/tmp/kinship-demo-bounce")
 
 
 def membership_address() -> str:
@@ -30,8 +33,13 @@ def membership_address() -> str:
 
 def config() -> kinship.Config:
     """Called inside each uvicorn worker, including when Docker restarts a crashed node."""
-    # A restarted node waits so peers can mark its old incarnation DEAD before it rejoins.
-    time.sleep(float(os.environ.get("STARTUP_DELAY_SECONDS", "0")))
+    # A restarted node waits so peers can mark its old run DEAD before it rejoins, unless it
+    # bounced: then it comes back at once and its new epoch replaces the old run directly.
+    delay = float(os.environ.get("STARTUP_DELAY_SECONDS", "0"))
+    if BOUNCE_MARKER.exists():
+        BOUNCE_MARKER.unlink(missing_ok=True)
+        delay = 0
+    time.sleep(delay)
     name = os.environ.get("NODE_NAME", os.environ.get("NAME", socket.gethostname()))
     address = membership_address()
     meta = {"role": os.environ.get("ROLE", "cache"), "zone": os.environ.get("ZONE", "zone-a")}
