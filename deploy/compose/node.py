@@ -76,7 +76,12 @@ def create_app(name: str | None = None) -> FastAPI:
                     await task
 
     app = FastAPI(lifespan=lifespan)
-    app.include_router(cluster_router())
+    router = (
+        cluster_router(metrics=True)
+        if os.environ.get("KINSHIP_METRICS") == "1"
+        else cluster_router()
+    )
+    app.include_router(router)
     data: dict[str, str] = {}
     app.state.data = data
 

@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 3s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: kinship
+    metrics_path: /cluster/metrics
+    honor_labels: true
+    static_configs:
+      - targets:
+          - node-1:8000
+          - node-2:8000
+          - node-3:8000
+          - node-4:8000
+          - node-5:8000
+    # Keep node labels on Prometheus's own `up` series, even when a node is down.
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: node
+        replacement: "$1"

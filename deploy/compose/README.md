@@ -41,6 +41,62 @@ Dockerfile-specific `Dockerfile.dockerignore` excludes `.git`, `.venv` and
 `target` directories, including nested ones, without changing the repo's root
 ignore files.
 
+## Prometheus and Grafana
+
+Add the optional monitoring override to the same Compose project:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build -d
+```
+
+This adds Prometheus and Grafana and enables `/cluster/metrics` on all five cache
+nodes. The override builds their `kinship-compose-demo-metrics` image from this
+checkout automatically, because published kinship 0.3 does not include the metrics
+API. The dashboard keeps its normal image and remains at <http://localhost:8080>.
+The ordinary `docker compose up` still runs the demo without monitoring.
+
+- Open **Grafana** at <http://localhost:3000/d/kinship-cluster>. The **Kinship cluster**
+  dashboard and Prometheus data source are provisioned automatically. Anonymous
+  access is read-only; no login or dashboard import is needed. For admin access,
+  the initial login is `admin` / `admin`; Grafana asks you to change the password.
+- Open **Prometheus** at <http://localhost:9090>. Its Targets page shows a separate
+  scrape of `node-1:8000` through `node-5:8000`, every five seconds. Expect targets
+  to be down during the nodes' initial 15-second startup delay.
+- Both published ports bind to loopback. Override them with `KINSHIP_GRAFANA_PORT`
+  and `KINSHIP_PROMETHEUS_PORT` if 3000 or 9090 is already in use. Cache HTTP ports
+  remain internal; Prometheus reaches them over the existing membership network.
+
+The graphs show HTTP scrape availability, alive/suspect counts as seen by each
+node, Lifeguard local health, probe and packet rates, suspicions, refutations,
+restarts observed by peers, and decode/decrypt failures. Use the Node selector to
+compare views. Healthy nodes normally see **six** members: the five caches plus
+the demo dashboard. Counts are per reporter; summing them would count the same
+members repeatedly. Dead/left tombstones are excluded by `members()` and their
+metrics stay zero, so the dashboard shows alive and suspect counts instead.
+
+Try **Stall** in the demo: HTTP scrapes fail while the Rust protocol thread keeps
+membership healthy. Try **Crash** or **Bounce**: watch gaps, suspicion/refutation
+activity, membership views and restarts observed by peers. `rate()` handles
+counter resets. Rates need a few scrapes to appear; five-second scraping can miss
+short-lived states. The graphs describe the membership protocol, not cache hit
+rates or application latency; the demo page still shows cache load and errors.
+
+For Docker faults too, add `--profile chaos` before `up`. Use the same two `-f`
+arguments for subsequent monitoring commands. After stopping chaos and recovering
+manual faults as described below:
+
+```sh
+# Stop only monitoring and leave the demo running:
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml stop prometheus grafana
+
+# Or stop the whole project, including the optional chaos helper:
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml --profile chaos down
+```
+
+Prometheus keeps one day of samples in `prometheus-data`; Grafana keeps its state
+in `grafana-data`. These named volumes survive `down`. Add `--volumes` to the
+second command to discard monitoring history and reset Grafana as well.
+
 ## What the dashboard shows
 
 Turn on **Load**. It warms the 64 keys once, then GETs random keys and
@@ -177,6 +233,12 @@ ownership and eviction with a fake ring, and the SSE view:
 
 ```sh
 docker compose run --rm --no-deps dashboard python -m unittest discover -s /app -v
+```
+
+To include the source-only metrics endpoint test, use a monitoring cache image:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml run --rm --no-deps node-1 python -m unittest discover -s /app -v
 ```
 
 Inspect services with `docker compose ps` and logs with `docker compose logs -f`.

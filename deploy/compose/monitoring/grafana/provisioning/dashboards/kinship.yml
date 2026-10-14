@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: kinship
+    orgId: 1
+    folder: Kinship
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

@@ -7,6 +7,7 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 ### Added
 
 - **Prometheus metrics.** Dependency-free `kinship.metrics.prometheus_text(cluster)` exports every protocol counter, the local health gauge and membership counts for async and blocking clusters. `cluster_router(metrics=True)` opts into a Prometheus text endpoint at `/cluster/metrics` (or the configured prefix).
+- **Demo monitoring.** Optional `docker-compose.monitoring.yml` adds Prometheus and Grafana to the five-node Compose demo, with automatic source builds, per-node scraping and a provisioned cluster dashboard for membership views, health, probes and failure activity.
 - **armv7 wheels.** Linux abi3 wheels for manylinux_2_28 and musllinux_1_2, with musllinux tests under QEMU in Alpine.
 
 ### Fixed

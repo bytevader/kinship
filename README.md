@@ -401,6 +401,17 @@ Expose this endpoint only to trusted scrapers. Give each node its own scrape tar
 with several server workers sharing an HTTP port, a scrape can reach a different node
 each time.
 
+The [five-node Compose demo](deploy/compose/README.md#prometheus-and-grafana) includes
+an optional Prometheus and Grafana override with a provisioned cluster dashboard:
+
+```sh
+cd deploy/compose
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build -d
+```
+
+Open Grafana at <http://localhost:3000/d/kinship-cluster> and the demo at
+<http://localhost:8080> to watch metrics while injecting faults.
+
 ## Examples
 
 Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/examples), each a single file with nothing to install beyond kinship, except `fastapi_app.py`, which needs `kinship[fastapi]` and httpx:
