@@ -1352,7 +1352,9 @@ mod tests {
     fn a_node_moves_past_a_later_life_of_its_own_name() {
         let me = Identity::new("a", addr(1)).unwrap().with_epoch(100);
         let cfg = Config::local(Security::InsecurePlaintext);
-        let mut n = Node::new(cfg, me, Instant::ZERO, 7, &[7; 32]).unwrap();
+        let mut nonce_key = [0; 32];
+        Rng::new(7).fill(&mut nonce_key);
+        let mut n = Node::new(cfg, me, Instant::ZERO, 7, &nonce_key).unwrap();
         let t = Instant::ZERO;
         let local = |n: &Node| (n.local().epoch, n.local().incarnation, n.local_health());
         // An earlier instance of this node, whose wall clock ran ahead, is remembered at 150:

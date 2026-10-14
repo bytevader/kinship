@@ -1048,11 +1048,13 @@ mod tests {
         assert!(matches!(&p.events(1)[..], [Event::MemberJoined(m)] if m.name == "a"));
     }
 
-    /// `name` at port `port`, starting at `epoch`.
+    /// `name` at port `port`, starting at `epoch`, with nonces keyed from `port`'s RNG.
     fn node_at(name: &str, port: u16, epoch: u64) -> Node {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let me = Identity::new(name, addr(port)).unwrap().with_epoch(epoch);
-        Node::new(cfg, me, Instant::ZERO, u64::from(port), &[port as u8; 32]).unwrap()
+        let mut nonce_key = [0; 32];
+        crate::Rng::new(u64::from(port)).fill(&mut nonce_key);
+        Node::new(cfg, me, Instant::ZERO, u64::from(port), &nonce_key).unwrap()
     }
 
     /// b holding a live a at incarnation 7 of the life `epoch`.
