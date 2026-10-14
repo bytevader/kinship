@@ -12,13 +12,14 @@
 - Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
 - Member epochs, one per run of a node, let a restart replace the old run at any incarnation (`docs/design.md`, Epochs); `Ring.fence()` provides tokens from those epochs, and the Compose demo's Bounce fault demonstrates a restart.
 - Timing preset tuning is done: no variant beats `lan()` at every cluster size without false deaths or more than 10% bandwidth, so `lan()` keeps memberlist's values; see `docs/results/tuning.md`.
+- User messages for 0.4, unreleased: `send(member, data)` and `broadcast(data)`, delivered as `UserMessage` events, on wire types 0x09 and 0x0A (`docs/design.md`, User messages). With none sent, the wire bytes and the pinned SWIM trace are those of 0.3. Broadcasts reach about 99.8% of members in the simulator, with nothing to repair a miss.
 
 ## Where to look
 
 - `docs/design.md`: architecture and design decisions. `README.md`: the public API contract.
 - `crates/kinship-proto`: wire types, codec, AEAD framing.
-- `crates/kinship-core`: sans-IO protocol state machine (`Node`). It never touches a clock, socket or RNG.
-- `crates/kinship-sim`: deterministic simulator.
+- `crates/kinship-core`: sans-IO protocol state machine (`Node`). It never touches a clock, socket or RNG. User messages live in `user.rs`, their broadcast queue beside the membership queue in `broadcast.rs`.
+- `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version.
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.

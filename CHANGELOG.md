@@ -4,6 +4,23 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **User messages.** `send(member, data)` sends bytes to one member: in one datagram when they fit, and over TCP otherwise, up to `max_user_message` (64 KiB). `broadcast(data)` gossips up to `max_user_broadcast` (256 bytes) to every member, beside the membership rumours and with their retransmit rule, membership always first, and every node delivers it at most once, told apart by sender, epoch and number. Receivers read both from `events()` as `UserMessage(sender, data, broadcast)`, in Python and Rust, with `EventsLost` unchanged. A `Member` names one run of a node, so a message for a run that has since restarted is refused by a sender that knows, and dropped by the new run otherwise. Messages are best effort and never acknowledged; README "Messages" and docs/design.md "User messages" give the guarantees. On `kinship.Cluster` and `kinship.blocking.Cluster`, the Rust `Cluster` (`send`, `send_to`, `broadcast`) and `kinship_net::Memberlist`; the sans-IO core takes `Command::Send` and `Command::Broadcast`.
+- `kinship.MessageTooLarge`, a `ValueError`, and `kinship.NotAMember`, a `LookupError`; Rust `Error::MessageTooLarge` and `Error::NotAMember`.
+- Config fields `max_user_message` (64 KiB), `max_user_broadcast` (256 bytes) and `user_broadcast_queue` (256), validated with the other limits.
+- Stats counters `user_messages_sent`, `user_messages_received`, `user_messages_dropped`, `user_messages_too_large` and `user_queue_overflow`.
+- `examples/messages.py`: a broadcast every other node hears once, and a request answered with a direct message too large for a datagram.
+- Simulator tests that run the released kinship-core 0.3.0 beside this version, and a 1,000-seed sweep of user messages in CI.
+
+### Changed
+
+- **Wire format.** User messages take types 0x09 (UserMessage) and 0x0A (UserBroadcast) from the reserved range; 0x0B to 0x7F stay reserved. No other message changes, so a node that sends no user messages sends the bytes 0.3 does, and the wire version stays 1. Nodes on 0.3 or older skip both types as types they do not know, without counting a decode error: they neither deliver nor pass on user messages.
+- `events()` can yield `UserMessage`, which carries `sender` rather than `member`, so code that reads `event.member` from every event but `EventsLost` should match on the event's type, as `kinship.ring` now does.
+- A config whose `max_stream_frame` cannot hold a `max_user_message` message, below about 64 KiB, is refused naming `max_stream_frame`; lower `max_user_message` with it.
+- Rust: `Message`, `Command`, `CommandError` and `Event` have new variants, and `Config` and `Metrics` new fields.
+- The `node_input` fuzz corpus is regenerated, since it predated epochs, and gains inputs with user messages; operation 7 of the target now has the node send them.
+
 ## [0.3.0] - 2026-10-14
 
 ### Added
