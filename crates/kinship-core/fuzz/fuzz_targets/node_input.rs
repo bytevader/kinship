@@ -1,17 +1,19 @@
-//! Feeds arbitrary datagrams, stream frames, stream ends and the passing of time to a node with
-//! a few members, encrypted or not, and checks that it never panics, that its timers settle,
-//! and that its metrics only ever count up.
+//! Feeds arbitrary datagrams, stream frames, stream ends, user messages of its own and the
+//! passing of time to a node with a few members, encrypted or not, and checks that it never
+//! panics, that its timers settle, and that its metrics only ever count up.
 //!
 //! An input is a mode byte and then a list of operations, until the bytes run out:
 //!
 //! ```text
 //! input = mode:u8 op*        mode bit 0: the node encrypts with key [7; 32], else plaintext
 //! op    = code:u8 body       code & 7 picks the operation, code >> 3 is its argument s
-//!   0, 5, 6, 7  a datagram:     len:u16be bytes
+//!   0, 5, 6     a datagram:     len:u16be bytes
 //!   1           a stream frame: len:u16be bytes, on stream s
 //!   2           the peer closed stream s
 //!   3           stream s failed
 //!   4           s x 100 ms pass, and every timer due by then fires
+//!   7           the node sends:  len:u16be bytes, as a broadcast if s is 0, else as a direct
+//!                                message to member n<s % 3 + 1>, over TCP if it is large
 //! ```
 //!
 //! Stream s is the node's inbound connection s for s below 16, else its outbound connection
@@ -23,7 +25,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use kinship_core::{Command, Config, Identity, Instant, Key, Node, Security, StreamEvent, StreamId};
+use kinship_core::{
+    Command, Config, Identity, Instant, Key, Node, Security, StreamEvent, StreamId,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// The simulator's address for node `i`, as in `kinship_sim::addr_of`.
@@ -81,7 +85,12 @@ fuzz_target!(|data: &[u8]| {
     for i in 1..=3 {
         node.add_member(now, &format!("n{i}"), addr(i)).unwrap();
     }
-    node.command(now, Command::Join { seeds: vec![addr(1), addr(2)] });
+    node.command(
+        now,
+        Command::Join {
+            seeds: vec![addr(1), addr(2)],
+        },
+    );
     drain(&mut node);
 
     let mut before = counters(&node);
@@ -95,6 +104,20 @@ fuzz_target!(|data: &[u8]| {
             }
             2 => node.handle_stream(now, stream(s), StreamEvent::Closed),
             3 => node.handle_stream(now, stream(s), StreamEvent::Failed),
+            7 => {
+                let Some(bytes) = body(&mut data) else { break };
+                let cmd = if s == 0 {
+                    Command::Broadcast(bytes.to_vec())
+                } else {
+                    let to = format!("n{}", s % 3 + 1);
+                    Command::Send {
+                        to,
+                        epoch: 0,
+                        data: bytes.to_vec(),
+                    }
+                };
+                node.command(now, cmd);
+            }
             4 => {
                 now = now + Duration::from_millis(100) * u32::from(s);
                 let mut fired = 0;
