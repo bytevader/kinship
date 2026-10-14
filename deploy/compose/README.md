@@ -26,7 +26,7 @@ Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
 The default image installs `kinship[fastapi]>=0.3` from PyPI on
 `python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
-`Ring.fence()`, new in 0.3, so until 0.3 is published build from source. To try
+`Ring.fence()`, new in 0.3. To try
 changes in this checkout, build a release wheel from source, with maturin and
 Rust 1.85.1 in a separate build stage:
 

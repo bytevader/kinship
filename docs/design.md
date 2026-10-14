@@ -490,7 +490,7 @@ The queue in broadcast.rs holds Alive, Suspect and Dead messages that still need
 
 - set_meta rejects metadata over max_meta_bytes (512) with ValueError, and the config refuses limits under which an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address does not fit a datagram beside the largest Ping, so one Alive always fits with room for a probe. A rumour that still cannot fit any datagram is dropped and counted under gossip_too_large rather than kept forever.
 - A node holds at most max_members (8,192) members, itself and Dead and Left tombstones included, and one datagram or push-pull frame adds at most max_new_members_per_packet (1,024) members it did not know. An Alive or record for a new name beyond either is refused, not gossiped on, and counted under members_refused; members already known keep updating, and a reaped tombstone frees its place. A full table of members with 512 bytes of metadata, 64-byte names and IPv6 addresses is about 5 MB, inside max_stream_frame. A cluster larger than 1,024 members learns the rest of it at later push-pulls and through gossip, 1,024 at a time, unless max_new_members_per_packet is raised to the cluster's size; one larger than 8,192 must raise max_members on every node.
-- Metadata is for small routing facts such as role, zone, version or a load hint. Larger application state belongs in the user's own channel, and user broadcasts are reserved for 0.2.
+- Metadata is for small routing facts such as role, zone, version or a load hint. Larger application state belongs in the user's own channel, and user broadcasts are reserved for a future release.
 - Metadata changes appear as MemberUpdated(member, previous_meta). Spread time is O(log n) gossip rounds, and push-pull bounds the worst case at push_pull_interval.
 
 ## Configuration surface
@@ -613,7 +613,7 @@ The open questions were settled on 2026-10-04 by the [README and API review](htt
 - Node identity: a user-chosen name, defaulting to hostname plus 6 hex characters.
 - AEAD: XChaCha20-Poly1305 only; the version byte leaves room for another.
 - `tcp_fallback_ping`: on in `lan()` and `wan()`, off in `local()`.
-- User broadcasts and compression: 0.2; message types 0x09 to 0x7F stay reserved.
+- User broadcasts and compression: a future release; message types 0x09 to 0x7F stay reserved.
 - MSRV: Rust 1.85 (edition 2024). Free-threaded wheels for CPython 3.14t only, no 3.13t.
 - Windows: supported in 0.1, wheels and CI included.
 

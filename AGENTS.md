@@ -4,13 +4,13 @@
 
 ## Status
 
-0.1.0 shipped on 2026-10-12 and 0.1.1 on 2026-10-13. 0.2.0, which adds `kinship.ring` and `kinship.contrib.fastapi`, is ready to release: versions are 0.2.0 and `CHANGELOG.md` dates it 2026-10-13. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
+0.1.0 shipped on 2026-10-12, and 0.1.1 and 0.2.0 on 2026-10-13. 0.3.0, which adds member epochs, `Ring.fence()` and the Compose demo's Bounce fault, is ready to release: versions are 0.3.0 and `CHANGELOG.md` dates it 2026-10-14. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
 
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.
 - Protocol review fixes KP-01..KP-05 (`docs/review.md`) and security fixes KS-01..KS-08 (`SECURITY.md`) are merged.
 - Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
-- For 0.3 (Unreleased in `CHANGELOG.md`): member epochs, one per run of a node, which let a restart replace the old run at any incarnation (`docs/design.md`, Epochs), and `Ring.fence()`.
+- Member epochs, one per run of a node, let a restart replace the old run at any incarnation (`docs/design.md`, Epochs); `Ring.fence()` provides tokens from those epochs, and the Compose demo's Bounce fault demonstrates a restart.
 - Timing preset tuning is done: no variant beats `lan()` at every cluster size without false deaths or more than 10% bandwidth, so `lan()` keeps memberlist's values; see `docs/results/tuning.md`.
 
 ## Where to look

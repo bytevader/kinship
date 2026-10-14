@@ -4,6 +4,8 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
 ### Added
 
 - **Member epochs.** Each node picks an epoch when it starts, the wall clock's milliseconds since the Unix epoch, and `Member.epoch` exposes it in Rust and Python, so `(name, epoch)` tells one run of a node from the next. A node that restarts under the same name comes back at a later epoch, which replaces the old run on every node at once, even at a lower incarnation: applications see `MemberLeft` for the old run, unless it had already died or left, then `MemberJoined` for the new one, and `stats().restarts` counts them. Rumours about an earlier run, at any incarnation, change nothing, so the old run's death cannot kill the new one and its Alive cannot bring a dead member back. A node whose clock reads behind its last run's epoch moves past it when its join tells it about that run. Members of nodes older than 0.3 have epoch 0, and between them incarnations decide as before. Rust drivers of `kinship-core` pass the epoch with `Identity::with_epoch`; `kinship-net` picks it.
@@ -16,7 +18,6 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - The limits check counts the epoch in the largest Alive: with 512 bytes of metadata an encrypted datagram must now be at least 821 bytes (was 813), and with the default 1,400-byte datagram `max_meta_bytes` can be at most 1,091 (was 1,099).
 - `Ring.moved()` counts a key whose owner restarted, the same name at a new epoch, as moved, since the new run has none of the old one's state, and `Ring.changes()` reports such a restart as the old run removed and the new one added, also after `EventsLost`.
 - `GET /members` from `cluster_router()` includes each member's `epoch`.
-- The Compose demo's default image needs kinship 0.3 from PyPI; until 0.3 is published, build it with `KINSHIP_INSTALL=source`.
 - Rust: `Member` and the core's `Alive`, `Suspect` and `Dead` messages have a new `epoch` field, and `Metrics` a new `restarts` counter.
 
 ## [0.2.0] - 2026-10-13
@@ -84,7 +85,8 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
-[Unreleased]: https://github.com/bytevader/kinship/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bytevader/kinship/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bytevader/kinship/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bytevader/kinship/releases/tag/v0.2.0
 [0.1.1]: https://github.com/bytevader/kinship/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bytevader/kinship/releases/tag/v0.1.0
