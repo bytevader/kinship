@@ -333,7 +333,18 @@ name = "kinship-core"
 version = "0.3.0"
 dependencies = [
  "chacha20",
- "kinship-proto",
+ "kinship-proto 0.3.0",
+ "serde",
+]
+
+[[package]]
+name = "kinship-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e036a6839b79089b26cfa7ed39d5bbc156e9d1217b1e5fa1585a540b30351d31"
+dependencies = [
+ "chacha20",
+ "kinship-proto 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
 ]
 
@@ -343,8 +354,8 @@ version = "0.3.0"
 dependencies = [
  "arc-swap",
  "getrandom 0.4.3",
- "kinship-core",
- "kinship-proto",
+ "kinship-core 0.3.0",
+ "kinship-proto 0.3.0",
  "socket2",
  "tokio",
  "tracing",
@@ -363,11 +374,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinship-proto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd6793ddab35882a2703cab460a44f5198bd312c3ed43ae7870aa99c2f265564"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "ctutils",
+ "zeroize",
+]
+
+[[package]]
 name = "kinship-py"
 version = "0.3.0"
 dependencies = [
  "kinship-net",
- "kinship-proto",
+ "kinship-proto 0.3.0",
  "pyo3",
  "pyo3-async-runtimes",
  "tokio",
@@ -378,8 +401,9 @@ dependencies = [
 name = "kinship-sim"
 version = "0.3.0"
 dependencies = [
- "kinship-core",
- "kinship-proto",
+ "kinship-core 0.3.0",
+ "kinship-core 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kinship-proto 0.3.0",
  "serde",
  "serde_json",
 ]
