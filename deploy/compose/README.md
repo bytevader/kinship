@@ -125,8 +125,12 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   Each card shows the full last flush id and its applied count, and the event
   log reports applications observed by polling. A stale card retains its last
   observed values, explicitly marked as such.
-  Handoffs carry the sender's last flush id and are accepted only when it
-  matches the receiver's: a late batch cannot bring pre-flush values back.
+  The flush also carries the time it was issued. A handoff carries the time
+  the sender's cache was last emptied, by its start, a flush or a refutation,
+  and is refused by a node that applied a later flush: a late batch cannot
+  bring pre-flush values back, while a node that restarted, or missed a flush
+  behind a partition, still exchanges warm keys. Compose containers share the
+  host's clock; nodes on separate hosts would need synchronized clocks.
 - A node that was paused or cut off keeps its values, but meanwhile its peers
   suspected it or declared it dead and sent writes elsewhere. When it comes back
   it refutes by raising its incarnation, and on seeing that it drops its whole
@@ -157,7 +161,7 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   counters/history; refreshing the page does not.
 
 This is a **volatile cache**, without replication or handoff acknowledgements.
-A lost handoff or one arriving before ownership or flush views converge leaves a cold key;
+A lost handoff, or one arriving before ownership views converge or racing a flush, leaves a cold key;
 it is not retried. Restarting a node does not restore values lost in its crash.
 Membership and ownership are eventually consistent, rather than a distributed
 lock or a guarantee against concurrent writes during a partition.

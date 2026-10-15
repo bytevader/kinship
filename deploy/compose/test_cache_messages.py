@@ -125,10 +125,11 @@ class MessageTests(unittest.IsolatedAsyncioTestCase):
         target = CacheMessages({}, "node-2")
         target_ring = FakeRing()
         target_ring.read_owner = member("node-2")
+        self.messages.since = 100.0
 
         async def send(owner, payload):
-            self.messages.flush("flush-1")
-            target.flush("flush-1")
+            self.messages.flush("flush-1", at=200.0)
+            target.flush("flush-1", at=200.0)
             target.receive(payload, target_ring, broadcast=False)
 
         self.cluster.send.side_effect = send
@@ -137,14 +138,51 @@ class MessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.data, {})
         self.assertEqual(self.cluster.send.await_count, 1)
 
-    def test_handoff_after_flush_requires_same_flush_view(self):
-        self.messages.flush("flush-1")
-        old_payload = CacheMessages.handoff_payload([["key", "old"]])
+    def test_handoff_written_before_an_applied_flush_is_refused(self):
+        self.messages.flush("flush-1", at=200.0)
+        old_payload = CacheMessages.handoff_payload([["key", "old"]], since=100.0)
         self.messages.receive(old_payload, self.ring, broadcast=False)
         self.assertEqual(self.data, {})
-        payload = CacheMessages.handoff_payload([["key", "new"]], "flush-1")
+        payload = CacheMessages.handoff_payload([["key", "new"]], since=200.0)
         self.messages.receive(payload, self.ring, broadcast=False)
         self.assertEqual(self.data, {"key": "new"})
+
+    def test_a_run_started_after_a_flush_still_hands_off(self):
+        # A restarted node applied no flush, but holds nothing older than its start.
+        self.messages.flush("flush-1", at=200.0)
+        payload = CacheMessages.handoff_payload([["key", "warm"]], since=300.0)
+        self.messages.receive(payload, self.ring, broadcast=False)
+        self.assertEqual(self.data, {"key": "warm"})
+
+    def test_a_node_that_missed_a_flush_accepts_later_values(self):
+        # A partitioned node missed flush-2, but its peers' values are newer still.
+        self.messages.flush("flush-1", at=200.0)
+        payload = CacheMessages.handoff_payload([["key", "warm"]], since=400.0)
+        self.messages.receive(payload, self.ring, broadcast=False)
+        self.assertEqual(self.data, {"key": "warm"})
+
+    async def test_a_cleared_cache_stops_its_pending_handoff(self):
+        self.data.update({str(i): "x" * 16384 for i in range(6)})
+        self.ring.read_owner = self.ring.write_owner = member("node-2")
+
+        async def send(owner, payload):
+            # A refutation clears the cache, as a flush does.
+            self.messages.clear()
+
+        self.cluster.send.side_effect = send
+        await self.messages.handoff(self.cluster, self.ring, (), ())
+        self.assertEqual(self.data, {})
+        self.assertEqual(self.cluster.send.await_count, 1)
+
+    def test_flush_time_is_validated_and_never_ahead_of_the_local_clock(self):
+        for at in ("soon", True, None):
+            command = {"type": "flush", "id": f"bad-{at}", "at": at}
+            self.messages.receive(json.dumps(command).encode(), self.ring, broadcast=True)
+        self.assertEqual(self.messages.stats["flushes"], 3)
+        far = {"type": "flush", "id": "far", "at": 1e18}
+        self.messages.receive(json.dumps(far).encode(), self.ring, broadcast=True)
+        self.assertLess(self.messages.flushed_at, 1e18)
+        self.assertLessEqual(self.messages.flushed_at, self.messages.since)
 
 
 if __name__ == "__main__":

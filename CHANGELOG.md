@@ -4,6 +4,10 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **Compose demo messages.** Cache nodes hand moved keys to their new owner with `cluster.send` on Drain, Undrain and joins, so those keys stay warm, and a Flush action clears every reachable cache with `cluster.broadcast`. A handoff carries the time the sender's cache was last emptied and is refused by a node that applied a later flush, so a late batch cannot bring flushed values back while a restarted node still exchanges warm keys. See `deploy/compose/README.md`.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added

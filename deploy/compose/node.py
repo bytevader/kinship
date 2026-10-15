@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from base64 import b64decode, b64encode
@@ -35,12 +36,27 @@ log = logging.getLogger("uvicorn.error")
 MAX_USER_MESSAGE = 64 * 1024
 
 
+def wall_time(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 class CacheMessages:
     """Demo commands only: handoff fills holes, never replaces a local write."""
 
     def __init__(self, data: dict[str, str], name: str):
         self.data, self.name = data, name
         self.flush_ids: set[str] = set()
+        # Every value here was written after `since`: this run's start or the last clear.
+        # `flushed_at` is when the latest flush this node applied was issued. Both are
+        # wall-clock times, which Compose containers share with their host.
+        self.since = time.time()
+        self.flushed_at = 0.0
         self.stats = {"handed_off": 0, "received": 0, "last_flush_id": None, "flushes": 0}
 
     @staticmethod
@@ -48,18 +64,22 @@ class CacheMessages:
         return json.dumps(command, separators=(",", ":"), ensure_ascii=False).encode()
 
     @classmethod
-    def handoff_payload(cls, entries: list, flush_id: str | None = None) -> bytes:
+    def handoff_payload(cls, entries: list, since: float = 0.0) -> bytes:
         # Bound expansion even for values full of JSON control characters.
         return cls.encode(
             {
                 "type": "handoff",
-                "flush_id": flush_id,
+                "since": since,
                 "entries": [[k, b64encode(v.encode()).decode()] for k, v in entries],
             }
         )
 
+    def clear(self) -> None:
+        self.data.clear()
+        self.since = time.time()
+
     async def handoff(self, cluster, ring: Ring, before: tuple, after: tuple) -> None:
-        flush_id = self.stats["last_flush_id"]
+        since = self.since
         moved = ring.moved(tuple(self.data), before, after)
         groups: dict[str, tuple[kinship.Member, list]] = {}
         for key, value in tuple(self.data.items()):
@@ -76,9 +96,9 @@ class CacheMessages:
                 groups.setdefault(owner.name, (owner, []))[1].append([key, value])
 
         async def send(owner, entries):
-            if flush_id != self.stats["last_flush_id"]:
-                return  # A flush invalidated the entries captured by this handoff.
-            payload = self.handoff_payload(entries, flush_id)
+            if since != self.since:
+                return  # A flush or refutation cleared the entries this handoff captured.
+            payload = self.handoff_payload(entries, since)
             try:
                 await cluster.send(owner, payload)
             except kinship.KinshipError as exc:
@@ -100,21 +120,21 @@ class CacheMessages:
         for owner, entries in groups.values():
             batch = []
             for entry in entries:
-                if (
-                    batch
-                    and len(self.handoff_payload([*batch, entry], flush_id)) > MAX_USER_MESSAGE
-                ):
+                if batch and len(self.handoff_payload([*batch, entry], since)) > MAX_USER_MESSAGE:
                     await send(owner, batch)
                     batch = []
                 batch.append(entry)
             if batch:
                 await send(owner, batch)
 
-    def flush(self, flush_id: str) -> None:
+    def flush(self, flush_id: str, at: float | None = None) -> None:
         if flush_id in self.flush_ids:
             return
         self.flush_ids.add(flush_id)
-        self.data.clear()
+        self.clear()
+        # A flush issued "later" than this node's clock could refuse every handoff.
+        at = self.since if at is None else min(at, self.since)
+        self.flushed_at = max(self.flushed_at, at)
         self.stats["last_flush_id"] = flush_id
         self.stats["flushes"] += 1
         log.info("%s applied flush %s", self.name, flush_id)
@@ -129,10 +149,11 @@ class CacheMessages:
         if command.get("type") == "flush" and broadcast:
             flush_id = command.get("id")
             if isinstance(flush_id, str) and 0 < len(flush_id) <= 64:
-                self.flush(flush_id)
+                self.flush(flush_id, wall_time(command.get("at")))
         elif command.get("type") == "handoff" and not broadcast:
-            if command.get("flush_id") != self.stats["last_flush_id"]:
-                return  # A late batch must not refill a cache after it was flushed.
+            since = wall_time(command.get("since"))
+            if since is None or since < self.flushed_at:
+                return  # Values written before a flush must not refill the cache.
             entries = command.get("entries")
             if not isinstance(entries, list):
                 return
@@ -227,7 +248,7 @@ def create_app(name: str | None = None) -> FastAPI:
         # incarnation, so drop everything rather than serve values that may be stale.
         incarnation = app.state.cluster.local.incarnation
         if incarnation != app.state.incarnation:
-            data.clear()
+            messages.clear()
             app.state.incarnation = incarnation
         return data
 
@@ -365,9 +386,10 @@ def create_app(name: str | None = None) -> FastAPI:
     async def flush(request: Request):
         cluster = await get_cluster(request)
         flush_id = uuid4().hex
-        await cluster.broadcast(messages.encode({"type": "flush", "id": flush_id}))
+        at = time.time()
+        await cluster.broadcast(messages.encode({"type": "flush", "id": flush_id, "at": at}))
         # kinship never delivers a node's own broadcast back to it.
-        messages.flush(flush_id)
+        messages.flush(flush_id, at)
         return {"node": name, "flush_id": flush_id}
 
     @app.get("/cache/stats")
