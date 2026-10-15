@@ -62,6 +62,7 @@ crates/kinship-core/src/
   awareness.rs    local health multiplier (LHM)
   broadcast.rs    transmit-limited gossip queue
   sync.rs         push-pull state exchange and merge
+  user.rs         user messages: direct sends, the broadcast queue, copies already seen
   event.rs        Event enum surfaced to drivers
   metrics.rs      counters the driver exports
 ```
@@ -74,7 +75,7 @@ impl Node {
     pub fn handle_datagram(&mut self, now: Instant, from: SocketAddr, buf: &[u8]);
     pub fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>); // Frame(&[u8]) | Closed | Failed
     pub fn handle_timeout(&mut self, now: Instant);
-    pub fn command(&mut self, now: Instant, cmd: Command) -> CommandId; // join, leave, set_meta
+    pub fn command(&mut self, now: Instant, cmd: Command) -> CommandId; // join, leave, set_meta, send, broadcast
 
     pub fn poll_transmit(&mut self) -> Option<Transmit>; // Datagram | Connect | Stream | Close
     pub fn poll_event(&mut self) -> Option<Event>;       // includes CommandDone { id, result }
@@ -249,6 +250,7 @@ Encoding rules the decoder enforces, so that every value has exactly one encodin
 - A payload holds at least one message, count is checked against the bytes left before any message is read, and no bytes may follow the last message. A known message type whose body is too short is an error, not a skip.
 - Booleans are exactly 0 or 1, states are 0 (Alive) to 3 (Left), and an Alive record has 1 <= vmin <= vmax.
 - The epoch appended to Alive, Suspect and Dead in 0.3 is a u64 right after the version 1 fields. Epoch 0, which a node without one has, is not written, so such a node sends exactly the bytes it did before; a body that ends there reads as epoch 0, and one that ends part way into the 8 bytes is too short. Fields appended later follow it.
+- UserMessage and UserBroadcast, from 0.4 (see User messages), write every field, epochs of 0 included, since no node ever sent them without one. Their data is a varint length and the bytes, bounded only by the packet: the core checks it against its own limits, so an oversized message is dropped alone and never fails the packet that carries membership beside it.
 - The whole payload is validated in one allocation-free pass, after which iterating it cannot fail. Postcard and protobuf were rejected: postcard cannot evolve fields, and prost adds allocation and size for little gain on a dozen fixed messages.
 
 | Type | Message | Body fields | Carried on |
@@ -261,7 +263,9 @@ Encoding rules the decoder enforces, so that every value has exactly one encodin
 | 0x06 | Suspect | inc u32, node NodeId, from NodeId, then from 0.3 epoch u64 | gossip |
 | 0x07 | Dead | inc u32, node NodeId, from NodeId, then from 0.3 epoch u64; from = node means Left | gossip |
 | 0x08 | PushPull | join u8, count varint, then count records, each a varint length and a body of state u8 followed by the Alive fields | TCP only |
-| 0x09 to 0x7F | reserved | user broadcasts, compression, future features |  |
+| 0x09 | UserMessage | to NodeId, to_epoch u64, from NodeId, from_epoch u64, data bytes; from 0.4 | UDP, or TCP when it does not fit a datagram |
+| 0x0A | UserBroadcast | from NodeId, from_epoch u64, seq u64, data bytes; from 0.4 | gossip |
+| 0x0B to 0x7F | reserved | compression, future features |  |
 
 NodeId is a UTF-8 name of 1 to 64 bytes, unique within the cluster. Addr is a family byte (4 or 6), the IP, and a u16 port; IPv6 flow info and scope id are not carried. Strings and byte fields carry a varint length. Push-pull records are length-prefixed so that fields appended to Alive in a later version do not break a reader that skips them.
 
@@ -272,6 +276,7 @@ The `meta` field of Alive is opaque to the protocol. The Python tag API stores a
 - A datagram is at most udp_max_payload bytes in total, header and tag included (1,400 by default), which keeps it under a 1,500-byte Ethernet MTU with IPv6 and UDP headers. The probe message goes first, and broadcasts fill the space left; `Message::encoded_len` and `Codec::max_payload_len` let the packer measure without encoding.
 - A TCP frame is a u32 big-endian length followed by one packet of at most max_stream_frame bytes (8 MiB by default, the prefix not counted). Larger push-pull states are refused and counted. The receiving `FrameReader` compares the declared length with the limit as soon as the 4-byte prefix arrives and grows its buffer only as bytes actually arrive, so a peer that announces 8 MiB costs nothing until it sends 8 MiB. A failed frame poisons the reader and the connection is dropped.
 - Metadata is at most max_meta_bytes (512), checked when sealing and again when opening, so a lenient sender cannot push oversized metadata through a strict receiver.
+- The data of a user message is at most max_user_message (64 KiB), and of a user broadcast at most max_user_broadcast (256 bytes), checked by the sender's core and again by the receiver's, which drops a larger one alone and counts it (User messages).
 - Each node advertises the wire versions it speaks (vmin, vmax) in its Alive message. A node sends the highest version every live member speaks, and drops packets with a version above its own vmax.
 - The decoder works on borrowed slices, checks every length against the remaining buffer, never panics, and is fuzzed with cargo-fuzz from the first commit: three targets under `crates/kinship-proto/fuzz` cover datagrams, stream framing and the inner payload, and the differential check that opening a sealed payload agrees with parsing it directly. A fourth, under `crates/kinship-core/fuzz`, feeds arbitrary datagrams and stream frames to a whole node, seeded with traffic captured in the simulator. Keys are 32 bytes in a heap allocation of their own, so moving one copies no key bytes, compared in constant time, zeroized on drop and never printed. They live only in the codec: Node::new moves them out of its config, which keeps an empty key list. The first key in the codec's list seals and any key opens, which the keyring task builds on.
 
@@ -490,8 +495,82 @@ The queue in broadcast.rs holds Alive, Suspect and Dead messages that still need
 
 - set_meta rejects metadata over max_meta_bytes (512) with ValueError, and the config refuses limits under which an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address does not fit a datagram beside the largest Ping, so one Alive always fits with room for a probe. A rumour that still cannot fit any datagram is dropped and counted under gossip_too_large rather than kept forever.
 - A node holds at most max_members (8,192) members, itself and Dead and Left tombstones included, and one datagram or push-pull frame adds at most max_new_members_per_packet (1,024) members it did not know. An Alive or record for a new name beyond either is refused, not gossiped on, and counted under members_refused; members already known keep updating, and a reaped tombstone frees its place. A full table of members with 512 bytes of metadata, 64-byte names and IPv6 addresses is about 5 MB, inside max_stream_frame. A cluster larger than 1,024 members learns the rest of it at later push-pulls and through gossip, 1,024 at a time, unless max_new_members_per_packet is raised to the cluster's size; one larger than 8,192 must raise max_members on every node.
-- Metadata is for small routing facts such as role, zone, version or a load hint. Larger application state belongs in the user's own channel, and user broadcasts are reserved for a future release.
+- Metadata is for small routing facts such as role, zone, version or a load hint. Larger application state belongs in the user's own channel or in user messages, below.
 - Metadata changes appear as MemberUpdated(member, previous_meta). Spread time is O(log n) gossip rounds, and push-pull bounds the worst case at push_pull_interval.
+
+## User messages
+
+From 0.4 applications send data of their own through the cluster: a direct message to one member with `send(member, data)`, or a broadcast to every member with `broadcast(data)`. Both travel in kinship's own packets, sealed with the cluster's key and checked against its replay window, so members need no second channel between them, with its own addresses, ports and credentials, to tell each other small things: a cache key to drop, a job handed over, a request whose answer is another message. Both are best effort. kinship never acknowledges or retries a message; the receiving application hears what arrived as a UserMessage event. Bulk data, and anything that must arrive, belongs on the application's own channel; a message can say where to find it.
+
+In the core these are `Command::Send { to, epoch, data }`, `Command::Broadcast(data)` and `Event::UserMessage { sender, data, broadcast }`, and the messages are UserMessage (0x09) and UserBroadcast (0x0A) in the table under Wire format.
+
+```mermaid
+sequenceDiagram
+    participant A as Node A (sender)
+    participant B as Node B
+    participant C as Node C
+    Note over A: send(B, 300 bytes)
+    A->>B: datagram: UserMessage(to B at its epoch, from A at its epoch)
+    Note over B: for this run of B, from a member B holds: UserMessage event
+    Note over A: send(B, 40 KiB)
+    A->>B: TCP frame: Alive(A), UserMessage(to B, from A)
+    B-->>A: close
+    Note over A: broadcast(data), seq 7
+    A->>C: Ping, membership rumours, then UserBroadcast(A, epoch, 7)
+    Note over C: first copy of (A, epoch, 7): UserMessage event, queued to relay
+    C->>B: gossip: UserBroadcast(A, epoch, 7)
+    A->>B: Ack: UserBroadcast(A, epoch, 7)
+    Note over B: B relays its first copy; the second is ignored
+```
+
+### Direct messages
+
+- A message is for one run of a member: `send(member, data)` takes the member's name and epoch, and the message carries both. The sender refuses it at once, with NotAMember, unless it holds that name as a live member, Alive or Suspect, at that epoch: a name it does not know, one that died or left, its own name, and a run that has since restarted are refused. Epoch 0, or a name alone, means whichever run the sender holds, and the message carries that run's epoch.
+- It goes in one datagram when it fits: the sealed datagram holds about 1,200 bytes of data with 64-byte names at the default udp_max_payload, more with shorter ones. The datagram carries no gossip, so a burst of messages to one member does not spend the retransmissions of every rumour on that member alone. While the sender's own Alive is still being gossiped, after it joined or changed its metadata, the Alive goes ahead of the message in the same datagram.
+- A larger message, up to max_user_message (64 KiB), goes over TCP: a connection to the member's address carrying one frame with the sender's Alive and the message, which the receiver closes once it has handled the frame. A sender keeps at most one such connection per member. Messages for a member whose connection is still open wait and go together in its next frame, so they arrive in order among themselves; the messages waiting, for every member together, hold at most max_stream_frame bytes of data, and one beyond that is dropped and counted under user_queue_overflow. A connection that fails, or that the receiver has not closed within tcp_timeout, counts its messages under user_messages_dropped.
+- The receiver delivers a message whose `to` is its name and whose `to_epoch` is the epoch it runs at, the one it started with, or 0. A message for another name, or for an earlier run of this name, is dropped and counted under user_messages_dropped: a restarted node never delivers what was meant for its previous run, and a recording of a member's message replayed to another member inside the replay window is refused there.
+- The sender must be a member the receiver holds at the message's from_epoch, or either epoch must be 0, as for rumours (Epochs). Any state will do, a tombstone included, so a message sent just before its sender left still arrives; the event carries the sender as the receiver holds it. A message from a name the receiver does not hold, or from another run of it, is dropped and counted. User messages in a packet are handled after its membership messages, so the sender's Alive ahead of a message introduces a sender that is new to the receiver, as a member that joined a moment ago is.
+- Delivery is at most once with encryption: replay protection drops every copy of a datagram or frame after the first. In plaintext mode, which has no replay protection, a datagram the network duplicates is delivered twice. Datagrams can arrive in any order, and a message sent over TCP can overtake or fall behind one sent in a datagram.
+
+### Broadcasts
+
+- `broadcast(data)` numbers the broadcast with seq, a u64 that starts at 1 in each run and goes up by one with every broadcast, and queues it as a UserBroadcast from (name, epoch, seq). A broadcast is at most max_user_broadcast (256 bytes) of data, and the config refuses a limit under which a broadcast that large, from a 64-byte name, does not fit a datagram beside the largest Ping: at the default udp_max_payload, encrypted, the most it can be is 1,108 bytes.
+- Broadcasts spread as membership rumours do, with the same retransmit rule: each node sends each broadcast it holds retransmit_mult × ceil(log10(n + 1)) times, then drops it. They ride on the same packets, every Ping, Ack and PingReq and the dedicated gossip packets, but only to members the node holds live, and only sends to those count. Membership always wins: a datagram is packed with its probe message first, then membership rumours, then broadcasts in the room that is left, so broadcasts never delay a rumour or a refutation, and while membership news fills the packets, broadcasts wait. A node with only broadcasts queued still sends its gossip packets to live members.
+- User broadcasts have a queue of their own, at most user_broadcast_queue (256) entries: the node's own broadcasts and those it relays. Packets take entries with the fewest sends first and, among those, the oldest first, so one member's broadcasts mostly leave in the order it made them. When the queue is full, the entry nearest to done is dropped, the most sent and among those the newest, which is the one being queued when none has been sent yet, and counted under user_queue_overflow; memory stays at the queue's size, whatever the rate. Gossip bandwidth is the limit: a node sends about fifteen gossip datagrams a second when it has news, so a cluster spreads only a handful of full-size broadcasts a second, and bursts beyond that show up as overflow.
+- The first copy of a broadcast a node receives is delivered as a UserMessage event with `broadcast` true, and queued to relay with its full count of sends. Copies are recognised by (sender, epoch, seq): for each member the node keeps the highest seq it has seen from the run it holds and which of the 256 below it it has seen. A copy of one already seen is ignored. One more than 256 below the highest is dropped and counted, since the node can no longer tell, which takes a member making more than 256 broadcasts while one of them is still on its way. A node's own broadcasts coming back are ignored. The state is 48 bytes per member that has broadcast, freed when the member's tombstone is reaped, and starts over when the member starts a new run.
+- A broadcast from a sender the node does not hold at its epoch is neither delivered nor relayed nor remembered, and is counted under user_messages_dropped; a later copy, arriving after the sender's Alive, is delivered then. A broadcast over the node's own max_user_broadcast is dropped, not relayed, and counted under user_messages_too_large, so every node of a cluster should have the same limits.
+- A broadcast is delivered at most once on each node, and is not delivered to the node that made it. It reaches the members that are up while it spreads with the probability a rumour does, 99.8% of them in the simulator's sweep of 5 to 16 nodes under up to 2% loss, and 99.4% in its five-node clusters with one node on 0.3. Nothing repairs a miss, since push-pull carries membership only: a member none of the others happened to pick, one that joins afterwards, and one cut off while it spreads never see it. There is no order between broadcasts, nor between broadcasts and direct messages.
+
+### Events, errors and counters
+
+UserMessage events go through the same per-subscription queue as membership events, event_buffer deep, and are dropped with them, oldest first, when a consumer falls behind, so EventsLost(n) counts lost messages too and its meaning is unchanged. A message that arrives is never a callback: the protocol thread only queues the event, and Python reads it from events() as any other.
+
+send() and broadcast() return once the message is queued in the node, and fail with MessageTooLarge over their limit, with NotAMember for a recipient that is not a live member at that epoch, and after leave() as set_meta does. Five counters in Stats account for the rest:
+
+| Counter | Counts |
+| --- | --- |
+| user_messages_sent | Direct messages written to a datagram or a stream, and broadcasts this node started |
+| user_messages_received | Messages delivered to the application, direct and broadcast |
+| user_messages_dropped | Messages that arrived for another name or run, or from a sender this node does not hold at that epoch, broadcasts too far behind to tell from copies, and direct messages whose connection failed |
+| user_messages_too_large | Sends refused over max_user_message or max_user_broadcast, and messages received over them |
+| user_queue_overflow | Broadcasts dropped from a full queue, and direct messages dropped while max_stream_frame bytes waited for connections |
+
+### Security
+
+- Encryption and replay: user messages are sealed, authenticated and replay-checked with the packet that carries them, like everything else, and a frame or datagram that fails any check delivers nothing. A stale request frame, which a node answers with its own record only (Wire format), delivers none of its messages.
+- Messages are authenticated to the cluster, not to their sender, which is KI-01 territory (SECURITY.md): a member holding the key can send messages and broadcasts in any member's name, to any member, can make nodes relay junk broadcasts until their queues overflow, and, with a broadcast numbered far ahead of a member's own, can make nodes take that member's next broadcasts for old copies until its numbers catch up or it restarts.
+- Plaintext nodes send only to members' addresses (KS-04): a direct message goes to the address the sender holds for the member, TCP included, broadcasts ride only on datagrams to members, and receiving a user message never makes a node send anything back, so a forged message cannot aim a node at a third party. Without encryption anyone who can reach the port can forge messages, and a forged broadcast is relayed to every member.
+- Every buffer is bounded (KI-04): the broadcast queue by user_broadcast_queue entries of at most max_user_broadcast, the direct messages waiting for a connection by max_stream_frame bytes, the seen-state by one entry per member in the table, and events by event_buffer.
+
+### Nodes older than 0.4
+
+The wire version stays 1, and no existing message changes, so a 0.4 node that sends no user messages sends the bytes 0.3 does. A 0.3 node treats the new messages as it treats any type it does not know:
+
+- In a datagram it skips both types by their length, without counting a decode error or anything else, and handles the rest of the packet as before, so the probe and the rumours beside a broadcast still reach it.
+- A frame with user messages on a connection it accepted holds no PushPull or Ping, the only messages a 0.3 node answers there, so it closes the connection and has counted one packet received. The sender reads the close as the end of the exchange, as it does from a 0.4 node, and cannot tell that nothing was delivered: send() to a member on 0.3 succeeds, and its message is lost.
+- It neither delivers nor relays broadcasts, and the copies sent to it count among the sender's sends to live members. In a cluster where some nodes are still on 0.3, broadcasts reach the 0.4 nodes less surely, the more of them are on 0.3; once every node runs 0.4 nothing is lost to them.
+
+The simulator runs the released kinship-core 0.3.0 beside 0.4 nodes to hold kinship to this: `usermsg::a_0_3_node_in_the_cluster_skips_user_messages`.
 
 ## Configuration surface
 
@@ -570,10 +649,13 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 | join_retries | 3 | attempts per seed, with exponential backoff from probe_interval |
 | max_members | 8,192 | members a node holds, itself and tombstones included; Alives for new names are refused beyond it |
 | max_new_members_per_packet | 1,024 | members new to a node that one datagram or push-pull frame can add |
+| max_user_message | 64 KiB | data in one direct message; one too large for a datagram goes over TCP, so it must fit one max_stream_frame frame |
+| max_user_broadcast | 256 bytes | data in one broadcast; must fit a datagram beside the largest Ping, at most 1,108 bytes encrypted with the default datagram |
+| user_broadcast_queue | 256 | broadcasts a node holds to send, its own and those it relays; beyond it the one nearest to done is dropped |
 | event_buffer | 1,024 | events held for Python before the oldest drop |
 | runtime_threads | 1 | tokio worker threads, set once per process |
 
-Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. Invalid combinations fail construction with the field names in the message.
+Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. A direct message of max_user_message bytes between 64-byte names must fit one max_stream_frame frame, naming max_stream_frame when it is below its default and max_user_message otherwise; a broadcast of max_user_broadcast bytes from a 64-byte name must fit a datagram beside the largest Ping, naming max_user_broadcast; and user_broadcast_queue must be at least 1. Invalid combinations fail construction with the field names in the message.
 
 ## Failure modes
 
@@ -598,6 +680,7 @@ kinship gives eventually consistent membership, not agreement: two nodes can dis
 | Partial stream frames or a connection flood from a peer without the key | Inbound connections share a budget of twice max_stream_frame, and those from one address a share of one frame; a read past the address's share drops its connection, and one past the budget evicts a partial frame of the address holding the most. One address keeps at most 16 connections, and a new one when all 64 are taken displaces the address with the most. A connection that does not start with a header for this node within a second is dropped | kinship-net `streams::inbound_connections_share_a_bounded_buffer`, `streams::a_peer_that_fills_the_inbound_budget_cannot_refuse_a_real_join`, `streams::inbound_connections_are_capped_per_address_then_taken_from_the_address_with_the_most`, `streams::a_connection_must_start_with_a_header_for_this_node` and `conn::tests::an_address_holds_at_most_its_share_and_room_comes_from_the_address_holding_the_most` |
 | Wall clock jumps (NTP, suspend) | Only monotonic time is used; a suspend looks like a long pause and is absorbed by LHM and refutation | kinship-sim `failure::a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds`, a jump alone or after a suspend; the `clippy.toml` of kinship-core, which reads no clock, and of kinship-net reject std::time::SystemTime and std::time::Instant::now, but for kinship-net's one read of the wall clock, which picks the epoch at start and times nothing |
 | Oversized metadata or member table | set_meta raises ValueError; limits under which a full Alive does not fit a datagram beside a Ping are refused at construction; a rumour that fits no datagram is dropped and counted; push-pull frames over max_stream_frame are refused and counted; new members beyond max_members, or beyond max_new_members_per_packet in one packet, are refused and counted, and the broadcast queue's member index keeps a bulk merge O(n log n) | kinship-core `open_findings::ki04_one_push_pull_floods_the_member_table`, 20,000 invented members in one frame, and 20,000 admitted in milliseconds when configured; `tests::one_datagram_admits_at_most_its_share_of_new_members`, `tests::the_table_holds_at_most_max_members_this_node_and_tombstones_included`, `sync::tests::one_push_pull_frame_shares_one_admission_budget`, `config::tests::member_limits_default_and_must_be_positive` and the `broadcast::tests` of the queue's order, replacement, packing and live-only sends; kinship-core `tests::new_rejects_invalid_config_and_meta`, `config::tests::the_largest_alive_must_fit_a_datagram_beside_a_ping`, `broadcast::tests::a_rumour_too_large_for_any_datagram_is_dropped_and_counted`, `sync::tests::state_too_large_for_a_frame_is_refused` and `sync::tests::oversized_frames_are_dropped_before_they_are_copied`; kinship-sim `review::kp03_a_member_with_full_metadata_survives_a_pause`, at the smallest datagram accepted; kinship-net `streams::an_oversized_frame_is_refused_from_its_length_prefix`; `test_cluster.py::test_metadata_set_update_and_limits` and `test_config.py::test_bad_fields_raise_config_error_naming_the_field` |
+| A user message that cannot arrive: too large, for a run that restarted, from a sender the receiver does not hold, lost, or to a node older than 0.4 | The sender refuses data over its limits and a recipient that is not a live member at that epoch. A receiver drops a message over its own limits, for another name or run, or from a sender it does not hold, alone, and counts it. A lost datagram or broadcast copy is not retried, so a broadcast misses a member now and then. A 0.3 node skips both types without a decode error, and membership goes on as before | kinship-sim `usermsg::messages_reach_their_members_once`, `usermsg::oversized_messages_are_refused_by_the_sender_and_dropped_by_a_stricter_receiver`, `usermsg::a_message_for_an_earlier_run_is_dropped_by_the_new_one`, `usermsg::a_0_3_node_in_the_cluster_skips_user_messages`, beside the released kinship-core 0.3.0, and `usermsg::user_messages_thousand_seeds`; kinship-core `user::tests`; kinship `messages::members_send_small_and_large_messages_and_broadcasts` and `messages::sends_to_strangers_old_runs_and_oversized_data_are_refused`; `test_messages.py`; cargo-fuzz `decode_payload` and `node_input` |
 | Actor panic | The panic is caught, the node moves to closed, pending and later calls fail with Closed (KinshipClosed in Python), and the events iterator ends with that error | kinship-net `tests::an_actor_panic_fails_pending_and_later_calls_and_marks_events_failed`, through a hook behind the hidden test-hooks feature; `test_panic.py::test_an_actor_panic_ends_the_event_iterator_with_kinship_closed`, run in CI against a second wheel built with that feature, never the release one |
 | os.fork after start | The child raises on first use instead of hanging on a dead runtime | `test_blocking.py::test_a_forked_child_raises_instead_of_hanging` and `test_a_forked_child_can_start_its_own_cluster` |
 
@@ -613,7 +696,7 @@ The open questions were settled on 2026-10-04 by the [README and API review](htt
 - Node identity: a user-chosen name, defaulting to hostname plus 6 hex characters.
 - AEAD: XChaCha20-Poly1305 only; the version byte leaves room for another.
 - `tcp_fallback_ping`: on in `lan()` and `wan()`, off in `local()`.
-- User broadcasts and compression: a future release; message types 0x09 to 0x7F stay reserved.
+- User broadcasts and compression: a future release; message types 0x09 to 0x7F stay reserved. User messages and broadcasts arrived in 0.4 as types 0x09 and 0x0A (User messages); compression is still to come, and 0x0B to 0x7F stay reserved.
 - MSRV: Rust 1.85 (edition 2024). Free-threaded wheels for CPython 3.14t only, no 3.13t.
 - Windows: supported in 0.1, wheels and CI included.
 

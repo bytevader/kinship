@@ -4,9 +4,12 @@ use core::fmt;
 use core::net::{Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
-use kinship_proto::{Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, Ping};
+use kinship_proto::{
+    Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, PacketKind, Ping, UserBroadcast,
+    UserMessage,
+};
 
-use crate::broadcast::{datagram_room, id};
+use crate::broadcast::{COUNT_LEN, datagram_room, id};
 
 /// How packets are protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,20 @@ pub struct Config {
     /// Most members new to this node that one datagram or one push-pull frame can add, shared
     /// by every Alive and record in it.
     pub max_new_members_per_packet: usize,
+    /// Most data in one direct user message. One that does not fit a datagram goes over TCP,
+    /// so this must fit a `max_stream_frame` frame.
+    pub max_user_message: usize,
+    /// Most data in one user broadcast, which must fit a datagram beside the largest Ping.
+    pub max_user_broadcast: usize,
+    /// Most user broadcasts a node holds to send, its own and those it relays; beyond it the
+    /// one nearest to done is dropped and counted.
+    pub user_broadcast_queue: usize,
+}
+
+impl Config {
+    pub const DEFAULT_MAX_USER_MESSAGE: usize = 64 * 1024;
+    pub const DEFAULT_MAX_USER_BROADCAST: usize = 256;
+    pub const DEFAULT_USER_BROADCAST_QUEUE: usize = 256;
 }
 
 impl Config {
@@ -103,6 +120,9 @@ impl Config {
             join_retries: 3,
             max_members: 8_192,
             max_new_members_per_packet: 1_024,
+            max_user_message: Self::DEFAULT_MAX_USER_MESSAGE,
+            max_user_broadcast: Self::DEFAULT_MAX_USER_BROADCAST,
+            user_broadcast_queue: Self::DEFAULT_USER_BROADCAST_QUEUE,
         }
     }
 
@@ -188,6 +208,9 @@ impl Config {
         if self.max_new_members_per_packet == 0 {
             return fail("max_new_members_per_packet", "must be positive");
         }
+        if self.user_broadcast_queue == 0 {
+            return fail("user_broadcast_queue", "must be at least 1");
+        }
         let Ok(codec) = self.measuring_codec() else {
             return fail("limits", "too small to hold the packet overhead");
         };
@@ -205,6 +228,22 @@ impl Config {
                     "max_meta_bytes",
                     "must leave an Alive that fits a udp_max_payload datagram beside a Ping",
                 )
+            };
+        }
+        if largest_ping() + largest_broadcast(self.max_user_broadcast, room) > room {
+            return fail(
+                "max_user_broadcast",
+                "must fit a udp_max_payload datagram beside the largest Ping",
+            );
+        }
+        let frame = codec
+            .max_payload_len(PacketKind::Stream)
+            .saturating_sub(COUNT_LEN);
+        if largest_user_message(self.max_user_message, frame) > frame {
+            return if self.limits.max_stream_frame < Limits::DEFAULT_MAX_STREAM_FRAME {
+                fail("max_stream_frame", "must fit a max_user_message message")
+            } else {
+                fail("max_user_message", "must fit a max_stream_frame frame")
             };
         }
         Ok(())
@@ -234,26 +273,70 @@ impl Config {
 /// Encoded size of the largest Ping and the largest Alive a node can hold: 64-byte names, an
 /// IPv6 address, an epoch and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
 fn largest_probe_and_alive(max_meta: usize, cap: usize) -> usize {
-    let name = "n".repeat(NodeId::MAX_LEN);
-    let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
-    // Metadata past the whole datagram can only fail too, and is not worth allocating.
-    let meta = vec![0; max_meta.min(cap.saturating_add(1))];
-    let ping = Message::Ping(Ping {
+    largest_ping() + largest_alive(max_meta, cap)
+}
+
+/// A name as long as names go.
+fn longest_name() -> String {
+    "n".repeat(NodeId::MAX_LEN)
+}
+
+/// Encoded size of the largest Ping: 64-byte names and an IPv6 address.
+fn largest_ping() -> usize {
+    let name = longest_name();
+    Message::Ping(Ping {
         seq: u32::MAX,
         target: id(&name),
         source: id(&name),
-        source_addr: addr,
-    });
-    let alive = Message::Alive(Alive {
+        source_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    })
+    .encoded_len()
+}
+
+/// Encoded size of the largest Alive a node can hold, its metadata counted up to `cap` bytes.
+fn largest_alive(max_meta: usize, cap: usize) -> usize {
+    let name = longest_name();
+    // Metadata past the whole packet can only fail too, and is not worth allocating.
+    let meta = vec![0; max_meta.min(cap.saturating_add(1))];
+    Message::Alive(Alive {
         inc: u32::MAX,
         node: id(&name),
-        addr,
+        addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         meta: &meta,
         vmin: u8::MAX,
         vmax: u8::MAX,
         epoch: u64::MAX,
-    });
-    ping.encoded_len() + alive.encoded_len()
+    })
+    .encoded_len()
+}
+
+/// Encoded size of the largest user broadcast: a 64-byte name and `max_data` bytes of data,
+/// counted up to `cap` bytes of it.
+fn largest_broadcast(max_data: usize, cap: usize) -> usize {
+    let name = longest_name();
+    let data = vec![0; max_data.min(cap.saturating_add(1))];
+    Message::UserBroadcast(UserBroadcast {
+        from: id(&name),
+        from_epoch: u64::MAX,
+        seq: u64::MAX,
+        data: &data,
+    })
+    .encoded_len()
+}
+
+/// Encoded size of the largest direct user message: 64-byte names and `max_data` bytes of
+/// data, counted up to `cap` bytes of it.
+fn largest_user_message(max_data: usize, cap: usize) -> usize {
+    let name = longest_name();
+    let data = vec![0; max_data.min(cap.saturating_add(1))];
+    Message::UserMessage(UserMessage {
+        to: id(&name),
+        to_epoch: u64::MAX,
+        from: id(&name),
+        from_epoch: u64::MAX,
+        data: &data,
+    })
+    .encoded_len()
 }
 
 /// A [`Config`] or [`Identity`](crate::Identity) field holds an unusable value.
@@ -370,5 +453,54 @@ mod tests {
         assert_eq!(cfg.validate(), Ok(()));
         cfg.limits.udp_max_payload = 784;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
+    }
+
+    #[test]
+    fn user_message_limits_default_and_must_fit_their_packets() {
+        let key = Security::Keys(vec![Key::from_bytes([1; 32])]);
+        for cfg in [
+            Config::lan(key.clone()),
+            Config::wan(key.clone()),
+            Config::local(Security::InsecurePlaintext),
+        ] {
+            assert_eq!(
+                (
+                    cfg.max_user_message,
+                    cfg.max_user_broadcast,
+                    cfg.user_broadcast_queue
+                ),
+                (65_536, 256, 256)
+            );
+        }
+        // A broadcast from a 64-byte name is 86 bytes besides its data, and must fit beside
+        // the largest Ping, 156: 1,350 - 156 - 86 = 1,108 with the default datagram.
+        let mut cfg = Config::lan(key.clone());
+        cfg.max_user_broadcast = 1_108;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.max_user_broadcast = 1_109;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_user_broadcast");
+        // Even at the smallest datagram accepted, the default fits.
+        let mut cfg = Config::lan(key.clone());
+        cfg.limits.udp_max_payload = 821;
+        assert_eq!(cfg.validate(), Ok(()));
+        // A direct message must fit a frame, 48 bytes of it for the seal, 2 for the count and
+        // 155 for the message besides its data; the limit moved from its default is named.
+        let mut cfg = Config::lan(key.clone());
+        cfg.max_user_message = cfg.limits.max_stream_frame - 48 - 2 - 155;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.max_user_message += 1;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_user_message");
+        let mut cfg = Config::lan(key.clone());
+        cfg.limits.max_stream_frame = 64 * 1024;
+        assert_eq!(cfg.validate().unwrap_err().field, "max_stream_frame");
+        cfg.max_user_message = 32 * 1024;
+        assert_eq!(cfg.validate(), Ok(()));
+        let mut cfg = Config::lan(key);
+        cfg.user_broadcast_queue = 0;
+        assert_eq!(cfg.validate().unwrap_err().field, "user_broadcast_queue");
+        cfg.user_broadcast_queue = 1;
+        cfg.max_user_message = 0;
+        cfg.max_user_broadcast = 0;
+        assert_eq!(cfg.validate(), Ok(()), "empty messages only");
     }
 }

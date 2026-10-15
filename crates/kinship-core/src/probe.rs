@@ -105,6 +105,7 @@ impl Node {
         // A tombstone outlives the replay window, so no recording can bring its member back.
         let keep = self.cfg.dead_reclaim.max(self.replay.window());
         self.table.reap(now, keep);
+        self.forget_reaped_senders();
         self.next_probe = now + self.probe_interval();
         self.start_probe(now);
     }

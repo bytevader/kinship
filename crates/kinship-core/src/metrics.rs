@@ -54,4 +54,20 @@ pub struct Metrics {
     pub tcp_pings: u64,
     /// Probe rounds saved by a TCP Ack: UDP to that member is failing while TCP works.
     pub tcp_ping_acks: u64,
+    /// Direct user messages written to a datagram or a connection, and broadcasts this node
+    /// started.
+    pub user_messages_sent: u64,
+    /// User messages delivered to the application, direct and broadcast.
+    pub user_messages_received: u64,
+    /// User messages that arrived for another name or an earlier life of this node, or from a
+    /// sender this node does not hold at that life; broadcasts too far behind their sender's
+    /// latest to tell from copies; and direct messages whose connection failed or that waited
+    /// for a member no longer held live.
+    pub user_messages_dropped: u64,
+    /// Sends refused for data over `max_user_message` or `max_user_broadcast`, and user
+    /// messages received over them, which are dropped alone.
+    pub user_messages_too_large: u64,
+    /// Broadcasts dropped from a full queue, `user_broadcast_queue` long, and direct messages
+    /// dropped while `max_stream_frame` bytes already waited for connections.
+    pub user_queue_overflow: u64,
 }

@@ -20,9 +20,16 @@ from types import TracebackType
 from typing import Self
 
 from kinship import _kinship
-from kinship._cluster import LEAVE_TIMEOUT, _Base, _seconds, _seed_list, _warn_leave_timeout
+from kinship._cluster import (
+    LEAVE_TIMEOUT,
+    _Base,
+    _recipient,
+    _seconds,
+    _seed_list,
+    _warn_leave_timeout,
+)
 from kinship._errors import KinshipClosed
-from kinship._types import Event, _event
+from kinship._types import Event, Member, _event
 
 __all__ = ["Cluster", "EventStream", "Keyring"]
 
@@ -137,6 +144,15 @@ class Cluster(_Base):
     def update_meta(self, *, timeout: Timeout = None, **changes: str | None) -> None:
         """Changes some metadata keys; a value of ``None`` deletes the key."""
         self._running.update_meta_blocking(changes, _seconds(timeout))
+
+    def send(self, member: Member | str, data: bytes, *, timeout: Timeout = None) -> None:
+        """Sends ``data`` to ``member``; see ``kinship.Cluster.send``."""
+        name, epoch = _recipient(member)
+        self._running.send_blocking(name, epoch, data, _seconds(timeout))
+
+    def broadcast(self, data: bytes, *, timeout: Timeout = None) -> None:
+        """Gossips ``data`` to every member; see ``kinship.Cluster.broadcast``."""
+        self._running.broadcast_blocking(data, _seconds(timeout))
 
     def leave(self, timeout: float | timedelta = LEAVE_TIMEOUT) -> None:
         """Tells the cluster this node is leaving and waits up to ``timeout`` for the news to

@@ -11,6 +11,7 @@ _RawEvent = tuple[
     list[tuple[str, str]] | None,
     str | None,
     int | None,
+    tuple[bytes, bool] | None,
 ]
 _Duration = float | timedelta
 
@@ -80,6 +81,10 @@ class Config:
     join_retries: int
     max_members: int
     max_new_members_per_packet: int
+    # User messages: data in bytes, and broadcasts a node holds to send
+    max_user_message: int
+    max_user_broadcast: int
+    user_broadcast_queue: int
     event_buffer: int
     runtime_threads: int
 
@@ -105,6 +110,12 @@ class Node:
     def update_meta_blocking(
         self, changes: Mapping[str, str | None], timeout: float | None = None
     ) -> None: ...
+    def send(self, name: str, epoch: int, data: bytes | bytearray) -> Awaitable[None]: ...
+    def send_blocking(
+        self, name: str, epoch: int, data: bytes | bytearray, timeout: float | None = None
+    ) -> None: ...
+    def broadcast(self, data: bytes | bytearray) -> Awaitable[None]: ...
+    def broadcast_blocking(self, data: bytes | bytearray, timeout: float | None = None) -> None: ...
     def leave(self, timeout: float) -> Awaitable[bool]: ...
     def leave_blocking(self, timeout: float) -> bool: ...
     def close(self) -> Awaitable[None]: ...

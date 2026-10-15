@@ -3,6 +3,7 @@
 //! Every method comes in an async form, which returns an asyncio awaitable, and a blocking form
 //! with a `_blocking` suffix, which waits with the GIL released. Reads never wait on the node.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use kinship_net::{Error, Event, Events, Key, Member, Memberlist, Seed, State, To
 use kinship_proto::tags::{Tags, TagsError, encode_tags};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyDict, PyString};
 
 use crate::config::{self, Config};
@@ -20,13 +22,15 @@ use crate::runtime::{self, awaitable, block_on, check_pid, seconds};
 /// suspect, dead and left, and `meta` as `(key, value)` pairs.
 type RawMember = (String, String, u8, u32, Vec<(String, String)>, u64);
 
-/// An event as `(kind, member, previous_meta, other_addr, count)`.
+/// An event as `(kind, member, previous_meta, other_addr, count, message)`, where `message`
+/// is a user message's `(data, broadcast)` and `member` its sender.
 type RawEvent = (
     &'static str,
     Option<RawMember>,
     Option<Vec<(String, String)>>,
     Option<String>,
     Option<u64>,
+    Option<(Cow<'static, [u8]>, bool)>,
 );
 
 /// Metadata as tag pairs. Raw metadata that is not a tag list, from a Rust node that set
@@ -59,7 +63,7 @@ fn raw_member(m: Member) -> RawMember {
 }
 
 fn raw_event(e: Event) -> RawEvent {
-    let member = |kind, m| (kind, Some(raw_member(m)), None, None, None);
+    let member = |kind, m| (kind, Some(raw_member(m)), None, None, None, None);
     match e {
         Event::MemberJoined(m) => member("MemberJoined", m),
         Event::MemberSuspect(m) => member("MemberSuspect", m),
@@ -75,6 +79,7 @@ fn raw_event(e: Event) -> RawEvent {
             Some(meta_pairs(&previous_meta)),
             None,
             None,
+            None,
         ),
         Event::NameConflict { member, other_addr } => (
             "NameConflict",
@@ -82,10 +87,23 @@ fn raw_event(e: Event) -> RawEvent {
             None,
             Some(other_addr.to_string()),
             None,
+            None,
         ),
-        Event::EventsLost(n) => ("EventsLost", None, None, None, Some(n)),
+        Event::UserMessage {
+            sender,
+            data,
+            broadcast,
+        } => (
+            "UserMessage",
+            Some(raw_member(sender)),
+            None,
+            None,
+            None,
+            Some((Cow::Owned(data), broadcast)),
+        ),
+        Event::EventsLost(n) => ("EventsLost", None, None, None, Some(n), None),
         // A kind this binding does not know yet: report it as a loss so callers resync.
-        _ => ("EventsLost", None, None, None, Some(1)),
+        _ => ("EventsLost", None, None, None, Some(1), None),
     }
 }
 
@@ -134,6 +152,14 @@ impl Inner {
         }
         let meta = self.encode(&pairs)?;
         Ok(self.ml.set_meta(meta).await?)
+    }
+
+    async fn send(&self, name: String, epoch: u64, data: Vec<u8>) -> Result<(), KError> {
+        Ok(self.ml.send(name, epoch, data).await?)
+    }
+
+    async fn broadcast(&self, data: Vec<u8>) -> Result<(), KError> {
+        Ok(self.ml.broadcast(data).await?)
     }
 
     /// Leaves, waiting up to `timeout`; `true` if it ran out of time. Leaving twice is fine.
@@ -383,6 +409,11 @@ impl Node {
             ("gossip_too_large", m.gossip_too_large),
             ("tcp_pings", m.tcp_pings),
             ("tcp_ping_acks", m.tcp_ping_acks),
+            ("user_messages_sent", m.user_messages_sent),
+            ("user_messages_received", m.user_messages_received),
+            ("user_messages_dropped", m.user_messages_dropped),
+            ("user_messages_too_large", m.user_messages_too_large),
+            ("user_queue_overflow", m.user_queue_overflow),
         ] {
             d.set_item(k, v)?;
         }
@@ -443,6 +474,57 @@ impl Node {
         let inner = self.get(py)?;
         let r = self::timeout(timeout)
             .and_then(|t| block_on(py, t, async move { inner.update_meta(changes).await }));
+        finish(py, r)
+    }
+
+    /// Sends `data` to the member `name` at its life `epoch`, or whichever life this node holds
+    /// with 0. Resolves once it is on its way.
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        epoch: u64,
+        data: PyBackedBytes,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let data = data.to_vec();
+        let inner = self.get(py)?;
+        awaitable(py, async move { inner.send(name, epoch, data).await })
+    }
+
+    #[pyo3(signature = (name, epoch, data, timeout=None))]
+    fn send_blocking(
+        &self,
+        py: Python<'_>,
+        name: String,
+        epoch: u64,
+        data: PyBackedBytes,
+        timeout: Option<f64>,
+    ) -> PyResult<()> {
+        let data = data.to_vec();
+        let inner = self.get(py)?;
+        let r = self::timeout(timeout)
+            .and_then(|t| block_on(py, t, async move { inner.send(name, epoch, data).await }));
+        finish(py, r)
+    }
+
+    /// Queues `data` to be gossiped to every member. Resolves once it is queued.
+    fn broadcast<'py>(&self, py: Python<'py>, data: PyBackedBytes) -> PyResult<Bound<'py, PyAny>> {
+        let data = data.to_vec();
+        let inner = self.get(py)?;
+        awaitable(py, async move { inner.broadcast(data).await })
+    }
+
+    #[pyo3(signature = (data, timeout=None))]
+    fn broadcast_blocking(
+        &self,
+        py: Python<'_>,
+        data: PyBackedBytes,
+        timeout: Option<f64>,
+    ) -> PyResult<()> {
+        let data = data.to_vec();
+        let inner = self.get(py)?;
+        let r = self::timeout(timeout)
+            .and_then(|t| block_on(py, t, async move { inner.broadcast(data).await }));
         finish(py, r)
     }
 

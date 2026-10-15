@@ -23,7 +23,7 @@ pub use error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 pub use limits::Limits;
 pub use message::{
     Alive, Dead, Message, Messages, NodeId, Payload, Ping, PingReq, PushPull, Record, RecordIter,
-    Records, State, Suspect, kind,
+    Records, State, Suspect, UserBroadcast, UserMessage, kind,
 };
 pub use packet::{
     Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, HeaderCheck, Key, KeyId, MAGIC, MAX_LABEL_LEN,

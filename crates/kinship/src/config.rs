@@ -306,6 +306,15 @@ impl Config {
         with_max_members => max_members: usize;
         /// Most new members one datagram or push-pull frame can add (1,024).
         with_max_new_members_per_packet => max_new_members_per_packet: usize;
+        /// Most data in one direct user message (64 KiB). One too large for a datagram goes
+        /// over TCP, so it must fit a `max_stream_frame` frame.
+        with_max_user_message => max_user_message: usize;
+        /// Most data in one user broadcast (256 bytes), which must fit a datagram beside the
+        /// largest Ping.
+        with_max_user_broadcast => max_user_broadcast: usize;
+        /// Broadcasts a node holds to send, its own and those it relays (256); beyond it the
+        /// one nearest to done is dropped and counted.
+        with_user_broadcast_queue => user_broadcast_queue: usize;
         /// Largest datagram sent, header and tag included. Must fit an Alive with
         /// `max_meta_bytes` of metadata beside a Ping: 813 bytes encrypted with the default 512.
         with_udp_max_payload => limits.udp_max_payload: usize;
@@ -426,6 +435,12 @@ mod tests {
         assert_eq!(cfg.build().unwrap_err().field, "max_members");
         let cfg = Config::local().with_max_new_members_per_packet(0);
         assert_eq!(cfg.build().unwrap_err().field, "max_new_members_per_packet");
+        let cfg = Config::local().with_max_user_broadcast(2_000);
+        assert_eq!(cfg.build().unwrap_err().field, "max_user_broadcast");
+        let cfg = Config::local().with_max_user_message(64 << 20);
+        assert_eq!(cfg.build().unwrap_err().field, "max_user_message");
+        let cfg = Config::local().with_user_broadcast_queue(0);
+        assert_eq!(cfg.build().unwrap_err().field, "user_broadcast_queue");
     }
 
     #[test]

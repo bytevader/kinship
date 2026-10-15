@@ -124,8 +124,10 @@ async with kinship.Cluster(cfg) as cluster:   # binds, then joins cfg.seeds
 | `cluster.events()` | `EventStream` | A new async iterator of events; see below. |
 | `await cluster.set_meta(meta)` | `None` | Replace this node's metadata and gossip it. |
 | `await cluster.update_meta(**changes)` | `None` | Change some metadata keys; a value of `None` deletes the key. |
+| `await cluster.send(member, data)` | `None` | Send bytes to one member; see Messages. |
+| `await cluster.broadcast(data)` | `None` | Send bytes to every other member; see Messages. |
 | `cluster.keyring` | `Keyring` | Runtime key rotation on this node; see Encryption. |
-| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, restarts seen, `decrypt_failures`, `decode_errors`, `replays_dropped`. |
+| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, restarts seen, `decrypt_failures`, `decode_errors`, `replays_dropped`, and the user messages sent, received and dropped. |
 | `await cluster.leave(timeout=5.0)` | `None` | Tell the cluster this node is leaving and wait for it to spread. |
 | `await cluster.close()` | `None` | Stop the node and close sockets. Without `leave()` first, peers see a crash. |
 
@@ -157,6 +159,8 @@ async for event in cluster.events():
             ring.remove(m)
         case kinship.MemberUpdated(member=m, previous_meta=old):
             ring.update(m)
+        case kinship.UserMessage(sender=m, data=data):
+            await handle(m, data)
         case kinship.EventsLost(count=n):
             ring.rebuild(cluster.members())
 ```
@@ -170,6 +174,7 @@ async for event in cluster.events():
 | `MemberLeft` | `member` | A node left on purpose, or restarted: its old run left, and `MemberJoined` follows with the new `epoch` |
 | `MemberUpdated` | `member`, `previous_meta` | A node changed its metadata |
 | `NameConflict` | `member`, `other_addr` | Two nodes claim the same name, a live one or one that recently died or left; the one at `other_addr` is ignored |
+| `UserMessage` | `sender`, `data`, `broadcast` | Another member sent this node `data`, or sent it to every member if `broadcast`; see Messages |
 | `EventsLost` | `count` | Your consumer fell behind and `count` events were dropped |
 
 Events never describe the local node, except `NameConflict`. Each call to `events()` is an independent subscription that starts at the moment of the call, not at the first `await`, so nothing is missed between `events()` and the loop. Every subscription buffers up to `event_buffer` events (1,024). When a slow consumer fills it, kinship drops the oldest events and your next read is `EventsLost(n)`; call `cluster.members()` and resync. The protocol never waits for you.
@@ -188,7 +193,40 @@ await cluster.set_meta({"role": "cache"})        # replace
 zone = cluster.member("cache-03").meta["zone"]  # read anyone's
 ```
 
-Encoded tags must fit in 512 bytes; a larger value raises `kinship.MetaTooLarge`, a `ValueError`. A change reaches every node in a few gossip rounds, under a second on `lan()` at 100 nodes, and other nodes see it as `MemberUpdated`. Ten quick updates cost one broadcast, because only the newest value is gossiped. Larger application state belongs in your own channel; use metadata to find it.
+Encoded tags must fit in 512 bytes; a larger value raises `kinship.MetaTooLarge`, a `ValueError`. A change reaches every node in a few gossip rounds, under a second on `lan()` at 100 nodes, and other nodes see it as `MemberUpdated`. Ten quick updates cost one broadcast, because only the newest value is gossiped. Metadata is for facts about a node that every node should see; to tell other nodes something, send a message.
+
+## Messages
+
+Members can send each other bytes through the cluster itself, sealed with the cluster's key, so your nodes need no HTTP endpoint, port or credentials of their own between them to tell each other small things: a cache key to drop, a job handed over, a request whose answer is another message.
+
+```python
+await cluster.broadcast(b"invalidate user:42")    # every other member, once each
+peer = cluster.member("cache-03")
+await cluster.send(peer, b"rebuild shard 7")      # this run of cache-03
+await cluster.send("cache-03", b"ping")           # whichever run of cache-03 is live
+
+async for event in cluster.events():
+    match event:
+        case kinship.UserMessage(data=data, broadcast=True):
+            cache.drop(data.removeprefix(b"invalidate "))
+        case kinship.UserMessage(sender=m, data=data):
+            await handle(m.name, data)
+```
+
+| Call | Data | How it travels |
+| --- | --- | --- |
+| `await cluster.send(member, data)` | up to `max_user_message`, 64 KiB | In one datagram when it fits, about 1.2 KB with the longest names; over a TCP connection above that |
+| `await cluster.broadcast(data)` | up to `max_user_broadcast`, 256 bytes | Gossiped beside the membership rumours, which always go first, with the same retransmit rule |
+
+Both return once the message is on its way, and the receiving nodes read it from `events()` as `UserMessage(sender, data, broadcast)`. A message is never delivered to the node that sent it, and `sender` is the member as the receiving node holds it, so its state can be suspect, or left for a message sent just before a leave.
+
+Messages are best effort. kinship never acknowledges or retries one: a direct message in a datagram can be lost, one over TCP arrives unless its connection fails, and a broadcast reaches each member with the probability a membership rumour does. In the simulator, at 5 to 16 nodes with up to 2% packet loss, a broadcast reached 99.8% of the members and a datagram 99.0%; nothing repairs a miss, and a member that joins after a broadcast has spread never sees it. If a message must arrive, have the receiver answer and retry when no answer comes. Each message arrives at most once with encryption, in no particular order, except that direct messages to one member over TCP keep their order.
+
+A `Member` names one run of a node, so `send(member, ...)` raises `kinship.NotAMember` once that node has restarted, died or left, and a restarted node drops anything meant for its previous run; a name alone goes to whichever run is live. Data over the limit raises `kinship.MessageTooLarge`, a `ValueError`, and after `leave()` both raise `KinshipClosed`.
+
+Messages share `events()` with membership events, so a consumer that falls behind loses them as `EventsLost(n)`. Broadcasts share the gossip bandwidth with membership, so a cluster spreads only a handful of full-size broadcasts a second: each node holds at most `user_broadcast_queue` (256) to send and drops the rest. `stats()` counts `user_messages_sent`, `user_messages_received`, `user_messages_dropped` (for another node or run, from an unknown sender, or a failed connection), `user_messages_too_large` and `user_queue_overflow`.
+
+Messages are authenticated to the cluster, not to their sender: any node that holds the key can send as any name, so treat `data` as input from the network. Nodes on kinship 0.3 or older ignore messages: a `send()` to one succeeds and nothing arrives, and they do not pass broadcasts on. Bulk data, and anything that must arrive, still belongs on a channel of your own; a message can say where to find it.
 
 ## Configuration
 
@@ -249,7 +287,7 @@ for event in cluster.events(timeout=1.0):   # yields None on each timeout tick
     ...
 ```
 
-Methods that wait on the network (`join`, `set_meta`, `update_meta`, `leave`, `close` and the keyring calls) block the calling thread and accept `timeout=`. Read events from a dedicated thread. Under Celery or gunicorn's prefork model, start the cluster in the worker after the fork (`worker_process_init`, `post_fork`), and give each worker its own port with `bind="0.0.0.0:0"`.
+Methods that wait on the network (`join`, `set_meta`, `update_meta`, `send`, `broadcast`, `leave`, `close` and the keyring calls) block the calling thread and accept `timeout=`. Read events from a dedicated thread. Under Celery or gunicorn's prefork model, start the cluster in the worker after the fork (`worker_process_init`, `post_fork`), and give each worker its own port with `bind="0.0.0.0:0"`.
 
 ## Ownership with kinship.ring
 
@@ -422,6 +460,7 @@ Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/e
 | [`sharded_keys.py`](https://github.com/bytevader/kinship/blob/main/examples/sharded_keys.py) | Rendezvous ownership of keys, and that only a departed node's keys move, after a leave and after a crash |
 | [`failover_job.py`](https://github.com/bytevader/kinship/blob/main/examples/failover_job.py) | A job that runs on exactly one node and moves on its own when that node dies |
 | [`sync_workers.py`](https://github.com/bytevader/kinship/blob/main/examples/sync_workers.py) | The blocking API and metadata: routing around a node that marks itself as draining |
+| [`messages.py`](https://github.com/bytevader/kinship/blob/main/examples/messages.py) | A broadcast every other node hears once, and a request answered with a direct message too large for a datagram |
 | [`fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) | A sharded cache as three FastAPI apps: `cluster_lifespan`, `get_ring`, redirects to a key's owner, and the keys that move when a node leaves |
 | [`deploy/compose/`](https://github.com/bytevader/kinship/tree/main/deploy/compose) | Five FastAPI cache nodes and a live dashboard: key ownership, load, stalls, crashes, draining and opt-in Docker partitions |
 
@@ -544,6 +583,8 @@ async def track(cluster: kinship.Cluster) -> None:
                 status.update({m.name: m.state for m in cluster.members()})
             case kinship.NameConflict(member=m, other_addr=addr):
                 alert(f"two boxes claim {m.name}: {m.addr} and {addr}")
+            case kinship.UserMessage():
+                pass
             case _:
                 status[event.member.name] = event.member.state   # SUSPECT shows as degraded
 ```
@@ -572,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(event) = events.recv().await {
         match event {
             Event::MemberDead(m) | Event::MemberLeft(m) => println!("{} is gone", m.name),
+            Event::UserMessage { sender, data, .. } => println!("{}: {data:?}", sender.name),
             Event::EventsLost(_) => println!("resync: {} members", cluster.members().len()),
             _ => {}
         }
@@ -581,7 +623,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `keyring()`, `leave()`, `close()`. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`. `with_seeds` takes addresses and `with_seed_hosts` takes `Seed`s, parsed from `host:port` with a DNS name or an IP address; `join_seeds` is `join` for them.
+The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `send()`, `broadcast()`, `keyring()`, `leave()`, `close()`. Rust's `send` takes a `&Member` and `send_to` a name. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`. `with_seeds` takes addresses and `with_seed_hosts` takes `Seed`s, parsed from `host:port` with a DNS name or an IP address; `join_seeds` is `join` for them.
 
 The `kinship-agent` example joins a cluster from seeds on the command line and logs every event until Ctrl-C, when it leaves:
 

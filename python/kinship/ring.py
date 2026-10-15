@@ -35,7 +35,7 @@ from typing import Generic, TypeAlias, TypeVar, overload
 from kinship import blocking, rendezvous
 from kinship._cluster import Cluster, _seconds
 from kinship._errors import KinshipClosed
-from kinship._types import Event, EventsLost, Member, NameConflict, State
+from kinship._types import Event, EventsLost, Member, NameConflict, State, UserMessage
 
 __all__ = ["Ring", "RingChanged"]
 
@@ -249,7 +249,7 @@ class _Tracker:
         suspect: list[Member] = []
         recovered: list[Member] = []
         lists = (added, removed, suspect, recovered)
-        if event is not None and not isinstance(event, NameConflict):
+        if event is not None and not isinstance(event, NameConflict | UserMessage):
             self._update(event.member, *lists)
         # No event describes this node, so its own metadata is checked on every wake.
         with contextlib.suppress(KinshipClosed):

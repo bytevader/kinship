@@ -1,6 +1,7 @@
 //! Captures the seed corpus of the `node_input` fuzz target in `crates/kinship-core/fuzz`: real
 //! traffic that node n0 receives in a simulated four-node cluster, once encrypted and once in
-//! plaintext, written in the fuzz target's input format.
+//! plaintext, written in the fuzz target's input format; and the same again from a shorter run
+//! in which the others send n0 user messages and broadcasts, in the `messages-` files.
 //!
 //! ```text
 //! cargo run -p kinship-sim --example node_corpus
@@ -26,6 +27,9 @@ const FILE_BYTES: usize = 512;
 
 /// Files kept per mode: every one with stream traffic, and evenly spaced others up to this.
 const FILES_PER_MODE: usize = 32;
+
+/// Files kept per mode of the run with user messages, chosen the same way.
+const MESSAGE_FILES_PER_MODE: usize = 8;
 
 /// One operation of the fuzz target's input format; see `node_input.rs`.
 enum Op {
@@ -130,8 +134,9 @@ impl SimNode for Recorder {
     }
 }
 
-/// Everything node 0 received in a run with `security`.
-fn capture(security: &Security) -> Vec<Op> {
+/// Everything node 0 received in a run with `security`, or with `messages` in the shorter run
+/// in which the others send it user messages.
+fn capture(security: &Security, messages: bool) -> Vec<Op> {
     let secs = Duration::from_secs;
     let join = |node: usize, seeds: &[usize]| Action::Command {
         node,
@@ -163,6 +168,40 @@ fn capture(security: &Security) -> Vec<Op> {
                 cmd: Command::Leave,
             },
         );
+    // A broadcast, a message in a datagram, and one over TCP, to and through n0.
+    let to_n0 = |node: usize, data: Vec<u8>| Action::Command {
+        node,
+        cmd: Command::Send {
+            to: "n0".to_owned(),
+            epoch: 0,
+            data,
+        },
+    };
+    let scenario = if messages {
+        Scenario::new(4)
+            .duration(secs(15))
+            .link(LinkConfig::lan().with_loss(0.02))
+            .trace(TraceConfig::OFF)
+            .at(Duration::ZERO, join(0, &[1, 2]))
+            .at(
+                secs(2),
+                Action::Command {
+                    node: 1,
+                    cmd: Command::Broadcast(b"drop user:42".to_vec()),
+                },
+            )
+            .at(secs(3), to_n0(2, b"hello".to_vec()))
+            .at(secs(4), to_n0(3, vec![b'x'; 3_000]))
+            .at(
+                secs(5),
+                Action::Command {
+                    node: 3,
+                    cmd: Command::Broadcast(Vec::new()),
+                },
+            )
+    } else {
+        scenario
+    };
     let ops = Rc::new(RefCell::new(Vec::new()));
     let recorded = Rc::clone(&ops);
     let security = security.clone();
@@ -209,10 +248,10 @@ fn inputs(mode: u8, ops: &[Op]) -> Vec<(Vec<u8>, bool)> {
     files
 }
 
-/// Every input with stream traffic, then evenly spaced others, up to [`FILES_PER_MODE`].
-fn keep(all: Vec<(Vec<u8>, bool)>) -> Vec<Vec<u8>> {
+/// Every input with stream traffic, then evenly spaced others, up to `per_mode`.
+fn keep(all: Vec<(Vec<u8>, bool)>, per_mode: usize) -> Vec<Vec<u8>> {
     let with_streams = all.iter().filter(|f| f.1).count();
-    let room = FILES_PER_MODE.saturating_sub(with_streams).max(1);
+    let room = per_mode.saturating_sub(with_streams).max(1);
     let others = all.len() - with_streams;
     let every = others.div_ceil(room).max(1);
     let mut nth = 0;
@@ -242,16 +281,21 @@ fn main() -> std::io::Result<()> {
         ("plaintext", 0, Security::InsecurePlaintext),
     ];
     for (label, mode, security) in modes {
-        let ops = capture(&security);
-        let files = keep(inputs(mode, &ops));
-        for (i, bytes) in files.iter().enumerate() {
-            std::fs::write(dir.join(format!("{label}-{i:02}")), bytes)?;
+        for (prefix, messages, per_mode) in [
+            ("", false, FILES_PER_MODE),
+            ("messages-", true, MESSAGE_FILES_PER_MODE),
+        ] {
+            let ops = capture(&security, messages);
+            let files = keep(inputs(mode, &ops), per_mode);
+            for (i, bytes) in files.iter().enumerate() {
+                std::fs::write(dir.join(format!("{prefix}{label}-{i:02}")), bytes)?;
+            }
+            println!(
+                "{prefix}{label}: {} inputs from {} operations",
+                files.len(),
+                ops.len()
+            );
         }
-        println!(
-            "{label}: {} inputs from {} operations",
-            files.len(),
-            ops.len()
-        );
     }
     Ok(())
 }

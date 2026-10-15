@@ -19,6 +19,10 @@
 //! interval and timeout when its own probes fail, missing Nacks from PingReq relays count
 //! against it, suspicion timeouts start long and shrink as independent members confirm them,
 //! and Pings to a suspected member carry the suspicion so it can refute at once.
+//!
+//! Applications can also send data of their own through the cluster, to one member or to all
+//! of them ([`Command::Send`], [`Command::Broadcast`]), and hear what arrives as
+//! [`Event::UserMessage`]; see `docs/design.md`, User messages.
 
 mod awareness;
 mod broadcast;
@@ -34,6 +38,7 @@ mod suspicion;
 mod sync;
 mod table;
 mod time;
+mod user;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -49,6 +54,7 @@ use crate::rng::Nonces;
 use crate::suspicion::Suspicion;
 use crate::sync::Sync;
 use crate::table::{Entry, Table};
+use crate::user::Users;
 
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
@@ -160,6 +166,8 @@ pub struct Node {
     /// In plaintext mode, the addresses that Alives in the packet being handled announce, which
     /// this node may answer as if they were members already; see [`Node::may_send`].
     announced: Vec<SocketAddr>,
+    /// User messages and broadcasts, apart from the broadcast queue in the outbox.
+    user: Users,
 }
 
 impl Node {
@@ -238,6 +246,7 @@ impl Node {
             replay,
             joined: false,
             announced: Vec::new(),
+            user: Users::default(),
         };
         node.out.stamp = node.replay.stamp(now);
         node.broadcast(node.local_alive());
@@ -393,6 +402,14 @@ impl Node {
             }
             Command::Join { seeds } => self.join(id, seeds),
             Command::Leave => self.leave(id),
+            Command::Send { to, epoch, data } => {
+                let r = self.send_user(&to, epoch, data);
+                self.finish(id, r);
+            }
+            Command::Broadcast(data) => {
+                let r = self.broadcast_user(data);
+                self.finish(id, r);
+            }
         }
         id
     }
@@ -449,7 +466,7 @@ impl Node {
         if let Some(s) = self.sync_deadline() {
             t = t.min(s);
         }
-        if !self.out.broadcasts.is_empty() {
+        if !self.out.broadcasts.is_empty() || !self.out.user.is_empty() {
             t = t.min(self.next_gossip);
         }
         Some(t)
@@ -570,6 +587,9 @@ impl Node {
     /// that the Ping ahead of the Alive is answered as it would be with encryption.
     ///
     /// The Alives in one datagram share one admission budget for new members.
+    ///
+    /// User messages are handled after everything else in the packet, so that an Alive in it
+    /// introduces their sender, as the Alive ahead of a direct message from a new member does.
     fn process(&mut self, payload: &Payload<'_>) {
         let now = self.now;
         let mut budget = self.admission();
@@ -580,6 +600,7 @@ impl Node {
                     _ => None,
                 }));
         }
+        let mut user = Vec::new();
         for msg in payload.iter() {
             match msg {
                 Message::Ping(p) => self.on_ping(&p),
@@ -591,7 +612,11 @@ impl Node {
                 Message::Dead(d) => self.on_dead(now, &d),
                 // Push-pull runs over streams only.
                 Message::PushPull(_) => {}
+                Message::UserMessage(_) | Message::UserBroadcast(_) => user.push(msg),
             }
+        }
+        for msg in &user {
+            self.on_user(msg);
         }
         self.announced.clear();
     }
@@ -933,6 +958,7 @@ mod tests {
                 Event::MemberUpdated { .. } => "updated",
                 Event::NameConflict { .. } => "conflict",
                 Event::CommandDone { .. } => "done",
+                Event::UserMessage { .. } => "message",
             })
             .collect()
     }

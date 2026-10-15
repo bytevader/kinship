@@ -26,6 +26,15 @@ fuzz_target!(|data: &[u8]| {
                     assert!(a.meta.len() <= limits.max_meta_bytes);
                     let _ = Tags::parse(a.meta).map(|t| t.iter().count());
                 }
+                // User data is bounded by the payload alone; the core checks its own limits.
+                Message::UserMessage(u) => {
+                    assert!(u.data.len() < data.len());
+                    assert!(!u.to.as_str().is_empty() && !u.from.as_str().is_empty());
+                }
+                Message::UserBroadcast(b) => {
+                    assert!(b.data.len() < data.len());
+                    assert!(!b.from.as_str().is_empty());
+                }
                 _ => {}
             }
         }

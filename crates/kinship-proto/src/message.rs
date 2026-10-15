@@ -17,6 +17,10 @@ pub mod kind {
     pub const SUSPECT: u8 = 0x06;
     pub const DEAD: u8 = 0x07;
     pub const PUSH_PULL: u8 = 0x08;
+    /// From 0.4; nodes older than that skip it as a type they do not know.
+    pub const USER_MESSAGE: u8 = 0x09;
+    /// From 0.4; nodes older than that skip it as a type they do not know.
+    pub const USER_BROADCAST: u8 = 0x0A;
 }
 
 /// A node name: UTF-8, 1 to [`NodeId::MAX_LEN`] bytes. Borrowed, so decoding allocates nothing.
@@ -135,6 +139,32 @@ impl Dead<'_> {
     pub fn is_left(&self) -> bool {
         self.node == self.from
     }
+}
+
+/// `UserMessage`: application data from the life `from_epoch` of `from` to the life `to_epoch`
+/// of `to`. Added in 0.4 with every field, epochs of 0 included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessage<'a> {
+    pub to: NodeId<'a>,
+    /// The life of `to` the message is for; 0 when the sender knows none.
+    pub to_epoch: u64,
+    pub from: NodeId<'a>,
+    /// The life of `from` that sent it; 0 for a sender without an epoch.
+    pub from_epoch: u64,
+    /// Opaque to the protocol, bounded only by the packet; the core checks its own limit.
+    pub data: &'a [u8],
+}
+
+/// `UserBroadcast`: application data for every member, broadcast number `seq` of the life
+/// `from_epoch` of `from`. Added in 0.4 with every field, as [`UserMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserBroadcast<'a> {
+    pub from: NodeId<'a>,
+    pub from_epoch: u64,
+    /// One higher for each broadcast of that life; with `from` and `from_epoch`, it tells a
+    /// copy from a new broadcast.
+    pub seq: u64,
+    pub data: &'a [u8],
 }
 
 /// One member in a push-pull exchange.
@@ -265,6 +295,8 @@ pub enum Message<'a> {
     Suspect(Suspect<'a>),
     Dead(Dead<'a>),
     PushPull(PushPull<'a>),
+    UserMessage(UserMessage<'a>),
+    UserBroadcast(UserBroadcast<'a>),
 }
 
 fn put_addr<S: Sink>(s: &mut S, addr: &SocketAddr) {
@@ -387,6 +419,8 @@ impl<'a> Message<'a> {
             Self::Suspect(_) => kind::SUSPECT,
             Self::Dead(_) => kind::DEAD,
             Self::PushPull(_) => kind::PUSH_PULL,
+            Self::UserMessage(_) => kind::USER_MESSAGE,
+            Self::UserBroadcast(_) => kind::USER_BROADCAST,
         }
     }
 
@@ -444,6 +478,19 @@ impl<'a> Message<'a> {
                 for rec in p.records.iter() {
                     put_record(s, &rec);
                 }
+            }
+            Self::UserMessage(m) => {
+                put_node(s, &m.to);
+                s.put_u64(m.to_epoch);
+                put_node(s, &m.from);
+                s.put_u64(m.from_epoch);
+                s.put_bytes(m.data);
+            }
+            Self::UserBroadcast(b) => {
+                put_node(s, &b.from);
+                s.put_u64(b.from_epoch);
+                s.put_u64(b.seq);
+                s.put_bytes(b.data);
             }
         }
     }
@@ -519,6 +566,19 @@ impl<'a> Message<'a> {
                     },
                 })
             }
+            kind::USER_MESSAGE => Self::UserMessage(UserMessage {
+                to: read_node(&mut r)?,
+                to_epoch: r.u64()?,
+                from: read_node(&mut r)?,
+                from_epoch: r.u64()?,
+                data: r.bytes()?,
+            }),
+            kind::USER_BROADCAST => Self::UserBroadcast(UserBroadcast {
+                from: read_node(&mut r)?,
+                from_epoch: r.u64()?,
+                seq: r.u64()?,
+                data: r.bytes()?,
+            }),
             _ => return Ok(None),
         };
         Ok(Some(msg))

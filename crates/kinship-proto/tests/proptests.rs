@@ -4,7 +4,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use kinship_proto::{
     Alive, Codec, Dead, FrameReader, Key, Limits, Message, NodeId, PacketKind, Payload, Ping,
-    PingReq, PushPull, Record, Records, State, Suspect, tags,
+    PingReq, PushPull, Record, Records, State, Suspect, UserBroadcast, UserMessage, tags,
 };
 use proptest::prelude::*;
 
@@ -54,6 +54,19 @@ enum M {
     PushPull {
         join: bool,
         recs: Vec<(u8, AliveM)>,
+    },
+    UserMessage {
+        to: String,
+        to_epoch: u64,
+        from: String,
+        from_epoch: u64,
+        data: Vec<u8>,
+    },
+    UserBroadcast {
+        from: String,
+        from_epoch: u64,
+        seq: u64,
+        data: Vec<u8>,
     },
 }
 
@@ -144,7 +157,29 @@ fn msg() -> impl Strategy<Value = M> {
             prop::collection::vec((0u8..=3, alive_m()), 0..6)
         )
             .prop_map(|(join, recs)| M::PushPull { join, recs }),
+        (name(), epoch(), name(), epoch(), data()).prop_map(
+            |(to, to_epoch, from, from_epoch, data)| M::UserMessage {
+                to,
+                to_epoch,
+                from,
+                from_epoch,
+                data,
+            }
+        ),
+        (name(), epoch(), any::<u64>(), data()).prop_map(|(from, from_epoch, seq, data)| {
+            M::UserBroadcast {
+                from,
+                from_epoch,
+                seq,
+                data,
+            }
+        }),
     ]
+}
+
+/// Application data: empty, short, and longer than any metadata.
+fn data() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(any::<u8>(), 0..=1024)
 }
 
 fn state(b: u8) -> State {
@@ -238,6 +273,30 @@ fn with_messages<R>(ms: &[M], f: impl FnOnce(&[Message<'_>]) -> R) -> R {
             M::PushPull { join, .. } => Message::PushPull(PushPull {
                 join: *join,
                 records: Records::Slice(recs),
+            }),
+            M::UserMessage {
+                to,
+                to_epoch,
+                from,
+                from_epoch,
+                data,
+            } => Message::UserMessage(UserMessage {
+                to: id(to),
+                to_epoch: *to_epoch,
+                from: id(from),
+                from_epoch: *from_epoch,
+                data,
+            }),
+            M::UserBroadcast {
+                from,
+                from_epoch,
+                seq,
+                data,
+            } => Message::UserBroadcast(UserBroadcast {
+                from: id(from),
+                from_epoch: *from_epoch,
+                seq: *seq,
+                data,
             }),
         })
         .collect();

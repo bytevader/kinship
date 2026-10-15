@@ -28,6 +28,16 @@ def _seconds(value: float | timedelta | None) -> float | None:
     return float(value)
 
 
+def _recipient(member: Member | str) -> tuple[str, int]:
+    """A send's target as ``(name, epoch)``: a ``Member`` names its run, a name alone means
+    whichever run this node holds, epoch 0."""
+    if isinstance(member, Member):
+        return member.name, member.epoch
+    if isinstance(member, str):
+        return member, 0
+    raise TypeError(f"send() takes a kinship.Member or a name, not {type(member).__name__}")
+
+
 def _warn_leave_timeout(timeout: float) -> None:
     log.warning(
         "leave() timed out after %.1f s before the news finished spreading; "
@@ -214,6 +224,24 @@ class Cluster(_Base):
     async def update_meta(self, **changes: str | None) -> None:
         """Changes some metadata keys; a value of ``None`` deletes the key."""
         await self._running.update_meta(changes)
+
+    async def send(self, member: Member | str, data: bytes) -> None:
+        """Sends ``data`` to ``member`` and returns once it is on its way: one datagram when it
+        fits, a TCP connection otherwise, up to ``max_user_message`` bytes (64 KiB). Best
+        effort, never acknowledged; the member reads it from ``events()`` as ``UserMessage``.
+
+        A ``Member`` names one run of the node, so a message meant for a run that has since
+        restarted is refused; a name alone goes to whichever run this node holds. Raises
+        ``NotAMember`` unless that is a live member, and ``MessageTooLarge`` over the limit."""
+        name, epoch = _recipient(member)
+        await self._running.send(name, epoch, data)
+
+    async def broadcast(self, data: bytes) -> None:
+        """Gossips ``data``, up to ``max_user_broadcast`` bytes (256), to every member, and
+        returns once it is queued. Every other node reads it once from ``events()`` as
+        ``UserMessage`` with ``broadcast=True``. Best effort: membership gossip goes first, and
+        a full queue drops broadcasts, counted in ``stats().user_queue_overflow``."""
+        await self._running.broadcast(data)
 
     async def leave(self, timeout: float | timedelta = LEAVE_TIMEOUT) -> None:
         """Tells the cluster this node is leaving and waits up to ``timeout`` for the news to

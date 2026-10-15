@@ -42,6 +42,18 @@ pub enum Command {
     /// Forget `key`. Refused for the key in use and for the last key; does nothing if it is not
     /// installed.
     RemoveKey(Key),
+    /// Send `data`, at most `max_user_message` bytes, to the member `to` at its life `epoch`, or
+    /// whichever life this node holds with 0. Refused unless this node holds that life as a live
+    /// member. Done once the message is handed to the network or queued for a connection; it
+    /// is best effort and never acknowledged.
+    Send {
+        to: String,
+        epoch: u64,
+        data: Vec<u8>,
+    },
+    /// Broadcast `data`, at most `max_user_broadcast` bytes, to every member: queued beside
+    /// the membership rumours and spread as they are. Done once queued.
+    Broadcast(Vec<u8>),
 }
 
 /// What a [`Command`] that succeeded produced.
@@ -74,6 +86,12 @@ pub enum CommandError {
     KeyInUse,
     /// [`Command::RemoveKey`] for the only installed key.
     LastKey,
+    /// [`Command::Send`] or [`Command::Broadcast`] data larger than `max_user_message` or
+    /// `max_user_broadcast`.
+    MessageTooLarge,
+    /// [`Command::Send`] to a name this node does not hold as a live member at that epoch,
+    /// or to itself.
+    NotAMember,
 }
 
 impl fmt::Display for CommandError {
@@ -86,6 +104,10 @@ impl fmt::Display for CommandError {
             Self::KeyNotInstalled => f.write_str("key is not installed"),
             Self::KeyInUse => f.write_str("key is the one in use"),
             Self::LastKey => f.write_str("key is the last one installed"),
+            Self::MessageTooLarge => {
+                f.write_str("message larger than max_user_message or max_user_broadcast")
+            }
+            Self::NotAMember => f.write_str("not a live member at that epoch"),
         }
     }
 }
@@ -122,5 +144,12 @@ pub enum Event {
     NameConflict {
         member: Member,
         other_addr: SocketAddr,
+    },
+    /// A user message arrived from `sender`, as this node holds it: sent to this node alone, or
+    /// to every member if `broadcast`. Never one this node sent itself.
+    UserMessage {
+        sender: Member,
+        data: Vec<u8>,
+        broadcast: bool,
     },
 }

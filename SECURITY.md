@@ -11,6 +11,7 @@ This file holds kinship's threat model and the findings of the security audit of
 - **Membership integrity.** Which members are alive, suspect, dead or gone, their addresses and their metadata, as every node sees them.
 - **Failure detection.** Live members stay members, and dead ones are declared dead within the Lifeguard timeouts.
 - **Confidentiality of membership traffic.** Names, addresses, metadata and protocol state are encrypted on the wire.
+- **User messages.** The data members send each other with `send()` and `broadcast()` travels in the same sealed packets, under the same replay checks. Inside the cluster a message is authenticated to the cluster, not to its sender (KI-01).
 - **The keys.** 32-byte XChaCha20-Poly1305 keys, which never leave the process, are never logged, and inside a node live only in its codec (KS-07).
 
 ### Attackers
@@ -130,6 +131,7 @@ With `insecure_plaintext=True`, or `Config.local()` on loopback, there is no aut
 **What remains:**
 
 - Plaintext is still unauthenticated. A peer that first forges an Alive for an invented member at the victim's address makes that address a member's: the node then answers Pings naming it, with gossip, probes it and gossips it to the cluster, which probes it too, until the invented member is declared dead and its tombstone reaped. That costs a forged Alive for every invented member and shows on every node as a member that joined and died, but the reflection then runs at the forger's rate. KS-01 and every member finding (KI-01 to KI-06) still apply to anyone who can reach the port.
+- User messages, from 0.4, are unauthenticated in plaintext too: anyone who can reach the port can deliver a message or a broadcast in any member's name, and a forged broadcast is relayed to every member, retransmit_limit times by each node. Receiving one never makes a node send anything back, and a node sends user messages only to members' addresses, so a forged one cannot aim a node at a third party.
 - A new member whose own packets do not carry its Alive, as in a large plaintext cluster where its queue of fresh rumours fills its first datagrams, is not answered until the node has heard of it from others. Its first probes can then go unanswered, so it suspects members that are fine, which refute, and its local health rises for a round or two.
 
 ### KS-05 Key id lookup timing revealed installed keys
@@ -204,6 +206,8 @@ An observer without a key still sees each packet's key id, its cluster time stam
 
 Rumours are not signed by their subject or their author, so a member that holds the key can send Suspect, Dead or Left about any node at its current incarnation and every node that hears it applies it at once. It can invent reporter names to bring a suspicion down to the minimum timeout, send Acks for probes it never forwarded (an Ack names only a sequence number) to keep a dead member alive in a prober's view, and answer PingReqs falsely. Removing it means rotating the key on every other node.
 
+User messages, from 0.4, are in the same position: they are authenticated to the cluster, not to their sender. A member that holds the key can send a direct message or a broadcast in any member's name and run, to any member. It can have every node relay broadcasts of its own until their queues, `user_broadcast_queue` long, overflow and drop real ones, counted under `user_queue_overflow`. And it can number a broadcast far ahead of a member's own, after which nodes take that member's next broadcasts, up to the forged number, for old copies and drop them, counted under `user_messages_dropped`, until the member restarts. An application that acts on a message must treat `sender` as a claim, as it treats names and metadata (KI-05), and authenticate the requests that matter itself, with a secret per member of its own.
+
 **Reproduction:** `open_findings::ki01_a_member_declares_any_node_dead_at_once`: one sealed Dead makes a node report MemberDead for a live member.
 
 **Recommended fix:** per-member signing keys, with rumours about a member's own state (Alive, Left) signed by it and accusations attributed to their author, is the change that would make this a finding with a fix. It belongs in a later wire version.
@@ -268,6 +272,7 @@ With the defaults a full table, with 512 bytes of metadata, 64-byte names and IP
 - A member can still fill the table with invented names, 1,024 per frame, and point every node's probes at addresses it lists until those members are declared dead and their tombstones reaped; it can keep sending them. Once the table is full, real new members are refused, and `members_refused` counts them, until it has room again. Removing the attacker still takes a key rotation (KI-01).
 - An honest cluster larger than 1,024 members is learned 1,024 members per push-pull: a node joining one knows the rest only after further push-pulls and gossip, a few `push_pull_interval`s, unless `max_new_members_per_packet` is raised to the cluster's size. A cluster larger than 8,192 must raise `max_members` on every node, or nodes refuse members beyond it.
 - The actor rebuilds its member snapshot, O(n), once for each input that changed membership, so a large table that changes in every packet costs O(n) per packet.
+- User messages, from 0.4, keep their buffers bounded the same way: the broadcast queue at `user_broadcast_queue` entries of at most `max_user_broadcast` bytes, direct messages waiting for a connection at `max_stream_frame` bytes, and what a node remembers of each member's broadcasts at 48 bytes per member, freed with its tombstone. A member holding the key can still fill the broadcast queue, which then drops broadcasts and counts them under `user_queue_overflow`.
 
 ### KI-05 Names and metadata are attacker-controlled strings
 
