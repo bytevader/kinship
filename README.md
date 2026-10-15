@@ -41,7 +41,7 @@ Use it when you are building your own distributed piece (a sharded cache, a job 
 pip install kinship
 ```
 
-Wheels cover CPython 3.11 and later (abi3) plus free-threaded 3.14t, on Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64). No Rust toolchain is needed.
+Wheels cover CPython 3.11 and later (abi3) plus free-threaded 3.14t, on Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64). Linux armv7 has abi3 wheels for glibc 2.28+ and musl 1.2+. No Rust toolchain is needed.
 
 ```bash
 cargo add kinship        # tokio runtime and Cluster handle
@@ -236,7 +236,7 @@ Pick a preset and override fields by name. Presets differ only in timing.
 | --- | --- | --- |
 | `Config.lan()` | One datacenter or VPC | none |
 | `Config.wan()` | Regions, edge sites, flaky links | probes every 5 s with a 3 s timeout, slower suspicion, push-pull every 60 s |
-| `Config.local()` | Tests, demos, the visualizer | probes every 200 ms, loopback only, plaintext allowed, no TCP fallback ping |
+| `Config.local()` | Tests and demos | probes every 200 ms, loopback only, plaintext allowed, no TCP fallback ping |
 
 ```python
 cfg = kinship.Config.wan(keys=[key], probe_interval=4.0)

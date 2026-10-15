@@ -12,6 +12,7 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - Stats counters `user_messages_sent`, `user_messages_received`, `user_messages_dropped`, `user_messages_too_large` and `user_queue_overflow`.
 - `examples/messages.py`: a broadcast every other node hears once, and a request answered with a direct message too large for a datagram.
 - Simulator tests that run the released kinship-core 0.3.0 beside this version, and a 1,000-seed sweep of user messages in CI.
+- **armv7 wheels.** Linux abi3 wheels for manylinux_2_28 and musllinux_1_2, with musllinux tests under QEMU in Alpine.
 
 ### Changed
 
@@ -20,6 +21,10 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - A config whose `max_stream_frame` cannot hold a `max_user_message` message, below about 64 KiB, is refused naming `max_stream_frame`; lower `max_user_message` with it.
 - Rust: `Message`, `Command`, `CommandError` and `Event` have new variants, and `Config` and `Metrics` new fields.
 - The `node_input` fuzz corpus is regenerated, since it predated epochs, and gains inputs with user messages; operation 7 of the target now has the node send them.
+
+### Fixed
+
+- Replace references to the unimplemented visualizer with the Compose demo dashboard or existing test and demo uses.
 
 ## [0.3.0] - 2026-10-14
 

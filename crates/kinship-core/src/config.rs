@@ -138,7 +138,7 @@ impl Config {
         }
     }
 
-    /// One host: tests, the simulator and the visualizer.
+    /// One host: tests, the simulator and demos.
     pub fn local(security: Security) -> Self {
         Self {
             probe_interval: Duration::from_millis(200),
