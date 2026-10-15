@@ -28,7 +28,7 @@ RUN for wheel in /wheels/*.whl; do pip install --no-cache-dir "${wheel}[fastapi]
 
 # The default: the published package. --build-arg KINSHIP_INSTALL=source builds this checkout.
 FROM runtime AS pypi
-RUN pip install --no-cache-dir 'kinship[fastapi]>=0.3'
+RUN pip install --no-cache-dir 'kinship[fastapi]>=0.4'
 
 FROM ${KINSHIP_INSTALL} AS demo
 COPY deploy/compose/*.py deploy/compose/dashboard.html ./

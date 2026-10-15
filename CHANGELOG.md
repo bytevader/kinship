@@ -4,6 +4,8 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
 ### Added
 
 - **User messages.** `send(member, data)` sends bytes to one member: in one datagram when they fit, and over TCP otherwise, up to `max_user_message` (64 KiB). `broadcast(data)` gossips up to `max_user_broadcast` (256 bytes) to every member, beside the membership rumours and with their retransmit rule, membership always first, and every node delivers it at most once, told apart by sender, epoch and number. Receivers read both from `events()` as `UserMessage(sender, data, broadcast)`, in Python and Rust, with `EventsLost` unchanged. A `Member` names one run of a node, so a message for a run that has since restarted is refused by a sender that knows, and dropped by the new run otherwise. Messages are best effort and never acknowledged; README "Messages" and docs/design.md "User messages" give the guarantees. On `kinship.Cluster` and `kinship.blocking.Cluster`, the Rust `Cluster` (`send`, `send_to`, `broadcast`) and `kinship_net::Memberlist`; the sans-IO core takes `Command::Send` and `Command::Broadcast`.
@@ -109,7 +111,8 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
-[Unreleased]: https://github.com/bytevader/kinship/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bytevader/kinship/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bytevader/kinship/releases/tag/v0.4.0
 [0.3.0]: https://github.com/bytevader/kinship/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bytevader/kinship/releases/tag/v0.2.0
 [0.1.1]: https://github.com/bytevader/kinship/releases/tag/v0.1.1

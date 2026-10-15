@@ -24,9 +24,9 @@ Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
 Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
-The default image installs `kinship[fastapi]>=0.3` from PyPI on
+The default image installs `kinship[fastapi]>=0.4` from PyPI on
 `python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
-`Ring.fence()`, new in 0.3. To try
+`Ring.fence()`, new in 0.3, and the metrics endpoint, new in 0.4. To try
 changes in this checkout, build a release wheel from source, with maturin and
 Rust 1.85.1 in a separate build stage:
 
@@ -50,9 +50,8 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build
 ```
 
 This adds Prometheus and Grafana and enables `/cluster/metrics` on all five cache
-nodes. The override builds their `kinship-compose-demo-metrics` image from this
-checkout automatically, because published kinship 0.3 does not include the metrics
-API. The dashboard keeps its normal image and remains at <http://localhost:8080>.
+nodes, which keep the demo's image; set `KINSHIP_INSTALL=source` as above to build
+it from this checkout instead. The dashboard remains at <http://localhost:8080>.
 The ordinary `docker compose up` still runs the demo without monitoring.
 
 - Open **Grafana** at <http://localhost:3000/d/kinship-cluster>. The **Kinship cluster**

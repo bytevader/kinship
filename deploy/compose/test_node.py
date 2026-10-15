@@ -93,9 +93,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.IsolatedAsyncioTestCase):
-    @unittest.skipUnless(
-        importlib.util.find_spec("kinship.metrics"), "needs the metrics source build"
-    )
+    @unittest.skipUnless(importlib.util.find_spec("kinship.metrics"), "needs kinship 0.4 or later")
     async def test_metrics_can_be_enabled_for_monitoring(self):
         with patch.dict("os.environ", {"KINSHIP_METRICS": "1"}):
             app = create_app("node-1")
