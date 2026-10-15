@@ -1,10 +1,6 @@
 # Merge with docker-compose.yml; the base demo remains usable without monitoring.
-# Source builds provide the metrics API until it is available in a published release.
+# The nodes keep the demo's image, kinship 0.4 or later, and serve /cluster/metrics.
 x-metrics-node: &metrics-node
-  image: kinship-compose-demo-metrics
-  build:
-    args:
-      KINSHIP_INSTALL: source
   environment:
     KINSHIP_METRICS: "1"
 
