@@ -84,10 +84,9 @@ enum PeerEvent {
 
 /// The key every node of the run of `seed` shares, drawn from the seed.
 fn cluster_key(seed: u64) -> [u8; 32] {
-    let mut key = [0; 32];
     // "keys" in ASCII, so that the key's stream is not the seed's own.
-    Rng::new(seed ^ 0x6b65_7973).fill(&mut key);
-    key
+    let mut rng = Rng::new(seed ^ 0x6b65_7973);
+    std::array::from_fn(|_| rng.next_u64().to_le_bytes()[0])
 }
 
 fn to_old(t: Instant) -> old::Instant {

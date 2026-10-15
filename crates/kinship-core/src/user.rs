@@ -593,11 +593,15 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// `N` bytes drawn from the RNG seeded with `seed`, the same in every run.
+    fn drawn<const N: usize>(seed: u64) -> [u8; N] {
+        let mut rng = Rng::new(seed);
+        std::array::from_fn(|_| rng.next_u64().to_le_bytes()[0])
+    }
+
     /// Bytes to seal test packets with; plaintext sends no nonce, but the codec takes one.
     fn nonce() -> [u8; 24] {
-        let mut nonce = [0; 24];
-        Rng::new(24).fill(&mut nonce);
-        nonce
+        drawn(24)
     }
 
     fn plaintext() -> Codec {
@@ -607,9 +611,7 @@ mod tests {
     /// Node "a" at port 1, in its life `epoch`, running `cfg`.
     fn node_with(cfg: Config, epoch: u64) -> Node {
         let me = Identity::new("a", addr(1)).unwrap().with_epoch(epoch);
-        let mut nonce_key = [0; 32];
-        Rng::new(1).fill(&mut nonce_key);
-        Node::new(cfg, me, Instant::ZERO, 1, &nonce_key).unwrap()
+        Node::new(cfg, me, Instant::ZERO, 1, &drawn(1)).unwrap()
     }
 
     /// Node "a" in plaintext at epoch 100.
