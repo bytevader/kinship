@@ -23,6 +23,7 @@ from typing import Annotated
 try:
     from fastapi import APIRouter, Depends, FastAPI
     from fastapi.requests import HTTPConnection
+    from fastapi.responses import Response
     from pydantic import BaseModel
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -32,6 +33,7 @@ except ImportError as e:  # pragma: no cover
 from kinship._cluster import LEAVE_TIMEOUT, Cluster
 from kinship._errors import KinshipClosed
 from kinship._kinship import Config
+from kinship.metrics import prometheus_text
 from kinship.ring import Ring, Where
 
 __all__ = ["cluster_lifespan", "cluster_router", "get_cluster", "get_ring"]
@@ -133,10 +135,13 @@ class MemberInfo(BaseModel):
     meta: dict[str, str]
 
 
-def cluster_router(prefix: str = "/cluster") -> APIRouter:
+def cluster_router(prefix: str = "/cluster", *, metrics: bool = False) -> APIRouter:
     """A router with ``GET {prefix}/members``, the alive and suspect members with their name,
     address, state, epoch and metadata, and ``GET {prefix}/stats``, this node's protocol
     counters.
+
+    Set ``metrics=True`` to add ``GET {prefix}/metrics``, Prometheus text exposition
+    with protocol counters, local health and member counts. It is disabled by default.
 
     These expose member addresses and metadata. In production, protect them, for example
     with ``app.include_router(cluster_router(), dependencies=[Depends(admin_only)])``, or
@@ -156,5 +161,14 @@ def cluster_router(prefix: str = "/cluster") -> APIRouter:
     @router.get("/stats")
     async def stats(cluster: Annotated[Cluster, Depends(get_cluster)]) -> dict[str, int]:
         return dataclasses.asdict(cluster.stats())
+
+    if metrics:
+
+        @router.get("/metrics", response_class=Response)
+        async def metrics_text(cluster: Annotated[Cluster, Depends(get_cluster)]) -> Response:
+            return Response(
+                prometheus_text(cluster),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
 
     return router

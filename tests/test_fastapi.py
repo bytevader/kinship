@@ -123,3 +123,25 @@ async def test_misuse_is_reported() -> None:
         with pytest.raises(RuntimeError, match="cluster_lifespan"):
             await http.get("/ops/members")
         assert (await http.get("/cluster/members")).status_code == 404
+
+
+@pytest.mark.parametrize("prefix", ["/cluster", "", "/ops"])
+async def test_metrics_route_is_opt_in(prefix: str) -> None:
+    from kinship.metrics import prometheus_text
+
+    app = fastapi.FastAPI(lifespan=cluster_lifespan(local(name="metrics-api")))
+    app.include_router(cluster_router(prefix=prefix, metrics=True))
+    async with app.router.lifespan_context(app), client(app) as http:
+        response = await http.get(f"{prefix}/metrics")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+        assert response.text == prometheus_text(app.state.cluster)
+        assert (await http.get(f"{prefix}/members")).status_code == 200
+        assert (await http.get(f"{prefix}/stats")).status_code == 200
+
+
+async def test_metrics_route_is_disabled_by_default() -> None:
+    app = fastapi.FastAPI()
+    app.include_router(cluster_router())
+    async with client(app) as http:
+        assert (await http.get("/cluster/metrics")).status_code == 404

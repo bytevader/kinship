@@ -1,5 +1,6 @@
 """Cache routing tests; run with ``python -m unittest test_node`` in the demo image."""
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,8 @@ from node import (
     drop_moved,
     watch_ring,
 )
+
+import kinship
 
 
 def member(name="node-1", url=None, epoch=7):
@@ -87,6 +90,35 @@ class ConfigTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "membership network"),
         ):
             config()
+
+
+class MetricsTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(
+        importlib.util.find_spec("kinship.metrics"), "needs the metrics source build"
+    )
+    async def test_metrics_can_be_enabled_for_monitoring(self):
+        with patch.dict("os.environ", {"KINSHIP_METRICS": "1"}):
+            app = create_app("node-1")
+        config = kinship.Config.local(name="node-1", bind="127.0.0.1:0")
+        async with kinship.Cluster(config) as cluster:
+            app.state.cluster = cluster
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://node-1:8000"
+            ) as client:
+                response = await client.get("/cluster/metrics")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["content-type"], "text/plain; version=0.0.4; charset=utf-8"
+        )
+        self.assertIn('kinship_members{node="node-1",state="alive"} 1\n', response.text)
+
+    async def test_metrics_stays_disabled_for_the_default_demo(self):
+        with patch.dict("os.environ", {"KINSHIP_METRICS": "0"}):
+            app = create_app("node-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://node-1:8000"
+        ) as client:
+            self.assertEqual((await client.get("/cluster/metrics")).status_code, 404)
 
 
 class FakeRing:
