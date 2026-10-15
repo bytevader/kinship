@@ -212,6 +212,22 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackgroundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_flush_during_partition_does_not_reserve_or_recover_a_fault(self):
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            controller = FaultController(http, lambda *_: None, docker_enabled=True)
+            await controller.apply("node-3", "disconnect")
+            token = controller.poll_token("node-3")
+            await controller.apply("node-1", "flush")
+            self.assertEqual(controller.unavailable_nodes, {"node-3"})
+            self.assertEqual(controller.poll_token("node-3"), token)
+            self.assertEqual(seen[-1], "http://node-1:8000/fault/flush")
+
     async def test_ambiguous_fault_timeout_retains_recovery_reservation(self):
         def handler(request):
             raise httpx.ReadTimeout("response lost after fault", request=request)
