@@ -141,6 +141,9 @@ class View:
 
     async def consume(self, events) -> None:
         async for event in events:
+            if isinstance(event, kinship.UserMessage):
+                # Cache commands belong to the cache nodes; this is only an observer.
+                continue
             if isinstance(event, kinship.EventsLost):
                 self.resync()
                 detail = f"{event.count} events lost; refreshed membership"
@@ -180,6 +183,7 @@ class View:
 async def poll_members(view: View, http: httpx.AsyncClient) -> None:
     async def count(name):
         generation = view.controller.poll_token(name)
+        previous = view.member_counts.get(name, {})
         try:
             response = await http.get(URLS[name] + "/cluster/members")
             response.raise_for_status()
@@ -187,13 +191,25 @@ async def poll_members(view: View, http: httpx.AsyncClient) -> None:
             if not isinstance(members, list):
                 raise ValueError("expected member list")
         except (httpx.HTTPError, ValueError):
-            previous = view.member_counts.get(name, {})
-            return name, {"count": previous.get("count"), "reachable": False}
+            return name, {**previous, "reachable": False}
         local = next((m for m in members if m["name"] == name), None)
         if local and local["state"] == "ALIVE" and local["meta"].get("role") == "cache":
             # Automatic restart/rejoin has recovered a manually crashed node.
             view.controller.mark_reachable(name, generation)
-        return name, {"count": len(members), "reachable": True}
+        stats = previous.get("cache", {})
+        try:
+            response = await http.get(URLS[name] + "/cache/stats")
+            response.raise_for_status()
+            stats = response.json()
+        except (httpx.HTTPError, ValueError):
+            pass
+        if stats.get("last_flush_id") and stats["last_flush_id"] != previous.get("cache", {}).get(
+            "last_flush_id"
+        ):
+            view.add_log(
+                "Flush", f"{name} applied flush {stats['last_flush_id']} (total {stats['flushes']})"
+            )
+        return name, {"count": len(members), "reachable": True, "cache": stats}
 
     while True:
         view.member_counts.update(await asyncio.gather(*(count(name) for name in NAMES)))

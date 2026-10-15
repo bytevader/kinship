@@ -9,8 +9,8 @@ import time
 import httpx
 
 NAMES = tuple(f"node-{i}" for i in range(1, 6))
-APP_ACTIONS = frozenset({"stall", "crash", "bounce", "leave", "drain", "undrain"})
-FAULT_ACTIONS = APP_ACTIONS - {"undrain"} | {"pause", "kill", "disconnect"}
+APP_ACTIONS = frozenset({"stall", "crash", "bounce", "leave", "drain", "undrain", "flush"})
+FAULT_ACTIONS = APP_ACTIONS - {"undrain", "flush"} | {"pause", "kill", "disconnect"}
 DOCKER_ACTIONS = frozenset(
     {"pause", "unpause", "kill", "restart", "start", "disconnect", "connect"}
 )

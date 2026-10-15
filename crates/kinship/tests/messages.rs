@@ -183,7 +183,11 @@ async fn sends_to_strangers_old_runs_and_oversized_data_are_refused() {
         nodes[0].broadcast(vec![0; max + 1]).await,
         Err(Error::MessageTooLarge)
     ));
-    assert_eq!(nodes[0].stats().metrics.user_messages_too_large, 2);
+    // Command replies can wake the caller before the actor publishes its stats.
+    wait_until("both oversized messages are counted", || {
+        nodes[0].stats().metrics.user_messages_too_large == 2
+    })
+    .await;
     // A member's own Member value, epoch included, is a valid recipient.
     assert!(send(n1, vec![1]).await.is_ok());
     // A node that left sends nothing more.

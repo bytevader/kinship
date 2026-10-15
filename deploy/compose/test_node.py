@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
 
 import httpx
@@ -14,9 +14,9 @@ from node import (
     FENCE_HEADER,
     HOP_HEADER,
     MAX_HOPS,
+    CacheMessages,
     cache_ring,
     create_app,
-    drop_moved,
     watch_ring,
 )
 
@@ -129,6 +129,11 @@ class FakeRing:
 
     def owner(self, key, *, new_work=False):
         self.calls.append((key, new_work))
+        if key in self.movement:
+            owner = self.movement[key][1]
+            if owner is None:
+                raise LookupError("empty ring")
+            return owner
         return self._owner(new_work)
 
     def _owner(self, new_work):
@@ -248,18 +253,21 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get("/kv/key-01")).status_code, 503)
         self.assertEqual((await self.client.put("/kv/key-01", json="v")).status_code, 503)
 
-    async def test_local_drain_drops_values_immediately(self):
+    async def test_local_drain_hands_off_values_immediately(self):
         calls = []
 
         async def update_meta(**changes):
             calls.append(changes)
+            self.ring.read_owner = self.ring.write_owner = member("node-2")
 
-        self.app.state.cluster = SimpleNamespace(update_meta=update_meta)
+        self.app.state.cluster.update_meta = update_meta
+        self.app.state.cluster.send = AsyncMock()
         self.app.state.data["key-01"] = "v"
         response = await self.client.post("/fault/drain")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.app.state.data, {})
         self.assertEqual(calls, [{"role": "draining"}])
+        self.app.state.cluster.send.assert_awaited_once()
         response = await self.client.post("/fault/undrain")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(calls[-1], {"role": "cache"})
@@ -270,7 +278,9 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
             "move": (member(), member("node-2")),
             "lost": (member(), None),
         }
-        drop_moved(data, self.ring, "node-1", (), ())
+        await CacheMessages(data, "node-1").handoff(
+            SimpleNamespace(send=AsyncMock()), self.ring, (), ()
+        )
         self.assertEqual(data, {"stay": "v"})
 
     async def test_values_and_keys_are_bounded(self):
@@ -287,7 +297,14 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
         async def changes():
             yield SimpleNamespace(members=(member("node-2"),))
 
-        await watch_ring(data, self.ring, "node-1", (member(),), changes())
+        await watch_ring(
+            CacheMessages(data, "node-1"),
+            SimpleNamespace(send=AsyncMock()),
+            self.ring,
+            (member(),),
+            changes(),
+            lambda: None,
+        )
         self.assertEqual(data, {})
 
     async def test_recovery_evicts_temporary_write_fallback_without_normal_move(self):
@@ -299,8 +316,30 @@ class NodeTests(unittest.IsolatedAsyncioTestCase):
         async def changes():
             yield SimpleNamespace(members=(member("node-2"),))
 
-        await watch_ring(data, self.ring, "node-1", (member("node-2"),), changes())
+        await watch_ring(
+            CacheMessages(data, "node-1"),
+            SimpleNamespace(send=AsyncMock()),
+            self.ring,
+            (member("node-2"),),
+            changes(),
+            lambda: None,
+        )
         self.assertEqual(data, {})
+
+    async def test_flush_broadcasts_and_applies_locally_without_a_self_event(self):
+        import json
+
+        self.app.state.cluster.broadcast = AsyncMock()
+        self.app.state.data["key"] = "v"
+        response = await self.client.post("/fault/flush")
+        self.assertEqual(response.status_code, 200)
+        payload = self.app.state.cluster.broadcast.await_args.args[0]
+        self.assertLess(len(payload), 256)
+        self.assertEqual(json.loads(payload)["id"], response.json()["flush_id"])
+        self.assertEqual(self.app.state.data, {})
+        stats = (await self.client.get("/cache/stats")).json()
+        self.assertEqual(stats["flushes"], 1)
+        self.assertEqual(stats["last_flush_id"], response.json()["flush_id"])
 
 
 if __name__ == "__main__":

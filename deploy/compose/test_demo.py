@@ -38,6 +38,17 @@ async def events(*values):
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_messages_do_not_stop_the_membership_observer(self):
+        view = View(Cluster())
+        await view.consume(
+            events(
+                kinship.UserMessage(member(), b'{"type":"flush","id":"abc"}', True),
+                kinship.MemberJoined(member()),
+            )
+        )
+        self.assertEqual(view.members["node-3"]["state"], "ALIVE")
+        self.assertEqual([entry["kind"] for entry in view.log], ["MemberJoined"])
+
     async def test_suspect_ownership_and_movement_are_in_sse_snapshot(self):
         old = member(state=kinship.State.SUSPECT)
         fallback = member("node-4")

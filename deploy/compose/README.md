@@ -26,7 +26,7 @@ Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
 The default image installs `kinship[fastapi]>=0.4` from PyPI on
 `python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
-`Ring.fence()`, new in 0.3, and the metrics endpoint, new in 0.4. To try
+`Ring.fence()`, new in 0.3, and user messages and the metrics endpoint, new in 0.4. To try
 changes in this checkout, build a release wheel from source, with maturin and
 Rust 1.85.1 in a separate build stage:
 
@@ -108,9 +108,25 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   moved flash. Hover a key to see its normal owner and its new-write owner.
 - SUSPECT owners retain their keys and get a dashed amber outline, while new writes
   go to an ALIVE fallback. Reads still target the suspect owner.
-- DEAD, LEFT and draining nodes own no keys. `ring.changes()` and `ring.moved()`
-  drop values a node no longer owns. Draining also clears its own cache at once,
+- DEAD, LEFT and draining nodes own no keys. Before dropping moved values,
+  `ring.changes()` and `ring.moved()` trigger a warm handoff with
+  `cluster.send(member, data)`. Each new owner reads `UserMessage` events and
+  accepts only keys it currently owns and does not already hold, so a delayed
+  handoff cannot overwrite a fresher PUT. Encoded batches fit the 64 KiB message
+  limit, including escaped or Unicode values. Drain does this explicitly too,
   since a node gets no membership event about its own metadata change.
+- **Keys handed off / received** count values queued for sending and accepted
+  by that node, per run. A queued send does not prove delivery; messages are
+  best effort. Drain, Undrain and joins can keep moved keys warm. A crash sends
+  no handoff and loses its values: compare the resulting misses.
+- **Flush** broadcasts a short command with a unique id through kinship gossip.
+  Each cache node clears once per id and logs it. The sender clears itself
+  directly because kinship does not deliver its own broadcast back to it.
+  Each card shows the full last flush id and its applied count, and the event
+  log reports applications observed by polling. A stale card retains its last
+  observed values, explicitly marked as such.
+  Handoffs carry the sender's last flush id and are accepted only when it
+  matches the receiver's: a late batch cannot bring pre-flush values back.
 - A node that was paused or cut off keeps its values, but meanwhile its peers
   suspected it or declared it dead and sent writes elsewhere. When it comes back
   it refutes by raising its incarnation, and on seeing that it drops its whole
@@ -140,8 +156,9 @@ limit bounds forwarding while views disagree. Writes use `new_work=True`.
   Browsers reconnect to a current snapshot. Restarting the dashboard clears
   counters/history; refreshing the page does not.
 
-This is a **volatile cache**, without replication or key transfer. A new owner
-starts cold, and restarting/undraining a node does not restore its old values.
+This is a **volatile cache**, without replication or handoff acknowledgements.
+A lost handoff or one arriving before ownership or flush views converge leaves a cold key;
+it is not retried. Restarting a node does not restore values lost in its crash.
 Membership and ownership are eventually consistent, rather than a distributed
 lock or a guarantee against concurrent writes during a partition.
 
@@ -159,7 +176,8 @@ the optional profile below.
 | **Crash** | `os._exit(1)` sends no leave. Watch SUSPECT, DEAD, moved keys and misses, then MemberJoined when `restart: on-failure` starts it again, at a new epoch. | Automatic, including the 15-second startup delay. |
 | **Bounce** | `os._exit(1)` too, but the next run skips the startup delay, so it is usually back, a few seconds later, before anyone declares it dead. Its later epoch replaces the old run on every node at once, though its incarnation starts again at 0: MemberLeft, MemberJoined and a New run entry, perhaps after a SUSPECT, with no DEAD. Its keys keep their owner but start cold, and with Load on, writes forwarded with the old run's token count as fenced. | Automatic, within a few seconds. |
 | **Leave** | The node calls `leave()` and exits 0. Watch LEFT, moved keys and misses; Docker leaves it down. | **Start** with the chaos profile, or `docker compose start node-3`; the dashboard frees the fault slot once the node reports itself ALIVE. |
-| **Drain** | Metadata changes to `role=draining`. The member stays ALIVE but its keys move to cache members. | **Undrain** returns `role=cache`; some keys move back, cold. |
+| **Drain** | Metadata changes to `role=draining`. The member stays ALIVE; watch its handed-off count and peers' received counts rise as moved keys arrive warm. Pause Load after warming to check that GETs still succeed without replacement PUTs. | **Undrain** returns `role=cache`; peers hand the returning keys back warm. |
+| **Flush** | Watch every reachable cache show the same last flush id and increment its applied count once. With Load paused, all 64 keys become misses. Flush has no fault slot and remains available on reachable nodes during a partition. | Warm again with PUTs; Load's initial warmup runs only once. |
 | **Pause** | Docker freezes the entire process, including kinship's thread. Watch SUSPECT outlines, then DEAD and changed owners. | **Unpause**; wait for recovery/rejoin. |
 | **Kill** | SIGKILL models a process crash. Watch failure detection and lost values. Docker counts a kill as a manual stop, so `restart: on-failure` leaves it down. | **Start**. |
 | **Restart** | Docker stops and starts the process. A normal stop sends LEFT; values are lost and the node rejoins after the startup delay. | Automatic. |
@@ -174,6 +192,15 @@ Docker will restart it, so the card offers no recovery button.
 A partition of `node-3`: its peers and the dashboard now see 5 members, its
 own count is stale because its HTTP API is out of reach, and its card offers
 **Reconnect**.
+
+While `node-3` is partitioned, press **Flush** on a reachable node. The other
+four cards show its new id once each; `node-3`'s stale card retains the old id.
+Keep it cut off until the broadcast has finished spreading (about 15 seconds),
+then Reconnect and compare its live last flush id: it missed that command.
+Broadcasts have no history repair, so healing the partition does not replay it.
+The known brief membership flap on reconnect is unchanged. To film warm handoff,
+use Drain and Undrain before this scene, with Load paused after warming: watch
+ownership colours move and handoff counters rise while the moved keys stay warm.
 
 ![node-3 DEAD behind a partition, with member counts that disagree](screenshots/partition.jpg)
 

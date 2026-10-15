@@ -224,6 +224,7 @@
       ['bounce', 'Bounce', 'Exit without leaving and come straight back as a new run: peers swap the old run for the new one at once'],
       ['leave', 'Leave', 'Leave the cluster gracefully and exit. Peers mark it LEFT at once'],
       ['drain', 'Drain', 'Set role=draining: still ALIVE, but its keys move to the other cache nodes'],
+      ['flush', 'Flush', 'Broadcast a cache flush through kinship. A cut-off node misses it; compare last flush IDs'],
     ];
     const DOCKER_FAULTS = [
       ['pause', 'Pause', 'Freeze the whole container, kinship included, so it stops answering probes'],
@@ -243,7 +244,7 @@
       crash: (n, manual) => `${n} exited without leaving. Watch it turn SUSPECT, then DEAD, while its keys take on other colours. Docker restarts it after a 15-second startup delay and it rejoins.`,
       bounce: (n, manual) => `${n} exited and Docker is starting it again without the startup delay, usually before anyone declares it dead. Its new run has a later epoch, so every node swaps the old run for it at once: MemberLeft, MemberJoined, no DEAD, even though its incarnation started again at 0. Its keys keep their colour but start cold, and a write still fenced with the old run's epoch is refused.`,
       leave: (n, manual) => `${n} left gracefully, so peers marked it LEFT at once, with no suspicion. ${manual ? `Press Start to bring it back, or run docker compose start ${n}.` : CHAOS_RECOVERS}`,
-      drain: (n, manual) => `${n} is still ALIVE but no longer role=cache, so the ring handed its keys to the others without anyone failing. ${manual ? 'Press Undrain to take them back.' : CHAOS_RECOVERS}`,
+      drain: (n, manual) => `${n} is still ALIVE but no longer role=cache. Watch handed off / received rise as its keys arrive warm through kinship messages. ${manual ? 'Press Undrain to hand them back warm.' : CHAOS_RECOVERS}`,
       pause: (n, manual) => `Docker froze ${n}, kinship included. Its keys get a dashed outline while it is SUSPECT, then move when it is DEAD. ${manual ? 'Press Unpause: it' : 'When it is unpaused it'} refutes, rejoins, and drops values that may be stale.`,
       kill: (n, manual) => `${n} got SIGKILL. Docker treats that as a manual stop, so it stays down. ${manual ? 'Press Start.' : CHAOS_RECOVERS}`,
       restart: (n, manual) => `${n} stopped cleanly (LEFT) and is starting again; it rejoins after its 15-second startup delay.`,
@@ -286,14 +287,17 @@
       const label = el('span', '', 'keys owned'); row.append(label, keys);
       const bar = el('div', 'bar'); const fill = el('i'); bar.append(fill); share.append(row, bar);
       const view = el('div', 'view', 'Waiting for its view…');
+      const messages = el('div', 'view', 'Handoff: waiting…');
+      const flush = el('div', 'view', 'Last flush: none');
+      flush.style.overflowWrap = 'anywhere';
       const feedback = el('div', 'feedback');
       const faults = el('div', 'actions'); faults.dataset.label = 'In the app'; for (const [a, l, t] of FAULTS) faults.append(button(name, a, l, t, feedback));
       const docker = el('div', 'actions docker'); docker.dataset.label = 'Docker'; for (const [a, l, t] of DOCKER_FAULTS) docker.append(button(name, a, l, t, feedback));
       const recover = el('div', 'actions recover'); recover.dataset.label = 'Recover';
       for (const a of ['undrain', 'unpause', 'start', 'connect']) recover.append(button(name, a, RECOVER_LABELS[a], `Recover ${name}: ${RECOVER_LABELS[a].toLowerCase()}`, feedback));
-      card.append(head, meta, share, view, recover, faults, docker, feedback);
+      card.append(head, meta, share, view, messages, flush, recover, faults, docker, feedback);
       $('#nodes').append(card);
-      nodeViews.set(name, { card, badge, meta, keys, fill, view, faults, docker, recover });
+      nodeViews.set(name, { card, badge, meta, keys, fill, view, messages, flush, faults, docker, recover });
     }
     for (const name of NAMES) {
       const item = el('span', '', name); const swatch = el('i'); swatch.style.setProperty('--c', COLOURS[name]);
@@ -360,6 +364,10 @@
         v.fill.style.width = `${Math.min(100, (owned[name] / 25.6) * 100)}%`;
         v.view.className = count && !count.reachable ? 'view stale' : 'view';
         v.view.textContent = !count ? 'Waiting for its view…' : count.reachable ? `Sees ${count.count} members` : `HTTP unreachable · last saw ${count.count ?? '?'}`;
+        const stats = count?.cache;
+        v.messages.className = v.flush.className = count && !count.reachable ? 'view stale' : 'view';
+        v.messages.textContent = stats ? `Keys handed off ${stats.handed_off} · received ${stats.received}` : 'Handoff: waiting…';
+        v.flush.textContent = `Last flush: ${stats?.last_flush_id ?? 'none'} · applied ${stats?.flushes ?? 0}${count && !count.reachable ? ' (last seen)' : ''}`;
 
         const unhealthy = st !== 'ALIVE' || role !== 'cache' || (count && !count.reachable);
         // A fault that recovers by itself (a crash, a stall, or one random chaos owns) needs no button.
@@ -378,8 +386,9 @@
         v.recover.hidden = shown === 0;
         v.docker.hidden = !s.docker_enabled;
         for (const b of [...v.faults.children, ...v.docker.children]) {
-          b.disabled = locked;
-          b.title = locked && !busy ? (s.chaos_enabled ? 'Stop random chaos first' : 'Recover the current fault first') : [...FAULTS, ...DOCKER_FAULTS].find(f => f[0] === b.dataset.action)[2];
+          const blocked = b.dataset.action === 'flush' ? !!busy || (count && !count.reachable) || st !== 'ALIVE' : locked;
+          b.disabled = blocked;
+          b.title = blocked && !busy && b.dataset.action !== 'flush' ? (s.chaos_enabled ? 'Stop random chaos first' : 'Recover the current fault first') : [...FAULTS, ...DOCKER_FAULTS].find(f => f[0] === b.dataset.action)[2];
         }
       }
 
