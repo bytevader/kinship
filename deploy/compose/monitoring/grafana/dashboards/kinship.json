@@ -1,0 +1,538 @@
+{
+  "uid": "kinship-cluster",
+  "title": "Kinship cluster",
+  "description": "Protocol activity and membership views from the five cache nodes. The demo dashboard is a sixth member, but is not scraped.",
+  "tags": [
+    "kinship",
+    "swim"
+  ],
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": false,
+  "refresh": "5s",
+  "timezone": "browser",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(up{job=\"kinship\"}, node)",
+        "query": {
+          "query": "label_values(up{job=\"kinship\"}, node)",
+          "refId": "NodeVariable"
+        },
+        "refresh": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP scrape availability",
+      "type": "timeseries",
+      "description": "1 = HTTP metrics answered; 0 = scrape failed. A blocked FastAPI event loop can fail a scrape while the Rust membership thread remains healthy.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"kinship\",node=~\"$node\"}",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Each node's membership view",
+      "type": "timeseries",
+      "description": "Expect six alive members: five cache nodes and the demo dashboard. Each series is one node's view; do not sum across reporters. Dead/left tombstones are excluded by members().",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kinship_members{job=\"kinship\",node=~\"$node\",state=\"alive\"}",
+          "legendFormat": "{{node}} alive",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "kinship_members{job=\"kinship\",node=~\"$node\",state=\"suspect\"}",
+          "legendFormat": "{{node}} suspect",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Lifeguard local health",
+      "type": "timeseries",
+      "description": "Lower is healthier. Missing samples are gaps, not zeroes.",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kinship_local_health{job=\"kinship\",node=~\"$node\"}",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Probe rates",
+      "type": "timeseries",
+      "description": "Per-second counters; rates handle counter resets when nodes restart.",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(kinship_probes_sent_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} sent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "rate(kinship_probes_failed_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "rate(kinship_indirect_probes_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} indirect",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Suspicions and refutations",
+      "type": "timeseries",
+      "description": "Try a crash or Docker pause. Suspicions concern peers; refutations defend this node's own life.",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(kinship_suspicions_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} suspicions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "rate(kinship_refutations_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} refutations",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Restarts observed in the last 5 minutes",
+      "type": "timeseries",
+      "description": "Restarts seen by each reporter, not its own restart count. Bounce a cache node; peers record its new epoch. Increase is extrapolated and can be fractional.",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(kinship_restarts_total{job=\"kinship\",node=~\"$node\"}[5m])",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Packet receive rates",
+      "type": "timeseries",
+      "description": "Membership packets received per second.",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(kinship_packets_received_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Decode and decrypt failure rates",
+      "type": "timeseries",
+      "description": "Normally zero in this isolated plaintext demo.",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(kinship_decode_errors_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} decode",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "rate(kinship_decrypt_failures_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} decrypt",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "rate(kinship_replays_dropped_total{job=\"kinship\",node=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "{{node}} replay drops",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true
+        }
+      ]
+    }
+  ]
+}

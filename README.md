@@ -363,6 +363,55 @@ async def get(key: str, ring: CacheRing) -> dict[str, str] | RedirectResponse:
 - kinship's own traffic is not HTTP: gossip runs over UDP and TCP, encrypted with XChaCha20-Poly1305. Whether your app serves HTTP or HTTPS is up to your server or proxy; put the scheme in the URL you publish in metadata, as above.
 - `httpx.ASGITransport` does not run the lifespan; in tests, enter `app.router.lifespan_context(app)` around the client. [`examples/fastapi_app.py`](https://github.com/bytevader/kinship/blob/main/examples/fastapi_app.py) runs three apps in one process that way.
 
+## Metrics
+
+`kinship.metrics.prometheus_text(cluster)` exports Prometheus text without extra dependencies,
+from either `kinship.Cluster` or `kinship.blocking.Cluster`:
+
+```python
+from kinship.metrics import prometheus_text
+
+print(prometheus_text(cluster))  # a started cluster
+```
+
+Every `Stats` field is a `kinship_<field>_total` counter, except `local_health`, which is
+the `kinship_local_health` gauge. All samples have a `node` label with the local member's
+name. Counters reset when the node restarts. `kinship_members` gauges have a `state` label
+(`alive`, `suspect`, `dead`, `left`), counted from `cluster.members()`. That API excludes
+dead and left tombstones, so those two gauges are zero.
+
+With the FastAPI integration, opt into an HTTP endpoint (disabled by default):
+
+```python
+app.include_router(cluster_router(metrics=True))  # GET /cluster/metrics
+# Use cluster_router(prefix="", metrics=True) for GET /metrics.
+```
+
+Configure Prometheus to scrape each node's HTTP server, for example:
+
+```yaml
+scrape_configs:
+  - job_name: kinship
+    metrics_path: /cluster/metrics
+    static_configs:
+      - targets: ["node-1:8000", "node-2:8000"]
+```
+
+Expose this endpoint only to trusted scrapers. Give each node its own scrape target;
+with several server workers sharing an HTTP port, a scrape can reach a different node
+each time.
+
+The [five-node Compose demo](deploy/compose/README.md#prometheus-and-grafana) includes
+an optional Prometheus and Grafana override with a provisioned cluster dashboard:
+
+```sh
+cd deploy/compose
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build -d
+```
+
+Open Grafana at <http://localhost:3000/d/kinship-cluster> and the demo at
+<http://localhost:8080> to watch metrics while injecting faults.
+
 ## Examples
 
 Runnable scripts in [examples/](https://github.com/bytevader/kinship/blob/main/examples), each a single file with nothing to install beyond kinship, except `fastapi_app.py`, which needs `kinship[fastapi]` and httpx:
