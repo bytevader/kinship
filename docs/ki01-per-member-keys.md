@@ -11,7 +11,7 @@ A plan for closing KI-01 in SECURITY.md: any member that holds the cluster key c
 - Wire version 2 is version 1 with signatures appended to the messages that carry them and two new message types. 0.4 nodes skip what they do not know, so a cluster moves to it one node at a time, and KI-01 is closed once every node runs with `require_signatures`.
 - Cost, measured in kinship-sim with realistic names and metadata: 71% to 90% more bytes per node, from 0.85 to 1.47 KB/s at 100 nodes and from 6.7 to 12.0 KB/s at 1,000 in a calm cluster, most of it the signatures in push-pull records and, under stress, in rumours. Signing takes 29 µs and verifying 82 µs on the laptop used for the tuning sweep; a node checked 1 to 14 signatures a second, at most about a thousandth of a core.
 
-The decisions this plan needs are listed at the end, under [Decisions](#decisions).
+The choices accepted by Nikola on 2026-10-16 are recorded under [Decisions](#decisions). Approval is for this design; implementation remains future work and KI-01 stays Accepted until the completion criteria below are met.
 
 ## 1. Threat model
 
@@ -359,6 +359,19 @@ Each stage is one or more pull requests that leave main releasable. Nothing chan
 **What moves KI-01 from Accepted to Fixed.** Stage 3 merged, with the rogue-node sweep and the KI-01 test running in CI, and stages 4 and 5 merged, so that an operator can issue, renew and revoke certificates and turn `require_signatures` on from Python. KI-01's entry then reads, as KS-04's does for plaintext: Fixed with member identities in mode `require`; without identities the cluster trusts every key holder as before. Its What remains lists [what a member can still do](#1-threat-model), and KI-03's and KI-04's What remains drop the parts about names. Until then KI-01 stays Accepted, and each stage's pull request updates SECURITY.md with what it changed.
 
 ## Decisions
+
+**Accepted by Nikola on 2026-10-16.** The following selections resolve the alternatives listed below:
+
+1. Use a cluster CA to bind member names to signing keys.
+2. Treat a third party's Dead as a confirmation, with the proposed K + 1 signed-reporter shortcut. Validate it against the partition-heal fix during implementation.
+3. Sign Acks and preserve the target's signature through indirect probes.
+4. Accept the estimated 71% to 90% bandwidth increase for the opt-in mode; digest push-pull is not a prerequisite.
+5. Use wire version 2 with per-recipient negotiation.
+6. Accept replay of a departed member's last Alive until its certificate expires; periodic re-signing is not required by this plan.
+7. Ship as an opt-in feature in a 1.x minor release after 1.0.
+8. Keep internal crates on 0.x and pin their exact versions from the stable kinship facade, as recorded in [the stability policy](stability.md).
+
+The original alternatives and their tradeoffs are retained for context:
 
 1. **The binding.** A cluster CA, as recommended, or an allow-list, which is simpler for fixed fleets but cannot follow a cluster that scales. First sight cannot close KI-01.
 2. **A third party's Dead.** A confirmation, with a node declaring death at once from K + 1 signed reporters, as proposed; or Deads only from a node's own timer, which is simpler and costs detection time at the tail. Either way it should agree with what `fix/partition-heal-flap` does for version 1.

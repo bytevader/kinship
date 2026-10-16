@@ -73,7 +73,7 @@ These may change in any release, minor or patch, with a CHANGELOG entry but with
 - **Performance**: detection latency, bandwidth, memory and CPU are measured and published, not promised. A release may trade one for another within the rule in `docs/results/tuning.md`.
 - **Opt-in features marked experimental** in the CHANGELOG when they ship, such as per-member keys while their plan is in progress.
 
-The published crates have one version today. For 1.0, either the internal crates keep 0.x versions of their own and `kinship` 1.x pins the exact ones it was built with, or they move to 1.0 with it and say in their documentation that their API is outside the promise. The first is what Cargo users read correctly; the choice is open.
+The published crates have one version today. **Decision accepted by Nikola on 2026-10-16:** for 1.0, the internal crates keep 0.x versions of their own and `kinship` 1.x pins the exact ones it was built with. The stable facade remains responsible for preserving its public contract when it updates those dependencies.
 
 ## Deprecation policy
 
