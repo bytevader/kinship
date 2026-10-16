@@ -676,6 +676,8 @@ The same seed, nonce key and inputs always give the same outputs, byte for byte,
 - [Design](https://github.com/bytevader/kinship/blob/main/docs/design.md): the protocol state machine, wire format, threading model and failure modes.
 - [Benchmarks](https://github.com/bytevader/kinship/blob/main/docs/results/detection.md): detection latency against memberlist, and the [timing preset sweep](https://github.com/bytevader/kinship/blob/main/docs/results/tuning.md).
 - [Security](https://github.com/bytevader/kinship/blob/main/SECURITY.md): the threat model, the audit findings and how to report a vulnerability.
+- [Per-member keys](https://github.com/bytevader/kinship/blob/main/docs/ki01-per-member-keys.md): the plan for KI-01, so that a member holding the cluster key can no longer speak for the others.
+- [Stability](https://github.com/bytevader/kinship/blob/main/docs/stability.md): what 1.0 will promise, what stays unstable, and how deprecations work.
 - [Changelog](https://github.com/bytevader/kinship/blob/main/CHANGELOG.md).
 
 ## License

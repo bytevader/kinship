@@ -9,14 +9,15 @@
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.
 - Protocol review fixes KP-01..KP-05 (`docs/review.md`) and security fixes KS-01..KS-08 (`SECURITY.md`) are merged.
-- Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance.
+- Compromised-member findings KI-02, KI-04 and KI-06 are fixed and KI-03 is mitigated; their reproductions in `crates/kinship-core/tests/open_findings.rs` now assert the fixes. KS-09 and KI-01 are accepted, and KI-05 is application guidance. `docs/ki01-per-member-keys.md` plans the fix for KI-01: per-member Ed25519 keys bound to names by a cluster CA, in wire version 2, not implemented yet.
 - Member epochs, one per run of a node, let a restart replace the old run at any incarnation (`docs/design.md`, Epochs); `Ring.fence()` provides tokens from those epochs, and the Compose demo's Bounce fault demonstrates a restart.
 - Timing preset tuning is done: no variant beats `lan()` at every cluster size without false deaths or more than 10% bandwidth, so `lan()` keeps memberlist's values; see `docs/results/tuning.md`.
 - User messages (0.4): `send(member, data)` and `broadcast(data)`, delivered as `UserMessage` events, on wire types 0x09 and 0x0A (`docs/design.md`, User messages). With none sent, the wire bytes and the pinned SWIM trace are those of 0.3. Broadcasts reach about 99.8% of members in the simulator, with nothing to repair a miss.
 
 ## Where to look
 
-- `docs/design.md`: architecture and design decisions. `README.md`: the public API contract.
+- `docs/design.md`: architecture and design decisions. `README.md`: the public API contract. `docs/stability.md`: what 1.0 promises, what stays unstable, and the deprecation policy; check a public change against it.
+- `docs/ki01-per-member-keys.md`: the staged plan for per-member keys (KI-01), with its threat model, wire changes and measured cost.
 - `crates/kinship-proto`: wire types, codec, AEAD framing.
 - `crates/kinship-core`: sans-IO protocol state machine (`Node`). It never touches a clock, socket or RNG. User messages live in `user.rs`, their broadcast queue beside the membership queue in `broadcast.rs`.
 - `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version.

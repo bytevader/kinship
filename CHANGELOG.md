@@ -6,6 +6,7 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ### Added
 
+- **Plans for 1.0 and KI-01.** `docs/stability.md` proposes what 1.0 promises (the Python API, the Rust facade, wire version 1, config defaults and events), what stays unstable, and a deprecation policy; `docs/ki01-per-member-keys.md` plans per-member Ed25519 keys bound to names by a cluster CA, with signed rumours, Acks and user messages in a wire version 2 that 0.4 nodes coexist with, its measured cost and the stages that would move KI-01 to Fixed. Neither changes code.
 - **Compose demo messages.** Cache nodes hand moved keys to their new owner with `cluster.send` on Drain, Undrain and joins, so those keys stay warm, and a Flush action clears every reachable cache with `cluster.broadcast`. A handoff carries the time the sender's cache was last emptied and is refused by a node that applied a later flush, so a late batch cannot bring flushed values back while a restarted node still exchanges warm keys. See `deploy/compose/README.md`.
 
 ## [0.4.0] - 2026-10-15
