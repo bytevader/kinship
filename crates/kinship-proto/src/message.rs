@@ -7,7 +7,7 @@ use crate::error::{DecodeError, EncodeError};
 use crate::limits::Limits;
 use crate::wire::{Count, Reader, Sink, varint_len};
 
-/// Wire type bytes of the messages defined for version 1.
+/// Wire type bytes. Identity messages require the explicitly selected v2 grammar.
 pub mod kind {
     pub const PING: u8 = 0x01;
     pub const PING_REQ: u8 = 0x02;
@@ -21,6 +21,8 @@ pub mod kind {
     pub const USER_MESSAGE: u8 = 0x09;
     /// From 0.4; nodes older than that skip it as a type they do not know.
     pub const USER_BROADCAST: u8 = 0x0A;
+    pub const CERTIFICATE: u8 = 0x0B;
+    pub const REVOCATION: u8 = 0x0C;
 }
 
 /// A node name: UTF-8, 1 to [`NodeId::MAX_LEN`] bytes. Borrowed, so decoding allocates nothing.
@@ -67,7 +69,7 @@ pub enum State {
 }
 
 impl State {
-    fn from_wire(b: u8) -> Result<Self, DecodeError> {
+    pub(crate) fn from_wire(b: u8) -> Result<Self, DecodeError> {
         match b {
             0 => Ok(Self::Alive),
             1 => Ok(Self::Suspect),
@@ -299,7 +301,7 @@ pub enum Message<'a> {
     UserBroadcast(UserBroadcast<'a>),
 }
 
-fn put_addr<S: Sink>(s: &mut S, addr: &SocketAddr) {
+pub(crate) fn put_addr<S: Sink>(s: &mut S, addr: &SocketAddr) {
     match addr.ip() {
         IpAddr::V4(ip) => {
             s.put_u8(4);
@@ -313,7 +315,7 @@ fn put_addr<S: Sink>(s: &mut S, addr: &SocketAddr) {
     s.put_u16(addr.port());
 }
 
-fn read_addr(r: &mut Reader<'_>) -> Result<SocketAddr, DecodeError> {
+pub(crate) fn read_addr(r: &mut Reader<'_>) -> Result<SocketAddr, DecodeError> {
     let ip = match r.u8()? {
         4 => IpAddr::V4(Ipv4Addr::from(r.array::<4>()?)),
         6 => IpAddr::V6(Ipv6Addr::from(r.array::<16>()?)),
@@ -322,17 +324,17 @@ fn read_addr(r: &mut Reader<'_>) -> Result<SocketAddr, DecodeError> {
     Ok(SocketAddr::new(ip, r.u16()?))
 }
 
-fn put_node<S: Sink>(s: &mut S, id: &NodeId<'_>) {
+pub(crate) fn put_node<S: Sink>(s: &mut S, id: &NodeId<'_>) {
     s.put_bytes(id.as_str().as_bytes());
 }
 
-fn read_node<'a>(r: &mut Reader<'a>) -> Result<NodeId<'a>, DecodeError> {
+pub(crate) fn read_node<'a>(r: &mut Reader<'a>) -> Result<NodeId<'a>, DecodeError> {
     let bytes = r.bytes()?;
     let s = core::str::from_utf8(bytes).map_err(|_| DecodeError::BadNodeId)?;
     NodeId::new(s)
 }
 
-fn read_bool(r: &mut Reader<'_>) -> Result<bool, DecodeError> {
+pub(crate) fn read_bool(r: &mut Reader<'_>) -> Result<bool, DecodeError> {
     match r.u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -355,7 +357,7 @@ fn read_epoch(r: &mut Reader<'_>) -> Result<u64, DecodeError> {
     if r.is_empty() { Ok(0) } else { r.u64() }
 }
 
-fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
+pub(crate) fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
     s.put_u32(a.inc);
     put_node(s, &a.node);
     put_addr(s, &a.addr);
@@ -365,7 +367,10 @@ fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
     put_epoch(s, a.epoch);
 }
 
-fn read_alive<'a>(r: &mut Reader<'a>, limits: &Limits) -> Result<Alive<'a>, DecodeError> {
+pub(crate) fn read_alive<'a>(
+    r: &mut Reader<'a>,
+    limits: &Limits,
+) -> Result<Alive<'a>, DecodeError> {
     let inc = r.u32()?;
     let node = read_node(r)?;
     let addr = read_addr(r)?;
@@ -443,7 +448,7 @@ impl<'a> Message<'a> {
         }
     }
 
-    fn put_body<S: Sink>(&self, s: &mut S) {
+    pub(crate) fn put_body<S: Sink>(&self, s: &mut S) {
         match self {
             Self::Ping(p) => {
                 s.put_u32(p.seq);

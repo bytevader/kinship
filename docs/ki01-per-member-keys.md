@@ -1,6 +1,6 @@
 # KI-01: per-member keys
 
-A plan for closing KI-01 in SECURITY.md: any member that holds the cluster key can declare any node dead, claim any name, and send user messages in any member's name. Proposed on 2026-10-15; nothing here is implemented. The protocol it changes is in `docs/design.md`, and the threat model it builds on is in SECURITY.md.
+A plan for closing KI-01 in SECURITY.md: any member that holds the cluster key can declare any node dead, claim any name, and send user messages in any member's name. Proposed on 2026-10-15. Stage 1 identity primitives and explicitly selected codec support now exist in kinship-proto; the runtime feature remains planned for an opt-in release after 1.0. The protocol it changes is in `docs/design.md`, and the threat model it builds on is in SECURITY.md.
 
 ## Summary
 
@@ -11,7 +11,9 @@ A plan for closing KI-01 in SECURITY.md: any member that holds the cluster key c
 - Wire version 2 is version 1 with signatures appended to the messages that carry them and two new message types. 0.4 nodes skip what they do not know, so a cluster moves to it one node at a time, and KI-01 is closed once every node runs with `require_signatures`.
 - Cost, measured in kinship-sim with realistic names and metadata: 71% to 90% more bytes per node, from 0.85 to 1.47 KB/s at 100 nodes and from 6.7 to 12.0 KB/s at 1,000 in a calm cluster, most of it the signatures in push-pull records and, under stress, in rumours. Signing takes 29 µs and verifying 82 µs on the laptop used for the tuning sweep; a node checked 1 to 14 signatures a second, at most about a thousandth of a core.
 
-The choices accepted by Nikola on 2026-10-16 are recorded under [Decisions](#decisions). Approval is for this design; implementation remains future work and KI-01 stays Accepted until the completion criteria below are met.
+The choices accepted by Nikola on 2026-10-16 are recorded under [Decisions](#decisions). Stage 1 codec support exists; the remaining runtime feature is future work and KI-01 stays Accepted until the completion criteria below are met.
+
+**Implementation status.** [Stage 1 notes](ki01-stage1.md) specify the exact canonical grammar, signature domains and replay bindings used by the experimental codec, including details absent from the size sketch below. Every member-signed statement binds its certificate id, probe answers explicitly name their requester and target, and push-pull preserves the original Alive incarnation beside an independent Left proof. These additions require Stage 2 to remeasure the sketch's bandwidth and size estimates. The notes also record the probe challenge security decision raised during implementation. Stages 2 through 5 remain unimplemented; existing nodes advertise and emit version 1 and enforce no member signatures. KI-01 remains Accepted.
 
 ## 1. Threat model
 
@@ -28,7 +30,7 @@ The table lists what a key holder can do today, and what is left of it once the 
 | Invent reporter names to bring a suspicion down to the minimum timeout | **Stopped.** A reporter is a member with a certificate, and each confirmation is its own signature. |
 | Claim names nobody holds, before their owners start or after their tombstones are reaped, and so choose rendezvous weights (KI-03, What remains) | **Stopped.** A name needs a certificate for it. |
 | Fill the member table with invented names and point every node's probes at addresses it lists (KI-04, What remains) | **Stopped.** Names need certificates. |
-| Send Acks for probes it never forwarded, keeping a dead member alive in a prober's view; with sequence numbers that are easy to guess, for every prober at once | **Stopped.** An Ack is signed by the probed member and bound to the prober's name, run and sequence number, and it passes through a relay unchanged. |
+| Send Acks for probes it never forwarded, keeping a dead member alive in a prober's view; with sequence numbers that are easy to guess, for every prober at once | **Stopped.** An Ack is signed by the probed member and bound to the prober's name, run, sequence number and unpredictable round challenge, and it passes through a relay unchanged. |
 | Answer PingReqs falsely as a relay | **Narrowed.** As a relay the prober chose, it can drop the target's Ack or send a Nack of its own. It cannot forge the target's Ack, and the prober has two more relays, its direct probe and the TCP fallback. |
 | Send direct messages and broadcasts in any member's name | **Stopped.** Each is signed by its sender. |
 | Number a broadcast far ahead of a member's own, so nodes drop that member's next broadcasts as old copies | **Stopped.** Only the member signs its broadcasts. |
@@ -158,8 +160,8 @@ The library exposes the same operations for an issuing service: `kinship.identit
 | Left (Dead naming its own author) | the member | its epoch and incarnation | as Alive |
 | Suspect | the reporter (`from`) | the suspected member's epoch and incarnation, and the reporter's cluster time `at` | the reporter is a live member it holds, not the suspect; `at` is inside the replay window; then the signature |
 | Dead about another member | the declarer (`from`) | as Suspect | as Suspect; it then counts as a confirmation (below) |
-| Ack | the probed member | the prober's name, the prober's epoch, the prober's sequence number, and its own epoch | the Ack answers a probe this node is running, signed by its target |
-| Nack | the relay | the prober's name, epoch and sequence number | the relay is one this node asked in this round, once each |
+| Ack | the probed member | the prober's name, epoch, sequence number and round challenge; its own name, epoch and certificate id | the Ack answers a probe this node is running, signed by its target |
+| Nack | the relay | the prober's name, epoch, sequence number and round challenge; the target's name; its own name, epoch and certificate id | the relay is one this node asked in this round, once each |
 | UserMessage | the sender | the nonce of the packet that carries it | the sender is a member it holds at that epoch, as now; then the signature |
 | UserBroadcast | the sender | its epoch and sequence number | as now, then the signature, before it is delivered or relayed |
 | PushPull record | the member, through its Alive or Left | as Alive or Left | each record as the Alive or Left it carries |
@@ -184,9 +186,9 @@ Any member with a valid certificate may sign a Suspect about another member, as 
 
 Today an Ack names only a sequence number, so a key holder can answer any prober's round, directly or as a relay.
 
-- A Ping in version 2 carries its source's epoch, and a relay's Ping carries the requester's name, epoch and sequence number, from the PingReq.
-- The target signs its Ack over the requester's name and epoch, the requester's sequence number, and its own name and epoch. A direct Ack's requester is the source of the Ping. A relay forwards the target's signature unchanged, as it forwards the Ack today.
-- The prober accepts an Ack only for the round it is running, signed by the target of that round, whichever path it came by. A crashed member signs nothing, so nobody can keep it alive.
+- A Ping in version 2 carries its source's epoch and a fresh unpredictable 128-bit round challenge, and a relay's Ping also carries the requester's name, epoch and sequence number, from the PingReq. The relay preserves the original requester's challenge.
+- The target signs its Ack over the requester's name, epoch, sequence number and challenge, its own name and epoch, and its certificate id. A direct Ack's requester is the source of the Ping. A relay forwards the target's signature unchanged, as it forwards the Ack today.
+- The prober accepts an Ack only for the exact round and challenge it is running, signed by the target of that round, whichever path it came by. The challenge prevents a key holder from harvesting future-sequence Acks before the target crashes. Stage 2 must use a cryptographically secure source independently for each round.
 - A relay signs its Nack over the same binding, and the prober counts at most one Nack from each relay it asked.
 
 The direct probe, the indirect probes and the TCP fallback stay as they are, with the same timers. Nothing on the indirect path signs or carries an accusation: a relay's statements are its Ping, which needs no signature, and its Nack. Refusing forged Suspects and Deads therefore leaves indirect probes alone, and only the prober whose round failed signs the Suspect that follows.
@@ -203,7 +205,7 @@ A signature does not expire, so a key holder that recorded a statement can put i
 
 ### Version 2
 
-Version 2 keeps version 1's header, AEAD and payload grammar. Every message keeps its version 1 fields first, and the signed messages append theirs:
+Version 2 keeps version 1's header, AEAD and payload grammar. Every message keeps its version 1 fields first, and the signed messages append theirs. The table and cost estimates below are the original proposal's size sketch; [Stage 1 notes](ki01-stage1.md) specify the implemented fields, including certificate-specific bindings, explicit probe names and the accepted challenge. Stage 2 must remeasure these estimates before enabling traffic.
 
 | Message | Appended in version 2 | Bytes added |
 | --- | --- | --- |
@@ -330,10 +332,10 @@ Two changes could win most of it back, and neither needs signatures to be worth 
 
 Each stage is one or more pull requests that leave main releasable. Nothing changes on the wire until stage 2, and nothing is enforced until stage 3.
 
-**Stage 1: kinship-proto.**
+**Stage 1: kinship-proto (primitives and explicit codec support implemented).**
 
 - `kinship_proto::identity`: `SigningKey` (heap-allocated, zeroized, compared in constant time and never printed, as `Key` is), `PublicKey`, `Certificate` and `Revocation` with strict decoders and canonical encoders, and the signed-bytes construction of rule 6.
-- The appended fields of version 2 and the two new message types, `WIRE_VERSION` 2, and `Codec` sealing at a version the caller picks and opening versions 1 and 2.
+- The appended fields of version 2 and the two new message types, highest codec `WIRE_VERSION` 2, and explicit `Codec` entry points sealing at a version the caller picks and opening versions 1 and 2. `DEFAULT_WIRE_VERSION`, existing codec methods and the runtime's exported `WIRE_VERSION` remain 1. [Stage 1 notes](ki01-stage1.md) pin the completed grammar and API isolation.
 - Tests: round trips and one-encoding-per-value property tests for every new field; RFC 8032 test vectors through the wrapper; certificates that are expired, not yet valid, for another cluster, signed by an unknown anchor, or truncated, all refused; a version 2 payload, stamped version 1, parsed by the released kinship-proto 0.4.0 as a dev-dependency, with every known field equal and no decode error; the fuzz targets `decode_payload` and `decode_datagram` given version 2 inputs, and a new `decode_certificate`. `cargo deny` stays clean.
 
 **Stage 2: kinship-core, mode `sign`.**
@@ -370,6 +372,7 @@ Each stage is one or more pull requests that leave main releasable. Nothing chan
 6. Accept replay of a departed member's last Alive until its certificate expires; periodic re-signing is not required by this plan.
 7. Ship as an opt-in feature in a 1.x minor release after 1.0.
 8. Keep internal crates on 0.x and pin their exact versions from the stable kinship facade, as recorded in [the stability policy](stability.md).
+9. **Stage 1 security correction, accepted on 2026-10-16:** add a fresh unpredictable 128-bit challenge per probe round, carried unchanged through Ping/PingReq/Ack/Nack and covered by signed replies. Name, epoch and predictable sequence binding alone lets a key holder harvest Acks to future rounds from a live target and replay them after it crashes. Stage 2 must generate and match the challenge; Stage 1 implements only its wire fields and canonical signature binding.
 
 The original alternatives and their tradeoffs are retained for context:
 

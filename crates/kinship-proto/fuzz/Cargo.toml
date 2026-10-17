@@ -34,3 +34,10 @@ path = "fuzz_targets/decode_payload.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_certificate"
+path = "fuzz_targets/decode_certificate.rs"
+test = false
+doc = false
+bench = false

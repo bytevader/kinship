@@ -211,6 +211,8 @@ sequenceDiagram
 
 ## Wire format
 
+The runtime continues to speak version 1. Experimental identity primitives and an explicitly selected version 2 codec exist in kinship-proto only; [the Stage 1 notes](ki01-stage1.md) specify that grammar and its signature domains. Core signing, negotiation, replay enforcement for signed statements, Python APIs and tools remain planned for an opt-in release after 1.0. The version 1 format and default bytes below are unchanged, and KI-01 remains Accepted.
+
 kinship uses its own versioned binary format: a fixed outer header, an AEAD-sealed body, and inside it a list of length-prefixed messages that old nodes can skip when they do not recognise the type. It is deliberately not compatible with memberlist.
 
 ### Outer packet

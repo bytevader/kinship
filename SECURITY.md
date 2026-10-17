@@ -212,6 +212,8 @@ User messages, from 0.4, are in the same position: they are authenticated to the
 
 **Recommended fix:** per-member signing keys, with rumours about a member's own state (Alive, Left) signed by it and accusations attributed to their author, is the change that would make this a finding with a fix. It belongs in a later wire version.
 
+**Implementation status:** Stage 1 provides identity primitives and an explicitly selected version 2 codec in kinship-proto; [its notes](docs/ki01-stage1.md) pin the canonical bytes and the accepted 128-bit probe challenge correction, which prevents future-round Ack harvesting once the runtime generates and matches those challenges. It does not sign or enforce statements in the core, change accusations, negotiate versions or expose identities to applications. Nodes still advertise and emit version 1, and every key holder is trusted as before. The complete feature remains opt-in work planned after 1.0; KI-01 stays **Accepted** until the completion criteria in [the per-member keys plan](docs/ki01-per-member-keys.md) are met.
+
 ### KI-02 Incarnation u32::MAX evicts a name past the attacker's eviction
 
 **Severity:** Medium. **Status:** Fixed.
