@@ -2,11 +2,35 @@
 #![no_main]
 
 use kinship_proto::tags::{Tags, encode_tags};
-use kinship_proto::{Codec, Limits, Message, PacketKind, Payload};
+use kinship_proto::{Codec, Limits, Message, PacketKind, Payload, v2};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let limits = Limits::default();
+
+    if let Ok(payload) = v2::Payload::parse(data, &limits) {
+        let messages: Vec<_> = payload.iter().collect();
+        assert_eq!(messages.len() + payload.unknown(), payload.count());
+        for message in &messages {
+            let _ = message.encoded_len();
+            let nonce = matches!(message, v2::Message::UserMessage { .. }).then_some(&[7; 24]);
+            let _ = message.signed_bytes(b"golden", nonce);
+            if let v2::Message::PushPull(p) = message {
+                assert_eq!(p.records.iter().count(), p.records.len());
+                assert_eq!(
+                    p.known_certificates.iter().count(),
+                    p.known_certificates.len()
+                );
+                for record in p.records.iter() {
+                    let _ = record.alive_message();
+                    let _ = record.left_message();
+                }
+            }
+        }
+        if payload.unknown() == 0 {
+            assert_eq!(v2::encode_payload(&messages, &limits).unwrap(), data);
+        }
+    }
 
     if let Ok(p) = Payload::parse(data, &limits) {
         let msgs: Vec<Message<'_>> = p.iter().collect();

@@ -50,6 +50,8 @@ pub enum DecodeError {
     MetaTooLarge,
     /// A metadata tag list is malformed.
     BadTags,
+    /// A certificate or revocation body is structurally invalid.
+    BadIdentity,
 }
 
 impl DecodeError {
@@ -84,6 +86,7 @@ impl fmt::Display for DecodeError {
             Self::BadVersionRange => f.write_str("invalid version range"),
             Self::MetaTooLarge => f.write_str("metadata too large"),
             Self::BadTags => f.write_str("malformed metadata tags"),
+            Self::BadIdentity => f.write_str("malformed identity statement"),
         }
     }
 }
@@ -102,6 +105,8 @@ pub enum EncodeError {
     MetaTooLarge,
     /// An Alive record has `vmin > vmax` or `vmin == 0`.
     BadVersionRange,
+    /// A v2 value or signing context has no canonical wire representation.
+    InvalidMessage,
 }
 
 impl fmt::Display for EncodeError {
@@ -111,6 +116,7 @@ impl fmt::Display for EncodeError {
             Self::Empty => f.write_str("no messages to send"),
             Self::MetaTooLarge => f.write_str("metadata too large"),
             Self::BadVersionRange => f.write_str("invalid version range"),
+            Self::InvalidMessage => f.write_str("invalid message or signing context"),
         }
     }
 }

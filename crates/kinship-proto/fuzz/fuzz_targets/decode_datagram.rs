@@ -7,7 +7,9 @@
 //!    run. The result must agree with parsing the bytes directly.
 #![no_main]
 
-use kinship_proto::{Codec, Key, Limits, Message, PacketKind, Payload};
+use kinship_proto::{
+    Codec, Key, Limits, Message, PacketKind, Payload, VersionedPayload, WireVersion, v2,
+};
 use libfuzzer_sys::fuzz_target;
 
 fn codecs() -> (Codec, Codec) {
@@ -27,6 +29,15 @@ fuzz_target!(|data: &[u8]| {
     let (plain, enc) = codecs();
 
     for codec in [&plain, &enc] {
+        let mut versioned = data.to_vec();
+        if let Ok(payload) = codec.open_versioned(PacketKind::Datagram, &mut versioned) {
+            match payload {
+                VersionedPayload::V1(p) => assert_eq!(p.iter().count() + p.unknown(), p.count()),
+                VersionedPayload::V2(p) => assert_eq!(p.iter().count() + p.unknown(), p.count()),
+            }
+        }
+        let mut strict = data.to_vec();
+        let _ = codec.open_v2(PacketKind::Datagram, &mut strict);
         let mut buf = data.to_vec();
         if let Ok(p) = codec.open(PacketKind::Datagram, &mut buf) {
             // Accepted packets must be fully iterable.
@@ -37,6 +48,28 @@ fuzz_target!(|data: &[u8]| {
     // View 3: differential check against the bare payload parser.
     let limits = Limits::default();
     let direct = Payload::parse(data, &limits);
+    let direct_v2 = v2::Payload::parse(data, &limits);
+    for codec in [&plain, &enc] {
+        for version in [WireVersion::V1, WireVersion::V2] {
+            let mut packet = Vec::new();
+            if codec
+                .seal_raw_at(version, PacketKind::Datagram, data, &[9; 24], &mut packet)
+                .is_err()
+            {
+                assert!(data.len() > codec.max_payload_len(PacketKind::Datagram));
+                continue;
+            }
+            let via = codec.open_v2(PacketKind::Datagram, &mut packet);
+            match (&direct_v2, &via) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.iter().collect::<Vec<_>>(), b.iter().collect::<Vec<_>>());
+                    assert_eq!(a.unknown(), b.unknown());
+                }
+                (Err(a), Err(b)) => assert_eq!(a, b),
+                _ => panic!("v2 direct {direct_v2:?} vs sealed {via:?}"),
+            }
+        }
+    }
     for codec in [&plain, &enc] {
         let mut sealed = Vec::new();
         if codec

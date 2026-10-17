@@ -3,7 +3,7 @@
 //! The first byte picks how the rest is split into reads, so the reader sees every chunking.
 #![no_main]
 
-use kinship_proto::{Codec, FrameReader, Key, Limits, PacketKind};
+use kinship_proto::{Codec, FrameReader, Key, Limits, PacketKind, WireVersion};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -30,6 +30,25 @@ fuzz_target!(|data: &[u8]| {
                 Ok(Some(frame)) => {
                     assert!(frame.len() <= limits.max_stream_frame);
                     for codec in [&plain, &enc] {
+                        let mut versioned = frame.clone();
+                        let _ = codec.open_versioned(PacketKind::Stream, &mut versioned);
+                        let mut strict = frame.clone();
+                        let _ = codec.open_v2(PacketKind::Stream, &mut strict);
+                        for version in [WireVersion::V1, WireVersion::V2] {
+                            let mut sealed = Vec::new();
+                            if codec
+                                .seal_raw_at(
+                                    version,
+                                    PacketKind::Stream,
+                                    &frame,
+                                    &[1; 24],
+                                    &mut sealed,
+                                )
+                                .is_ok()
+                            {
+                                let _ = codec.open_v2(PacketKind::Stream, &mut sealed);
+                            }
+                        }
                         let mut copy = frame.clone();
                         let _ = codec.open(PacketKind::Stream, &mut copy);
                         // The same bytes as an inner payload behind valid crypto.

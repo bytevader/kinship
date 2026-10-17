@@ -25,8 +25,37 @@ use crate::limits::Limits;
 use crate::message::{Message, Payload, put_payload};
 use crate::wire::{Count, Sink};
 
-/// Wire format version spoken by this build.
+/// Wire format version spoken by this build: existing callers advertise and emit it.
 pub const WIRE_VERSION: u8 = 1;
+/// Highest codec version available through the explicit versioned APIs.
+pub const MAX_WIRE_VERSION: u8 = 2;
+
+/// Explicit envelope selection. A v2 body may use a v1 upgrade envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum WireVersion {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl TryFrom<u8> for WireVersion {
+    type Error = DecodeError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(DecodeError::UnsupportedVersion(value)),
+        }
+    }
+}
+
+/// The envelope version determines the payload grammar. A caller that deliberately
+/// expects v2 bodies in a v1 upgrade envelope uses Codec::open_v2 instead.
+#[derive(Debug, Clone, Copy)]
+pub enum VersionedPayload<'a> {
+    V1(Payload<'a>),
+    V2(crate::v2::Payload<'a>),
+}
 
 /// First two bytes of every packet: "kn".
 pub const MAGIC: [u8; 2] = *b"kn";
@@ -343,12 +372,20 @@ impl Codec {
         let mut label = [0; 4];
         label.copy_from_slice(&self.label_hash[..4]);
         HeaderCheck {
+            max_version: WIRE_VERSION,
             key_ids: match &self.security {
                 Security::Plaintext => None,
                 Security::Encrypted(keys) => Some(keys.ids.clone()),
             },
             label,
         }
+    }
+
+    /// A header check that explicitly permits both versions. Existing checks stay v1.
+    pub fn header_check_versioned(&self) -> HeaderCheck {
+        let mut check = self.header_check();
+        check.max_version = MAX_WIRE_VERSION;
+        check
     }
 
     /// Adds `key` to the keys that open packets, after the existing ones. Does nothing if it is
@@ -438,7 +475,9 @@ impl Codec {
         }
         let mut payload = Count::default();
         put_payload(&mut payload, msgs);
-        self.seal_with(kind, nonce, payload.0, out, |out| put_payload(out, msgs))
+        self.seal_with((kind, WIRE_VERSION), nonce, payload.0, out, |out| {
+            put_payload(out, msgs)
+        })
     }
 
     /// Like [`seal`](Self::seal) for a TCP stream: prefixes the packet with its `u32`
@@ -470,17 +509,77 @@ impl Codec {
         nonce: &[u8; NONCE_LEN],
         out: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        self.seal_with(kind, nonce, inner.len(), out, |out| out.put(inner))
+        self.seal_with((kind, WIRE_VERSION), nonce, inner.len(), out, |out| {
+            out.put(inner)
+        })
+    }
+
+    /// Explicitly seals v2 bodies in the chosen envelope. Does not sign statements or
+    /// negotiate a recipient's version. On error, out is unchanged.
+    pub fn seal_v2(
+        &self,
+        version: WireVersion,
+        kind: PacketKind,
+        messages: &[crate::v2::Message<'_>],
+        nonce: &[u8; NONCE_LEN],
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        crate::v2::validate(messages, &self.limits)?;
+        let len = crate::v2::payload_len(messages)?;
+        if kind == PacketKind::Stream && len > u32::MAX as usize - self.overhead() {
+            return Err(EncodeError::TooLarge);
+        }
+        self.seal_with((kind, version as u8), nonce, len, out, |out| {
+            crate::v2::put_payload(out, messages)
+        })
+    }
+
+    pub fn seal_v2_stream_frame(
+        &self,
+        version: WireVersion,
+        messages: &[crate::v2::Message<'_>],
+        nonce: &[u8; NONCE_LEN],
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        let start = out.len();
+        out.put(&[0; 4]);
+        if let Err(error) = self.seal_v2(version, PacketKind::Stream, messages, nonce, out) {
+            out.truncate(start);
+            return Err(error);
+        }
+        let len = out.len() - start - 4;
+        let Ok(len) = u32::try_from(len) else {
+            out.truncate(start);
+            return Err(EncodeError::TooLarge);
+        };
+        out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+        Ok(())
+    }
+
+    /// Raw inner bytes with an explicit version, for receive-path tests and fuzzing only.
+    #[doc(hidden)]
+    pub fn seal_raw_at(
+        &self,
+        version: WireVersion,
+        kind: PacketKind,
+        inner: &[u8],
+        nonce: &[u8; NONCE_LEN],
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        self.seal_with((kind, version as u8), nonce, inner.len(), out, |out| {
+            out.put(inner)
+        })
     }
 
     fn seal_with(
         &self,
-        kind: PacketKind,
+        format: (PacketKind, u8),
         nonce: &[u8; NONCE_LEN],
         payload_len: usize,
         out: &mut Vec<u8>,
         write_payload: impl FnOnce(&mut Vec<u8>),
     ) -> Result<(), EncodeError> {
+        let (kind, version) = format;
         if payload_len > self.max_payload_len(kind) {
             return Err(EncodeError::TooLarge);
         }
@@ -491,7 +590,7 @@ impl Codec {
             0
         };
         out.put(&MAGIC);
-        out.put_u8(WIRE_VERSION);
+        out.put_u8(version);
         match &self.security {
             Security::Plaintext => {
                 out.put_u8(flags);
@@ -537,10 +636,47 @@ impl Codec {
         kind: PacketKind,
         buf: &'a mut [u8],
     ) -> Result<Payload<'a>, DecodeError> {
+        let inner = self.open_inner(kind, buf, WIRE_VERSION)?;
+        Payload::parse(inner, &self.limits)
+    }
+
+    /// Explicitly opens strict v2 bodies in either a v1 upgrade envelope or v2 envelope.
+    /// This verifies packet AEAD only; statement trust/signatures remain the caller's job.
+    pub fn open_v2<'a>(
+        &self,
+        kind: PacketKind,
+        buf: &'a mut [u8],
+    ) -> Result<crate::v2::Payload<'a>, DecodeError> {
+        let inner = self.open_inner(kind, buf, MAX_WIRE_VERSION)?;
+        crate::v2::Payload::parse(inner, &self.limits)
+    }
+
+    /// Selects the payload grammar by envelope version: v1 uses the legacy decoder,
+    /// which skips appended proofs. Use [`open_v2`](Self::open_v2) for v2 bodies
+    /// in a v1 upgrade envelope. Statement signatures are not verified here.
+    pub fn open_versioned<'a>(
+        &self,
+        kind: PacketKind,
+        buf: &'a mut [u8],
+    ) -> Result<VersionedPayload<'a>, DecodeError> {
+        let version = buf.get(2).copied().ok_or(DecodeError::Truncated)?;
+        let inner = self.open_inner(kind, buf, MAX_WIRE_VERSION)?;
+        match version {
+            1 => Payload::parse(inner, &self.limits).map(VersionedPayload::V1),
+            _ => crate::v2::Payload::parse(inner, &self.limits).map(VersionedPayload::V2),
+        }
+    }
+
+    fn open_inner<'a>(
+        &self,
+        kind: PacketKind,
+        buf: &'a mut [u8],
+        max_version: u8,
+    ) -> Result<&'a [u8], DecodeError> {
         if buf.len() > self.limit(kind) {
             return Err(DecodeError::TooLarge);
         }
-        let encrypted = check_start(kind, buf)?;
+        let encrypted = check_start(kind, buf, max_version)?;
         let range = match (&self.security, encrypted) {
             (Security::Plaintext, false) => {
                 let hash = buf
@@ -606,20 +742,20 @@ impl Codec {
             }
             _ => return Err(DecodeError::EncryptionMismatch),
         };
-        Payload::parse(&buf[range], &self.limits)
+        Ok(&buf[range])
     }
 }
 
 /// Checks the magic, version and flags that start every packet, and that the packet is of
 /// `kind`. Returns whether it is encrypted.
-fn check_start(kind: PacketKind, buf: &[u8]) -> Result<bool, DecodeError> {
+fn check_start(kind: PacketKind, buf: &[u8], max_version: u8) -> Result<bool, DecodeError> {
     let [m0, m1, version, flags, ..] = *buf else {
         return Err(DecodeError::Truncated);
     };
     if [m0, m1] != MAGIC {
         return Err(DecodeError::BadMagic);
     }
-    if version == 0 || version > WIRE_VERSION {
+    if version == 0 || version > max_version {
         return Err(DecodeError::UnsupportedVersion(version));
     }
     if flags & FLAGS_RESERVED != 0 {
@@ -642,6 +778,7 @@ fn check_start(kind: PacketKind, buf: &[u8]) -> Result<bool, DecodeError> {
 /// nothing about the sender: key ids are sent in the clear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderCheck {
+    max_version: u8,
     /// Ids of the installed keys; `None` in plaintext mode.
     key_ids: Option<Vec<u32>>,
     /// The first bytes of BLAKE3(label), which a plaintext header carries after its flags.
@@ -656,7 +793,7 @@ impl HeaderCheck {
     /// [`DecodeError::Truncated`]; bytes past them are ignored.
     pub fn check(&self, kind: PacketKind, head: &[u8]) -> Result<(), DecodeError> {
         let head = head.get(..Self::LEN).ok_or(DecodeError::Truncated)?;
-        let encrypted = check_start(kind, head)?;
+        let encrypted = check_start(kind, head, self.max_version)?;
         let id = [head[4], head[5], head[6], head[7]];
         match &self.key_ids {
             None if encrypted => Err(DecodeError::EncryptionMismatch),
