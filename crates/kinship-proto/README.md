@@ -15,7 +15,7 @@ enable runtime identities or verify statements when opening packets. Existing
 Use `seal_v2` with an explicit `WireVersion`, `open_v2` for strict v2 bodies in
 either upgrade envelope. `open_versioned` selects its grammar by envelope version;
 its v1 decoder skips appended proofs, so use `open_v2` for v2-in-v1 upgrades.
-`WIRE_VERSION` is the highest codec version (2); `DEFAULT_WIRE_VERSION` is 1.
+`WIRE_VERSION` stays 1; `MAX_WIRE_VERSION` is the highest codec version (2).
 The runtime's exported wire version remains 1. The full opt-in feature is planned
 after 1.0 and KI-01 remains Accepted. Exact fields and remaining work are in
 [the Stage 1 notes](https://github.com/bytevader/kinship/blob/main/docs/ki01-stage1.md).

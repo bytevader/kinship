@@ -25,10 +25,10 @@ use crate::limits::Limits;
 use crate::message::{Message, Payload, put_payload};
 use crate::wire::{Count, Sink};
 
-/// Highest codec version available through explicit versioned APIs.
-pub const WIRE_VERSION: u8 = 2;
-/// Existing callers keep advertising and emitting version 1.
-pub const DEFAULT_WIRE_VERSION: u8 = 1;
+/// Wire format version spoken by this build: existing callers advertise and emit it.
+pub const WIRE_VERSION: u8 = 1;
+/// Highest codec version available through the explicit versioned APIs.
+pub const MAX_WIRE_VERSION: u8 = 2;
 
 /// Explicit envelope selection. A v2 body may use a v1 upgrade envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -372,7 +372,7 @@ impl Codec {
         let mut label = [0; 4];
         label.copy_from_slice(&self.label_hash[..4]);
         HeaderCheck {
-            max_version: DEFAULT_WIRE_VERSION,
+            max_version: WIRE_VERSION,
             key_ids: match &self.security {
                 Security::Plaintext => None,
                 Security::Encrypted(keys) => Some(keys.ids.clone()),
@@ -384,7 +384,7 @@ impl Codec {
     /// A header check that explicitly permits both versions. Existing checks stay v1.
     pub fn header_check_versioned(&self) -> HeaderCheck {
         let mut check = self.header_check();
-        check.max_version = WIRE_VERSION;
+        check.max_version = MAX_WIRE_VERSION;
         check
     }
 
@@ -475,7 +475,7 @@ impl Codec {
         }
         let mut payload = Count::default();
         put_payload(&mut payload, msgs);
-        self.seal_with((kind, DEFAULT_WIRE_VERSION), nonce, payload.0, out, |out| {
+        self.seal_with((kind, WIRE_VERSION), nonce, payload.0, out, |out| {
             put_payload(out, msgs)
         })
     }
@@ -509,13 +509,9 @@ impl Codec {
         nonce: &[u8; NONCE_LEN],
         out: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        self.seal_with(
-            (kind, DEFAULT_WIRE_VERSION),
-            nonce,
-            inner.len(),
-            out,
-            |out| out.put(inner),
-        )
+        self.seal_with((kind, WIRE_VERSION), nonce, inner.len(), out, |out| {
+            out.put(inner)
+        })
     }
 
     /// Explicitly seals v2 bodies in the chosen envelope. Does not sign statements or
@@ -640,7 +636,7 @@ impl Codec {
         kind: PacketKind,
         buf: &'a mut [u8],
     ) -> Result<Payload<'a>, DecodeError> {
-        let inner = self.open_inner(kind, buf, DEFAULT_WIRE_VERSION)?;
+        let inner = self.open_inner(kind, buf, WIRE_VERSION)?;
         Payload::parse(inner, &self.limits)
     }
 
@@ -651,7 +647,7 @@ impl Codec {
         kind: PacketKind,
         buf: &'a mut [u8],
     ) -> Result<crate::v2::Payload<'a>, DecodeError> {
-        let inner = self.open_inner(kind, buf, WIRE_VERSION)?;
+        let inner = self.open_inner(kind, buf, MAX_WIRE_VERSION)?;
         crate::v2::Payload::parse(inner, &self.limits)
     }
 
@@ -664,7 +660,7 @@ impl Codec {
         buf: &'a mut [u8],
     ) -> Result<VersionedPayload<'a>, DecodeError> {
         let version = buf.get(2).copied().ok_or(DecodeError::Truncated)?;
-        let inner = self.open_inner(kind, buf, WIRE_VERSION)?;
+        let inner = self.open_inner(kind, buf, MAX_WIRE_VERSION)?;
         match version {
             1 => Payload::parse(inner, &self.limits).map(VersionedPayload::V1),
             _ => crate::v2::Payload::parse(inner, &self.limits).map(VersionedPayload::V2),

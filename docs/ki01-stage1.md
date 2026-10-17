@@ -96,9 +96,9 @@ retain NodeId's exact UTF-8 bytes. No Unicode normalization is performed.
 
 ## API isolation
 
-`kinship_proto::WIRE_VERSION` is the highest codec version (2).
-`DEFAULT_WIRE_VERSION` stays 1. The core re-exports the default as WIRE_VERSION,
-so Rust facade/Python reporting and Alive version ranges stay unchanged.
+`kinship_proto::WIRE_VERSION` keeps its meaning and stays 1, so existing users of
+the constant, the core's re-export, Rust facade/Python reporting and Alive version
+ranges are unchanged. `MAX_WIRE_VERSION` is the highest codec version (2).
 Existing `Codec::seal`, `seal_stream_frame`, `seal_raw`, `open` and header checks
 remain version 1. Separate v2 message/payload types and explicit v2 entry points
 avoid dropping a proof through a legacy Message. The v2 sealer requires a chosen

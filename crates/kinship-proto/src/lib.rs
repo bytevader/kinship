@@ -28,8 +28,8 @@ pub use message::{
     Records, State, Suspect, UserBroadcast, UserMessage, kind,
 };
 pub use packet::{
-    Codec, DEFAULT_WIRE_VERSION, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, HeaderCheck, Key, KeyId,
-    MAGIC, MAX_LABEL_LEN, NONCE_LEN, PLAINTEXT_HEADER_LEN, PacketKind, TAG_LEN, VersionedPayload,
+    Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, HeaderCheck, Key, KeyId, MAGIC, MAX_LABEL_LEN,
+    MAX_WIRE_VERSION, NONCE_LEN, PLAINTEXT_HEADER_LEN, PacketKind, TAG_LEN, VersionedPayload,
     WIRE_VERSION, WireVersion, sealed_nonce,
 };
 pub use stream::FrameReader;

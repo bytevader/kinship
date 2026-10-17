@@ -258,8 +258,8 @@ fn every_v2_field_round_trips_and_reencodes_canonically() {
 #[test]
 fn legacy_callers_still_emit_and_accept_only_v1() {
     let c = Codec::insecure_plaintext(b"c", Limits::default()).unwrap();
-    assert_eq!(kinship_proto::WIRE_VERSION, 2);
-    assert_eq!(kinship_proto::DEFAULT_WIRE_VERSION, 1);
+    assert_eq!(kinship_proto::WIRE_VERSION, 1);
+    assert_eq!(kinship_proto::MAX_WIRE_VERSION, 2);
     let mut out = Vec::new();
     c.seal(
         PacketKind::Datagram,

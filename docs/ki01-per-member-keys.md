@@ -335,7 +335,7 @@ Each stage is one or more pull requests that leave main releasable. Nothing chan
 **Stage 1: kinship-proto (primitives and explicit codec support implemented).**
 
 - `kinship_proto::identity`: `SigningKey` (heap-allocated, zeroized, compared in constant time and never printed, as `Key` is), `PublicKey`, `Certificate` and `Revocation` with strict decoders and canonical encoders, and the signed-bytes construction of rule 6.
-- The appended fields of version 2 and the two new message types, highest codec `WIRE_VERSION` 2, and explicit `Codec` entry points sealing at a version the caller picks and opening versions 1 and 2. `DEFAULT_WIRE_VERSION`, existing codec methods and the runtime's exported `WIRE_VERSION` remain 1. [Stage 1 notes](ki01-stage1.md) pin the completed grammar and API isolation.
+- The appended fields of version 2 and the two new message types, highest codec version `MAX_WIRE_VERSION` 2, and explicit `Codec` entry points sealing at a version the caller picks and opening versions 1 and 2. `WIRE_VERSION`, existing codec methods and the runtime's exported `WIRE_VERSION` remain 1. [Stage 1 notes](ki01-stage1.md) pin the completed grammar and API isolation.
 - Tests: round trips and one-encoding-per-value property tests for every new field; RFC 8032 test vectors through the wrapper; certificates that are expired, not yet valid, for another cluster, signed by an unknown anchor, or truncated, all refused; a version 2 payload, stamped version 1, parsed by the released kinship-proto 0.4.0 as a dev-dependency, with every known field equal and no decode error; the fuzz targets `decode_payload` and `decode_datagram` given version 2 inputs, and a new `decode_certificate`. `cargo deny` stays clean.
 
 **Stage 2: kinship-core, mode `sign`.**
