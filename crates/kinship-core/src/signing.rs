@@ -32,6 +32,9 @@ pub(crate) const CHECKS_PER_INPUT: usize = 64;
 
 /// Whether this node has a member identity (KI-01), and what it does with it. Experimental:
 /// the feature is planned for an opt-in release after 1.0.
+///
+/// No driver supports it yet: kinship-net passes the field through untested, and the facade and
+/// the Python package do not expose it (Stage 5 of `docs/ki01-per-member-keys.md`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Signatures {

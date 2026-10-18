@@ -37,6 +37,7 @@
 
 ```bash
 cargo test --workspace --exclude kinship-py   # kinship-py needs a Python to link; pytest covers it
+cargo test --manifest-path crates/kinship-core/Cargo.toml   # -p kinship-core is ambiguous: kinship-sim also pulls the released 0.4.0 core
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 uv sync && uv run maturin develop && uv run pytest
