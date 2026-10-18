@@ -82,6 +82,11 @@ impl Suspicion {
         true
     }
 
+    /// Whether `from` has reported the suspicion already.
+    pub fn has_reporter(&self, from: &str) -> bool {
+        self.reporters.iter().any(|c| c == from)
+    }
+
     /// Independent confirmations after the first report.
     pub fn confirmations(&self) -> u32 {
         u32::try_from(self.reporters.len().saturating_sub(1)).unwrap_or(u32::MAX)
@@ -127,7 +132,8 @@ impl Node {
                 from: id(&me),
                 epoch: e.member.epoch,
             };
-            self.on_dead(now, &dead);
+            let proof = self.sign_dead(&dead);
+            self.on_dead(now, &dead, proof);
         }
     }
 

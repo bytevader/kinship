@@ -24,6 +24,7 @@ use kinship_proto::{Alive, Dead, Message, Suspect};
 
 use crate::broadcast::{Gossip, id};
 use crate::event::Event;
+use crate::signing::{AccusationProof, LeftProof, SignedBy};
 use crate::table::Entry;
 use crate::time::Instant;
 use crate::{Node, suspicion::Suspicion};
@@ -121,11 +122,25 @@ pub(crate) fn at_least(a: u32, b: u32) -> bool {
     a == b || newer(a, b)
 }
 
+/// Whether this node, on learning that a member speaks version 2 from an Alive with `signed`,
+/// sends it its own signed Alive: unless the Alive came in a version 2 push-pull, whose sender
+/// spreads this node's record signed too.
+fn announces(signed: Option<&SignedBy>) -> bool {
+    signed.is_none_or(|s| !s.pulled)
+}
+
 /// How many members new to this node one datagram or push-pull frame may still add: created
 /// once per packet, so every Alive and record in it shares `max_new_members_per_packet`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Admission {
     left: usize,
+}
+
+impl Admission {
+    /// Whether the packet has added as many new members as it may.
+    pub fn is_spent(&self) -> bool {
+        self.left == 0
+    }
 }
 
 impl Node {
@@ -155,7 +170,17 @@ impl Node {
 
     /// An Alive about `a.node`. One about a member this node does not know adds it only if
     /// `budget` and the table have room (KI-04); one about a known member always applies.
-    pub(crate) fn on_alive(&mut self, now: Instant, a: &Alive<'_>, budget: &mut Admission) {
+    ///
+    /// `signed` is its checked signature, from a version 2 packet; the member keeps it, and so
+    /// does its rumour. An unsigned Alive that applies leaves the member unsigned, and a signed
+    /// copy of the Alive already held gives it the proof it lacked.
+    pub(crate) fn on_alive(
+        &mut self,
+        now: Instant,
+        a: &Alive<'_>,
+        budget: &mut Admission,
+        signed: Option<SignedBy>,
+    ) {
         let name = a.node.as_str();
         if name == self.local.member.name {
             if a.addr != self.local.member.addr {
@@ -189,8 +214,14 @@ impl Node {
                 since: now,
                 vmin: a.vmin,
                 vmax: a.vmax,
+                proof: signed.as_ref().map(|s| s.proof),
+                left: None,
             });
-            self.broadcast(Gossip::from_alive(a));
+            let gossip = self.alive_gossip(a, signed.as_ref(), true);
+            self.broadcast(gossip);
+            if announces(signed.as_ref()) {
+                self.announce_to(name);
+            }
             return;
         };
         let old = &entry.member;
@@ -209,7 +240,27 @@ impl Node {
                 {
                     // The Alive this node already applied, now with the epoch that a node older
                     // than 0.3 dropped when it passed it on. Nothing about the member changed.
-                    self.table.update(name, state, inc, now).member.epoch = a.epoch;
+                    let sign = self.keys.is_some();
+                    let entry = self.table.update(name, state, inc, now);
+                    entry.member.epoch = a.epoch;
+                    // In mode `sign`, a member this node was given in a list, with no Alive yet,
+                    // also takes the versions it speaks from this one.
+                    let learned_v2 = sign && entry.vmax < 2 && a.vmax >= 2;
+                    if sign {
+                        entry.vmin = a.vmin;
+                        entry.vmax = a.vmax;
+                    }
+                    if learned_v2 {
+                        self.announce_to(name);
+                    }
+                }
+                // A signed copy of the Alive held without a proof, as a 0.4 relay passes it on.
+                let unsigned = self
+                    .table
+                    .get(name)
+                    .is_some_and(|e| e.proof.is_none() && e.holds(a));
+                if let Some(signed) = signed.filter(|_| unsigned) {
+                    self.attach_proof(a, &signed);
                 }
                 return;
             }
@@ -225,8 +276,9 @@ impl Node {
             return;
         }
         if life == Life::Later {
-            return self.restarted(now, a);
+            return self.restarted(now, a, signed);
         }
+        let spoke_v2 = entry.vmax >= 2;
         let was = old.state;
         let previous_meta = (old.meta != a.meta).then(|| old.meta.clone());
         let entry = self.table.update(name, State::Alive, a.inc, now);
@@ -238,6 +290,10 @@ impl Node {
             // New if this node first heard of the member through a node older than 0.3.
             entry.member.epoch = a.epoch;
         }
+        entry.proof = signed
+            .as_ref()
+            .filter(|_| entry.member.epoch == a.epoch)
+            .map(|s| s.proof);
         let member = entry.member.clone();
         self.suspicions.remove(name);
         match was {
@@ -261,14 +317,18 @@ impl Node {
                 }
             }
         }
-        self.broadcast(Gossip::from_alive(a));
+        let gossip = self.alive_gossip(a, signed.as_ref(), false);
+        self.broadcast(gossip);
+        if !spoke_v2 && announces(signed.as_ref()) {
+            self.announce_to(name);
+        }
     }
 
     /// An Alive about a later life of a member this node holds: it restarted. The new life
     /// replaces the old one whatever the incarnations, since the new process counts its own
     /// from 0. The application hears the old life leave, unless it had already died or left,
     /// and the new one join, so that it sees a restart as two events.
-    fn restarted(&mut self, now: Instant, a: &Alive<'_>) {
+    fn restarted(&mut self, now: Instant, a: &Alive<'_>, signed: Option<SignedBy>) {
         let name = a.node.as_str();
         let Some(old) = self.table.get(name).map(|e| e.member.clone()) else {
             return;
@@ -280,6 +340,7 @@ impl Node {
         entry.member.meta.extend_from_slice(a.meta);
         entry.vmin = a.vmin;
         entry.vmax = a.vmax;
+        entry.proof = signed.as_ref().map(|s| s.proof);
         let member = entry.member.clone();
         self.suspicions.remove(name);
         self.metrics.restarts += 1;
@@ -290,10 +351,52 @@ impl Node {
             }));
         }
         self.events.push_back(Event::MemberJoined(member));
-        self.broadcast(Gossip::from_alive(a));
+        let gossip = self.alive_gossip(a, signed.as_ref(), true);
+        self.broadcast(gossip);
+        if announces(signed.as_ref()) {
+            self.announce_to(name);
+        }
     }
 
-    pub(crate) fn on_suspect(&mut self, now: Instant, s: &Suspect<'_>) {
+    /// The rumour of an Alive this node applied: with its signature when it was signed, and
+    /// with its certificate ahead of it when it starts a member or a life new to this node, or
+    /// when the packet that brought it carried the certificate, as a relay passes it on.
+    fn alive_gossip(&mut self, a: &Alive<'_>, signed: Option<&SignedBy>, new: bool) -> Gossip {
+        let Some(s) = signed else {
+            return Gossip::from_alive(a);
+        };
+        let cert = self
+            .bind_cert(a.node.as_str(), s)
+            .filter(|_| new || s.carried);
+        Gossip::signed_alive(a, s.proof.cert, s.proof.sig, cert)
+    }
+
+    /// Gives the member the proof of the Alive it is held at, which it lacked, and the rumour
+    /// of that Alive still being spread its signature.
+    fn attach_proof(&mut self, a: &Alive<'_>, signed: &SignedBy) {
+        let name = a.node.as_str();
+        self.table.set_proof(name, Some(signed.proof));
+        // The member's own word on the versions it speaks.
+        let learned_v2 = self
+            .table
+            .set_versions(name, a.vmin, a.vmax)
+            .is_some_and(|vmax| vmax < 2 && a.vmax >= 2);
+        let cert = self.bind_cert(name, signed).filter(|_| signed.carried);
+        self.out
+            .broadcasts
+            .attach(a, signed.proof.cert, signed.proof.sig, cert);
+        if learned_v2 {
+            self.announce_to(name);
+        }
+    }
+
+    /// A Suspect about `s.node`, with its checked signature `proof` when it came signed.
+    pub(crate) fn on_suspect(
+        &mut self,
+        now: Instant,
+        s: &Suspect<'_>,
+        proof: Option<AccusationProof>,
+    ) {
         let name = s.node.as_str();
         if name == self.local.member.name {
             return self.about_self(s.inc, s.epoch);
@@ -320,7 +423,7 @@ impl Node {
                     .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
                 self.metrics.suspicions += 1;
                 self.events.push_back(Event::MemberSuspect(member));
-                self.broadcast(Gossip::from_suspect(s));
+                self.broadcast(Gossip::suspect(s, proof));
             }
             State::Suspect if newer(s.inc, inc) => {
                 // The member refuted the old suspicion, even if its Alive has not reached us,
@@ -329,7 +432,7 @@ impl Node {
                 self.table.update(name, State::Suspect, s.inc, now);
                 self.suspicions
                     .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
-                self.broadcast(Gossip::from_suspect(s));
+                self.broadcast(Gossip::suspect(s, proof));
             }
             State::Suspect if s.inc == inc => {
                 let fresh = self
@@ -337,14 +440,16 @@ impl Node {
                     .get_mut(name)
                     .is_some_and(|sus| sus.confirm(from));
                 if fresh {
-                    self.broadcast(Gossip::from_suspect(s));
+                    self.broadcast(Gossip::suspect(s, proof));
                 }
             }
             _ => {}
         }
     }
 
-    pub(crate) fn on_dead(&mut self, now: Instant, d: &Dead<'_>) {
+    /// A Dead about `d.node`, with its checked signature `proof` when it came signed; a signed
+    /// Left is kept with the tombstone.
+    pub(crate) fn on_dead(&mut self, now: Instant, d: &Dead<'_>, proof: Option<AccusationProof>) {
         let name = d.node.as_str();
         if name == self.local.member.name {
             return self.about_self(d.inc, d.epoch);
@@ -363,14 +468,20 @@ impl Node {
         } else {
             State::Dead
         };
-        let member = self.table.update(name, state, d.inc, now).member.clone();
+        let entry = self.table.update(name, state, d.inc, now);
+        entry.left = proof.filter(|_| d.is_left()).map(|proof| LeftProof {
+            inc: d.inc,
+            epoch: d.epoch,
+            proof,
+        });
+        let member = entry.member.clone();
         self.suspicions.remove(name);
         self.events.push_back(if d.is_left() {
             Event::MemberLeft(member)
         } else {
             Event::MemberDead(member)
         });
-        self.broadcast(Gossip::from_dead(d));
+        self.broadcast(Gossip::dead(d, proof));
     }
 
     /// A peer's push-pull holds `name` as Suspect or Dead at `inc`.
@@ -419,7 +530,7 @@ impl Node {
             epoch,
         });
         let limit = self.retransmit_limit();
-        self.send_to(addr, true, &[suspect], Some(limit));
+        self.send_to(addr, true, Some(name), &[suspect], Some(limit));
     }
 
     /// A Suspect or Dead about this node at `inc` of its life `epoch`. One about an earlier
@@ -451,7 +562,9 @@ impl Node {
             me.incarnation = inc.wrapping_add(1);
         }
         self.metrics.refutations += 1;
-        self.broadcast(self.local_alive());
+        // A new life: its first Alive carries the certificate, as a node's first one does.
+        self.resign_local();
+        self.broadcast(self.local_alive_announced());
     }
 
     /// Raises this node's incarnation past `seen`, which is its own or newer, and gossips
@@ -464,6 +577,7 @@ impl Node {
         let me = &mut self.local.member;
         me.incarnation = seen.wrapping_add(1);
         self.metrics.refutations += 1;
+        self.resign_local();
         self.broadcast(self.local_alive());
     }
 

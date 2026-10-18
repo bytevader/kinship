@@ -9,7 +9,11 @@ use kinship_proto::{
     UserMessage,
 };
 
+use kinship_proto::identity::{Certificate, IdentityError};
+use kinship_proto::v2::{self, SignedAlive};
+
 use crate::broadcast::{COUNT_LEN, datagram_room, id};
+use crate::signing::Signatures;
 
 /// How packets are protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +85,10 @@ pub struct Config {
     /// Most user broadcasts a node holds to send, its own and those it relays; beyond it the
     /// one nearest to done is dropped and counted.
     pub user_broadcast_queue: usize,
+    /// Per-member keys (KI-01): `Off`, the default, or `Sign` with this node's signing key,
+    /// certificate and trust anchors. Experimental, planned for an opt-in release after 1.0;
+    /// see `docs/ki01-stage2.md`.
+    pub signatures: Signatures,
 }
 
 impl Config {
@@ -123,6 +131,7 @@ impl Config {
             max_user_message: Self::DEFAULT_MAX_USER_MESSAGE,
             max_user_broadcast: Self::DEFAULT_MAX_USER_BROADCAST,
             user_broadcast_queue: Self::DEFAULT_USER_BROADCAST_QUEUE,
+            signatures: Signatures::Off,
         }
     }
 
@@ -246,6 +255,55 @@ impl Config {
                 fail("max_user_message", "must fit a max_stream_frame frame")
             };
         }
+        self.validate_signatures(room)
+    }
+
+    /// Checks what mode `sign` needs that does not depend on the node: encryption, a certificate
+    /// for the signing key from a trust anchor for this cluster, and room in a datagram for a
+    /// signed Alive behind its certificate. The node checks its name and its clock.
+    fn validate_signatures(&self, room: usize) -> Result<(), ConfigError> {
+        let fail = |field, reason| Err(ConfigError { field, reason });
+        let Some(c) = self.signatures.credentials() else {
+            return Ok(());
+        };
+        if self.security == Security::InsecurePlaintext {
+            return fail("signatures", "need encryption");
+        }
+        if c.trust_anchors.is_empty() {
+            return fail("trust_anchors", "needs at least one key");
+        }
+        let Ok(cert) = Certificate::decode(&c.certificate) else {
+            return fail("certificate", "is not a certificate");
+        };
+        if cert.key() != c.signing_key.public_key() {
+            return fail("certificate", "must be for signing_key");
+        }
+        // The CA and the cluster, at a time the certificate is valid: the clock is the node's.
+        match cert.verify(
+            &c.trust_anchors,
+            self.cluster.as_bytes(),
+            cert.not_before(),
+            0,
+        ) {
+            Ok(()) => {}
+            Err(IdentityError::WrongCluster) => {
+                return fail("certificate", "is for another cluster");
+            }
+            Err(_) => return fail("certificate", "must be signed by one of trust_anchors"),
+        }
+        if largest_signed_alive(self.limits.max_meta_bytes, room) > room {
+            return if self.limits.udp_max_payload < Limits::DEFAULT_UDP_MAX_PAYLOAD {
+                fail(
+                    "udp_max_payload",
+                    "must fit a signed Alive with max_meta_bytes of metadata and its certificate",
+                )
+            } else {
+                fail(
+                    "max_meta_bytes",
+                    "must leave a signed Alive and its certificate that fit a datagram",
+                )
+            };
+        }
         Ok(())
     }
 
@@ -309,6 +367,32 @@ fn largest_alive(max_meta: usize, cap: usize) -> usize {
     })
     .encoded_len()
 }
+
+/// Encoded size of the largest signed Alive, in version 2, behind the largest certificate: a
+/// 64-byte name in both, an IPv6 address, an epoch and `max_meta` bytes of metadata, counted
+/// up to `cap` bytes of it.
+fn largest_signed_alive(max_meta: usize, cap: usize) -> usize {
+    let name = longest_name();
+    let meta = vec![0; max_meta.min(cap.saturating_add(1))];
+    let alive = v2::Message::Alive(SignedAlive {
+        alive: Alive {
+            inc: u32::MAX,
+            node: id(&name),
+            addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            meta: &meta,
+            vmin: u8::MAX,
+            vmax: u8::MAX,
+            epoch: u64::MAX,
+        },
+        certificate_id: [0; 8],
+        signature: [0; 64],
+    });
+    alive.encoded_len() + LARGEST_CERTIFICATE
+}
+
+/// A certificate message for a 64-byte name: its type, a two-byte length, and a body of the
+/// version, issuer, cluster, name, key, validity and the CA's signature.
+const LARGEST_CERTIFICATE: usize = 1 + 2 + (1 + 8 + 8 + 1 + NodeId::MAX_LEN + 32 + 8 + 8 + 64);
 
 /// Encoded size of the largest user broadcast: a 64-byte name and `max_data` bytes of data,
 /// counted up to `cap` bytes of it.

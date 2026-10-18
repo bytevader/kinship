@@ -328,7 +328,7 @@ impl Node {
         if head.iter().map(Message::encoded_len).sum::<usize>() <= room {
             // No gossip rides along, so that messages to one member do not spend every rumour's
             // retransmissions on it.
-            if self.send_to(addr, true, head, None) {
+            if self.send_to(addr, true, Some(to), head, None) {
                 self.metrics.user_messages_sent += 1;
             }
             return Ok(CommandOutput::Done);
@@ -357,7 +357,12 @@ impl Node {
     /// A frame too small for both, which only a much lowered `max_stream_frame` makes, goes
     /// without the Alive.
     fn open_user_stream(&mut self, to: &str, addr: SocketAddr, batch: Vec<Waiting>) {
-        let conn = self.connect(addr, Purpose::Message, false);
+        let conn = self.connect(
+            addr,
+            Purpose::Message,
+            false,
+            kinship_proto::WireVersion::V1,
+        );
         let me = self.local.member.name.clone();
         let from_epoch = self.local.member.epoch;
         let alive = self.local_alive();

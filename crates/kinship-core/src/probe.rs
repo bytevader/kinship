@@ -99,13 +99,15 @@ impl Node {
                     from: id(&me),
                     epoch: p.epoch,
                 };
-                self.on_suspect(now, &suspect);
+                let proof = self.sign_suspect(&suspect);
+                self.on_suspect(now, &suspect, proof);
             }
         }
         // A tombstone outlives the replay window, so no recording can bring its member back.
         let keep = self.cfg.dead_reclaim.max(self.replay.window());
         self.table.reap(now, keep);
         self.forget_reaped_senders();
+        self.forget_reaped_certs();
         self.next_probe = now + self.probe_interval();
         self.start_probe(now);
     }
@@ -148,7 +150,7 @@ impl Node {
         };
         let limit = self.retransmit_limit();
         // Only live members are probed.
-        self.send_to(addr, true, head, Some(limit));
+        self.send_to(addr, true, Some(&name), head, Some(limit));
         self.metrics.probes_sent += 1;
         self.probe = Some(Probe {
             seq,
@@ -171,13 +173,13 @@ impl Node {
         };
         p.indirect_sent = true;
         let (seq, target, target_addr) = (p.seq, p.target.clone(), p.target_addr);
-        let relays: Vec<SocketAddr> = self
+        let relays: Vec<(SocketAddr, String)> = self
             .table
             .random(self.cfg.indirect_checks, &mut self.rng, |e| {
                 e.member.state == State::Alive && e.member.name != target
             })
             .into_iter()
-            .map(|e| e.member.addr)
+            .map(|e| (e.member.addr, e.member.name.clone()))
             .collect();
         let req = Message::PingReq(PingReq {
             seq,
@@ -188,8 +190,8 @@ impl Node {
         });
         let limit = self.retransmit_limit();
         let asked = u32::try_from(relays.len()).unwrap_or(u32::MAX);
-        for relay in relays {
-            self.send_to(relay, true, &[req], Some(limit));
+        for (relay, name) in relays {
+            self.send_to(relay, true, Some(&name), &[req], Some(limit));
             self.metrics.indirect_probes += 1;
         }
         if let Some(p) = &mut self.probe {
@@ -214,7 +216,8 @@ impl Node {
         let limit = self.retransmit_limit();
         let ack = Message::Ack { seq: ping.seq };
         let live = self.holds_live(ping.source.as_str());
-        self.send_to(ping.source_addr, live, &[ack], Some(limit));
+        let source = Some(ping.source.as_str());
+        self.send_to(ping.source_addr, live, source, &[ack], Some(limit));
     }
 
     /// Pings the target on the requester's behalf, unless this node knows the target left. In
@@ -240,7 +243,7 @@ impl Node {
             });
             let limit = self.retransmit_limit();
             // A PingReq names its requester by address only, so it is not counted as live.
-            self.send_to(req.requester_addr, false, &[news], Some(limit));
+            self.send_to(req.requester_addr, false, None, &[news], Some(limit));
             return;
         }
         let seq = self.next_seq();
@@ -253,7 +256,8 @@ impl Node {
         });
         let limit = self.retransmit_limit();
         let live = self.holds_live(req.target.as_str());
-        self.send_to(req.target_addr, live, &[ping], Some(limit));
+        let target = Some(req.target.as_str());
+        self.send_to(req.target_addr, live, target, &[ping], Some(limit));
         // The requester's indirect phase lasts at least probe_interval - probe_timeout; the
         // Nack must land inside it, whatever this node's own health, or it counts as missing.
         let (interval, timeout) = (self.cfg.probe_interval, self.cfg.probe_timeout);
@@ -279,7 +283,7 @@ impl Node {
         if let Some(relay) = self.relays.remove(&seq) {
             let limit = self.retransmit_limit();
             let ack = Message::Ack { seq: relay.seq };
-            self.send_to(relay.requester, false, &[ack], Some(limit));
+            self.send_to(relay.requester, false, None, &[ack], Some(limit));
         }
     }
 
@@ -302,7 +306,7 @@ impl Node {
             now < r.expires
         });
         for (to, seq) in nacks {
-            self.send_to(to, false, &[Message::Nack { seq }], None);
+            self.send_to(to, false, None, &[Message::Nack { seq }], None);
         }
     }
 
