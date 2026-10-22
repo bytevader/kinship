@@ -3,19 +3,24 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
-use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect};
+use kinship_proto::identity::{Certificate, CertificateId, Signature};
+use kinship_proto::v2;
+use kinship_proto::{Alive, Codec, Dead, Message, NodeId, PacketKind, Suspect, WireVersion};
 
 use crate::Node;
 use crate::io::{StreamId, Transmit};
 use crate::member::State;
 use crate::replay::STAMP_LEN;
 use crate::rng::Nonces;
+use crate::signing::{AccusationProof, AliveProof, signed_alive, signed_dead, signed_suspect};
 use crate::suspicion::retransmit_limit;
+use crate::table::Entry;
 use crate::time::Instant;
 use crate::user::UserQueue;
 
 /// An Alive, Suspect or Dead rumour waiting to be spread, owned so it can outlive the packet
-/// it arrived in.
+/// it arrived in. In mode `sign` it keeps its author's signature, and an Alive new to the node
+/// spreading it keeps its certificate, to go ahead of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Gossip {
     Alive {
@@ -26,18 +31,22 @@ pub(crate) enum Gossip {
         vmin: u8,
         vmax: u8,
         epoch: u64,
+        sig: Option<(CertificateId, Signature)>,
+        cert: Option<Vec<u8>>,
     },
     Suspect {
         inc: u32,
         node: String,
         from: String,
         epoch: u64,
+        proof: Option<AccusationProof>,
     },
     Dead {
         inc: u32,
         node: String,
         from: String,
         epoch: u64,
+        proof: Option<AccusationProof>,
     },
 }
 
@@ -56,24 +65,46 @@ impl Gossip {
             vmin: a.vmin,
             vmax: a.vmax,
             epoch: a.epoch,
+            sig: None,
+            cert: None,
         }
     }
 
-    pub fn from_suspect(s: &Suspect<'_>) -> Self {
+    /// A signed Alive, with the certificate to go ahead of it if `cert`.
+    pub fn signed_alive(
+        a: &Alive<'_>,
+        cert_id: CertificateId,
+        sig: Signature,
+        cert: Option<Vec<u8>>,
+    ) -> Self {
+        let mut g = Self::from_alive(a);
+        if let Self::Alive {
+            sig: s, cert: c, ..
+        } = &mut g
+        {
+            *s = Some((cert_id, sig));
+            *c = cert;
+        }
+        g
+    }
+
+    pub fn suspect(s: &Suspect<'_>, proof: Option<AccusationProof>) -> Self {
         Self::Suspect {
             inc: s.inc,
             node: s.node.as_str().to_owned(),
             from: s.from.as_str().to_owned(),
             epoch: s.epoch,
+            proof,
         }
     }
 
-    pub fn from_dead(d: &Dead<'_>) -> Self {
+    pub fn dead(d: &Dead<'_>, proof: Option<AccusationProof>) -> Self {
         Self::Dead {
             inc: d.inc,
             node: d.node.as_str().to_owned(),
             from: d.from.as_str().to_owned(),
             epoch: d.epoch,
+            proof,
         }
     }
 
@@ -84,6 +115,7 @@ impl Gossip {
         }
     }
 
+    /// The rumour in the version 1 grammar, without a signature.
     pub fn message(&self) -> Message<'_> {
         match self {
             Self::Alive {
@@ -94,6 +126,7 @@ impl Gossip {
                 vmin,
                 vmax,
                 epoch,
+                ..
             } => Message::Alive(Alive {
                 inc: *inc,
                 node: id(node),
@@ -108,6 +141,7 @@ impl Gossip {
                 node,
                 from,
                 epoch,
+                ..
             } => Message::Suspect(Suspect {
                 inc: *inc,
                 node: id(node),
@@ -119,6 +153,7 @@ impl Gossip {
                 node,
                 from,
                 epoch,
+                ..
             } => Message::Dead(Dead {
                 inc: *inc,
                 node: id(node),
@@ -127,6 +162,66 @@ impl Gossip {
             }),
         }
     }
+
+    /// The rumour in the version 2 grammar, behind its certificate if it carries one; `None`
+    /// if it is unsigned.
+    pub fn signed(&self) -> Option<(Option<Certificate<'_>>, v2::Message<'_>)> {
+        match (self, self.message()) {
+            (
+                Self::Alive {
+                    inc,
+                    sig: Some((cert_id, sig)),
+                    cert,
+                    ..
+                },
+                Message::Alive(a),
+            ) => {
+                let proof = AliveProof {
+                    inc: *inc,
+                    cert: *cert_id,
+                    sig: *sig,
+                };
+                let cert = cert.as_deref().and_then(|c| Certificate::decode(c).ok());
+                Some((cert, signed_alive(&a, &proof)))
+            }
+            (
+                Self::Suspect {
+                    proof: Some(proof), ..
+                },
+                Message::Suspect(s),
+            ) => Some((None, signed_suspect(&s, proof))),
+            (
+                Self::Dead {
+                    proof: Some(proof), ..
+                },
+                Message::Dead(d),
+            ) => Some((None, signed_dead(&d, proof))),
+            _ => None,
+        }
+    }
+
+    /// Sheds the certificate, and then the signature, while the version 2 form does not fit
+    /// `room` bytes.
+    fn fit(&mut self, room: usize) {
+        if self.signed_len().is_some_and(|len| len > room) {
+            if let Self::Alive { cert, .. } = self {
+                *cert = None;
+            }
+        }
+        if self.signed_len().is_some_and(|len| len > room) {
+            match self {
+                Self::Alive { sig, .. } => *sig = None,
+                Self::Suspect { proof, .. } | Self::Dead { proof, .. } => *proof = None,
+            }
+        }
+    }
+
+    /// Bytes the version 2 form takes in a payload, its certificate included.
+    fn signed_len(&self) -> Option<usize> {
+        let (cert, msg) = self.signed()?;
+        let cert = cert.map_or(0, |c| v2::Message::Certificate(c).encoded_len());
+        Some(cert + msg.encoded_len())
+    }
 }
 
 #[derive(Debug)]
@@ -134,6 +229,8 @@ struct Queued {
     gossip: Gossip,
     /// Encoded size inside a payload.
     len: usize,
+    /// Encoded size of its version 2 form, certificate included, when it is signed.
+    signed_len: Option<usize>,
     /// Only sends to live members count towards the limit.
     live_only: bool,
 }
@@ -182,12 +279,14 @@ impl Broadcasts {
         if let Some(old) = self.by_node.insert(gossip.node().to_owned(), rank) {
             self.queue.remove(&old);
         }
+        let signed_len = gossip.signed_len();
         let len = gossip.message().encoded_len();
         self.queue.insert(
             rank,
             Queued {
                 gossip,
                 len,
+                signed_len,
                 live_only,
             },
         );
@@ -198,6 +297,28 @@ impl Broadcasts {
         if let Some(rank) = self.by_node.remove(node) {
             self.queue.remove(&rank);
         }
+    }
+
+    /// Gives the queued rumour of `a`, if it is that unsigned Alive, its signature, and the
+    /// certificate to go ahead of it if `cert`. It keeps its place and its count of sends.
+    pub fn attach(
+        &mut self,
+        a: &Alive<'_>,
+        cert_id: CertificateId,
+        sig: Signature,
+        cert: Option<Vec<u8>>,
+    ) {
+        let Some(rank) = self.by_node.get(a.node.as_str()) else {
+            return;
+        };
+        let Some(q) = self.queue.get_mut(rank) else {
+            return;
+        };
+        if q.gossip.message() != Message::Alive(*a) || q.gossip.signed().is_some() {
+            return;
+        }
+        q.gossip = Gossip::signed_alive(a, cert_id, sig, cert);
+        q.signed_len = q.gossip.signed_len();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -241,6 +362,33 @@ impl Broadcasts {
             }
         }
         picked
+    }
+
+    /// Like [`select`](Self::select) for a member that speaks version 2, which gets two
+    /// packets: signed entries in their version 2 form fill `signed` bytes, the unsigned ones
+    /// `unsigned` bytes. Returns the entries for each.
+    fn select_split(&self, unsigned: usize, signed: usize) -> (Vec<Rank>, Vec<Rank>) {
+        let smallest = smallest_rumour();
+        let (mut left_v1, mut left_v2) = (unsigned, signed);
+        let (mut v1, mut v2) = (Vec::new(), Vec::new());
+        for (&rank, q) in &self.queue {
+            if left_v1 < smallest && left_v2 < smallest {
+                break;
+            }
+            match q.signed_len {
+                Some(len) if len <= left_v2 => {
+                    left_v2 -= len;
+                    v2.push(rank);
+                }
+                Some(_) => {}
+                None if q.len <= left_v1 => {
+                    left_v1 -= q.len;
+                    v1.push(rank);
+                }
+                None => {}
+            }
+        }
+        (v1, v2)
     }
 
     /// Counts one more send of each entry in `sent`, to a live member if `live`, then drops
@@ -338,13 +486,20 @@ impl Outbox {
     /// first, then, to a member held live, user broadcasts in the room they leave. `live` says
     /// whether `to` is a member this node holds live, Alive or Suspect. Sends nothing if there
     /// is nothing to send. Returns whether a datagram was queued.
+    ///
+    /// To a member that speaks `version` 2 the signed rumours go in a second, version 2
+    /// datagram; see [`send_split`](Self::send_split).
     pub fn send(
         &mut self,
         to: SocketAddr,
         live: bool,
+        version: WireVersion,
         head: &[Message<'_>],
         limit: Option<u32>,
     ) -> bool {
+        if version == WireVersion::V2 {
+            return self.send_split(to, live, head, limit);
+        }
         let max = datagram_room(&self.codec);
         let used: usize = head.iter().map(Message::encoded_len).sum();
         let picked = match limit {
@@ -395,6 +550,93 @@ impl Outbox {
         true
     }
 
+    /// What [`send`](Self::send) sends to a member that speaks version 2: `head`, the unsigned
+    /// rumours and user broadcasts in a version 1 datagram, as `off` would, and the signed
+    /// rumours, each new Alive behind its certificate, in a version 2 datagram. Each fills the
+    /// room of its own datagram, in queue order, and a rumour counts one send.
+    fn send_split(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        let max = datagram_room(&self.codec);
+        let used: usize = head.iter().map(Message::encoded_len).sum();
+        let (unsigned, signed) = match limit {
+            Some(_) => self.broadcasts.select_split(max.saturating_sub(used), max),
+            None => (Vec::new(), Vec::new()),
+        };
+        let users = match limit {
+            Some(_) if live && !self.user.is_empty() => {
+                let rumours: usize = unsigned.iter().map(|&r| self.broadcasts.len_of(r)).sum();
+                self.user.select(max.saturating_sub(used + rumours))
+            }
+            _ => Vec::new(),
+        };
+        let mut queued = false;
+        if !head.is_empty() || !unsigned.is_empty() || !users.is_empty() {
+            let nonce = self.nonce();
+            let mut msgs = Vec::with_capacity(head.len() + unsigned.len() + users.len());
+            msgs.extend_from_slice(head);
+            msgs.extend(
+                unsigned
+                    .iter()
+                    .map(|&rank| self.broadcasts.gossip(rank).message()),
+            );
+            msgs.extend(
+                users
+                    .iter()
+                    .map(|&rank| self.user.broadcast(rank).message()),
+            );
+            let mut payload = Vec::new();
+            if self
+                .codec
+                .seal(PacketKind::Datagram, &msgs, &nonce, &mut payload)
+                .is_ok()
+            {
+                drop(msgs);
+                self.transmits.push_back(Transmit::Datagram { to, payload });
+                queued = true;
+            }
+        }
+        if !signed.is_empty() {
+            let nonce = self.nonce();
+            let mut msgs = Vec::with_capacity(signed.len() * 2);
+            for &rank in &signed {
+                if let Some((cert, msg)) = self.broadcasts.gossip(rank).signed() {
+                    msgs.extend(cert.map(v2::Message::Certificate));
+                    msgs.push(msg);
+                }
+            }
+            let mut payload = Vec::new();
+            if self
+                .codec
+                .seal_v2(
+                    WireVersion::V2,
+                    PacketKind::Datagram,
+                    &msgs,
+                    &nonce,
+                    &mut payload,
+                )
+                .is_ok()
+            {
+                drop(msgs);
+                self.transmits.push_back(Transmit::Datagram { to, payload });
+                queued = true;
+            }
+        }
+        if let Some(limit) = limit {
+            let mut sent = unsigned;
+            sent.extend(signed);
+            self.broadcasts.sent(&sent, limit, live);
+            if !users.is_empty() {
+                self.user.sent(&users, limit);
+            }
+        }
+        queued
+    }
+
     /// Writes `msgs` to `conn` as one length-prefixed stream frame. Returns false, sending
     /// nothing, if they do not fit in `max_stream_frame`.
     pub fn frame(&mut self, conn: StreamId, msgs: &[Message<'_>]) -> bool {
@@ -403,6 +645,38 @@ impl Outbox {
         if self
             .codec
             .seal_stream_frame(msgs, &nonce, &mut frame)
+            .is_err()
+        {
+            return false;
+        }
+        self.transmits.push_back(Transmit::Stream { conn, frame });
+        true
+    }
+
+    /// Sends version 2 `msgs` to `to` alone in one version 2 datagram.
+    pub fn send_signed(&mut self, to: SocketAddr, msgs: &[v2::Message<'_>]) {
+        let nonce = self.nonce();
+        let mut payload = Vec::new();
+        let sealed = self.codec.seal_v2(
+            WireVersion::V2,
+            PacketKind::Datagram,
+            msgs,
+            &nonce,
+            &mut payload,
+        );
+        if sealed.is_ok() {
+            self.transmits.push_back(Transmit::Datagram { to, payload });
+        }
+    }
+
+    /// Writes version 2 `msgs` to `conn` as one stream frame at version 2. Returns false,
+    /// sending nothing, if they do not fit in `max_stream_frame`.
+    pub fn frame_v2(&mut self, conn: StreamId, msgs: &[v2::Message<'_>]) -> bool {
+        let nonce = self.nonce();
+        let mut frame = Vec::new();
+        if self
+            .codec
+            .seal_v2_stream_frame(WireVersion::V2, msgs, &nonce, &mut frame)
             .is_err()
         {
             return false;
@@ -428,8 +702,13 @@ impl Node {
     /// counted, together with anything older queued about the same member, rather than kept
     /// forever. `Config::validate` refuses limits under which this node's own rumours or any it
     /// accepts could be that large.
-    fn queue_gossip(&mut self, gossip: Gossip, live_only: bool) {
-        if gossip.message().encoded_len() > datagram_room(&self.out.codec) {
+    ///
+    /// A signed rumour too large for a datagram, which validated limits also rule out, goes
+    /// without its certificate, and failing that unsigned.
+    fn queue_gossip(&mut self, mut gossip: Gossip, live_only: bool) {
+        let room = datagram_room(&self.out.codec);
+        gossip.fit(room);
+        if gossip.message().encoded_len() > room {
             self.out.broadcasts.forget(gossip.node());
             self.metrics.gossip_too_large += 1;
         } else if live_only {
@@ -444,7 +723,7 @@ impl Node {
         retransmit_limit(&self.cfg, self.cluster_size())
     }
 
-    /// This node's own Alive rumour.
+    /// This node's own Alive rumour, signed in mode `sign`.
     pub(crate) fn local_alive(&self) -> Gossip {
         let me = &self.local;
         Gossip::Alive {
@@ -455,7 +734,19 @@ impl Node {
             vmin: me.vmin,
             vmax: me.vmax,
             epoch: me.member.epoch,
+            sig: me.proof.map(|p| (p.cert, p.sig)),
+            cert: None,
         }
+    }
+
+    /// This node's first Alive of a life, which in mode `sign` carries its certificate ahead of
+    /// it (section 2, Distribution).
+    pub(crate) fn local_alive_announced(&self) -> Gossip {
+        let mut gossip = self.local_alive();
+        if let Gossip::Alive { cert, .. } = &mut gossip {
+            *cert = self.keys.as_ref().map(|k| k.own.bytes.clone());
+        }
+        gossip
     }
 
     /// Whether this node holds `name` as a live member, Alive or Suspect.
@@ -474,7 +765,7 @@ impl Node {
             return;
         }
         let window = self.cfg.gossip_to_the_dead;
-        let targets: Vec<(SocketAddr, bool)> = self
+        let targets: Vec<(SocketAddr, bool, String)> = self
             .table
             .random(self.cfg.gossip_nodes, &mut self.rng, |e| {
                 match e.member.state {
@@ -484,14 +775,20 @@ impl Node {
                 }
             })
             .into_iter()
-            .map(|e| (e.member.addr, e.member.state.is_live()))
+            .map(|e| {
+                (
+                    e.member.addr,
+                    e.member.state.is_live(),
+                    e.member.name.clone(),
+                )
+            })
             .collect();
         let limit = self.retransmit_limit();
-        for (to, live) in targets {
+        for (to, live, name) in targets {
             // With nothing left to send, the rest get nothing either; a member that is not live
             // gets no user broadcasts, which the next one may.
             let empty = self.out.broadcasts.is_empty() && self.out.user.is_empty();
-            if !self.send_to(to, live, &[], Some(limit)) && empty {
+            if !self.send_to(to, live, Some(&name), &[], Some(limit)) && empty {
                 break;
             }
         }
@@ -507,15 +804,31 @@ impl Node {
     }
 
     /// Sends `head` to `to` in one datagram with queued gossip, as [`Outbox::send`] does, if
-    /// this node [may send](Self::may_send) to `to`. Returns whether a datagram was queued.
+    /// this node [may send](Self::may_send) to `to`. `peer` names the member at `to`, when the
+    /// caller knows it, for the version it speaks. Returns whether a datagram was queued.
     pub(crate) fn send_to(
         &mut self,
         to: SocketAddr,
         live: bool,
+        peer: Option<&str>,
         head: &[Message<'_>],
         limit: Option<u32>,
     ) -> bool {
-        self.may_send(to) && self.out.send(to, live, head, limit)
+        let version = self.version_for(peer, to);
+        self.may_send(to) && self.out.send(to, live, version, head, limit)
+    }
+
+    /// The highest wire version this node and the member `peer` at `to` both speak: version 2
+    /// in mode `sign` with a member whose Alive advertises it, and version 1 otherwise, which is
+    /// also the version for an address this node holds no member at.
+    pub(crate) fn version_for(&self, peer: Option<&str>, to: SocketAddr) -> WireVersion {
+        let two = WireVersion::V2 as u8;
+        let speaks = |e: &Entry| e.member.addr == to && e.vmin <= two && two <= e.vmax;
+        if self.keys.is_some() && peer.and_then(|p| self.table.get(p)).is_some_and(speaks) {
+            WireVersion::V2
+        } else {
+            WireVersion::V1
+        }
     }
 }
 
@@ -530,6 +843,7 @@ mod tests {
             node: node.to_owned(),
             from: "x".to_owned(),
             epoch: 0,
+            proof: None,
         }
     }
 
@@ -551,6 +865,8 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            sig: None,
+            cert: None,
         };
         n.broadcast(huge);
         assert_eq!(n.metrics().gossip_too_large, 1);
@@ -650,6 +966,8 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            sig: None,
+            cert: None,
         };
         let mut b = Broadcasts::default();
         b.push(suspect("old", 1));
@@ -723,7 +1041,7 @@ mod tests {
         let to = SocketAddr::from(([127, 0, 0, 1], 1));
         let mut sends = 0;
         while !out.broadcasts.is_empty() {
-            assert!(out.send(to, true, &[], Some(1)));
+            assert!(out.send(to, true, WireVersion::V1, &[], Some(1)));
             sends += 1;
         }
         assert!(sends > 1);
@@ -738,7 +1056,7 @@ mod tests {
                 Codec::insecure_plaintext(b"t", limits).unwrap(),
                 Nonces::new(&[1; 32])
             )
-            .send(to, true, &[], Some(1))
+            .send(to, true, WireVersion::V1, &[], Some(1))
         );
     }
 }

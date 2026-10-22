@@ -4,8 +4,11 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
+use kinship_proto::Alive;
+
 use crate::member::{Member, State};
 use crate::rng::Rng;
+use crate::signing::{AliveProof, LeftProof};
 use crate::time::Instant;
 
 /// A member plus what only the protocol needs to know about it.
@@ -16,6 +19,25 @@ pub(crate) struct Entry {
     pub since: Instant,
     pub vmin: u8,
     pub vmax: u8,
+    /// The signature of the Alive the member is held at, in mode `sign`; `None` while it is
+    /// unsigned. The member's name, address, metadata, versions and epoch are the rest of the
+    /// signed bytes, so every change to them sets this again or clears it.
+    pub proof: Option<AliveProof>,
+    /// The member's signed Left, kept with its tombstone.
+    pub left: Option<LeftProof>,
+}
+
+impl Entry {
+    /// Whether `a` is the Alive this entry holds, but for the versions it speaks: a 0.4 node
+    /// passes on the range of a member it was given in a list as 1 to 1, whatever the member
+    /// sent, so only the member's own signed Alive tells it.
+    pub fn holds(&self, a: &Alive<'_>) -> bool {
+        let m = &self.member;
+        a.inc == m.incarnation
+            && a.addr == m.addr
+            && a.meta == m.meta.as_slice()
+            && a.epoch == m.epoch
+    }
 }
 
 /// Every member other than this node, live or tombstoned.
@@ -103,6 +125,22 @@ impl Table {
         m.state = state;
         m.incarnation = inc;
         entry
+    }
+
+    /// Sets the proof of the Alive a known member is held at; see [`Entry::proof`].
+    pub fn set_proof(&mut self, name: &str, proof: Option<AliveProof>) {
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.proof = proof;
+        }
+    }
+
+    /// Sets the versions a known member speaks; returns the highest it spoke before.
+    pub fn set_versions(&mut self, name: &str, vmin: u8, vmax: u8) -> Option<u8> {
+        let entry = self.entries.get_mut(name)?;
+        let before = entry.vmax;
+        entry.vmin = vmin;
+        entry.vmax = vmax;
+        Some(before)
     }
 
     /// Deletes tombstones that have been Dead or Left for at least `keep`.
@@ -203,6 +241,8 @@ mod tests {
             since: Instant::ZERO,
             vmin: 1,
             vmax: 1,
+            proof: None,
+            left: None,
         }
     }
 

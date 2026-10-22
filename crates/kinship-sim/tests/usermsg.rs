@@ -60,9 +60,9 @@ struct Record {
 type Log = Rc<RefCell<Record>>;
 
 enum Inner {
-    New(Node),
+    New(Box<Node>),
     /// The released kinship-core 0.3.0.
-    Old(old::Node),
+    Old(Box<old::Node>),
 }
 
 /// A node of this version, or of 0.3.0, that reports into a shared [`Record`].
@@ -119,7 +119,7 @@ impl Peer {
                 n.add_member(now, &name_of(j), addr_of(j)).unwrap();
             }
             while n.poll_event().is_some() {}
-            Inner::Old(n)
+            Inner::Old(Box::new(n))
         } else {
             let mut cfg = Config::lan(Security::Keys(vec![Key::from_bytes(key)]));
             tune(spec.index, &mut cfg);
@@ -131,7 +131,7 @@ impl Peer {
                 n.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
             }
             while n.poll_event().is_some() {}
-            Inner::New(n)
+            Inner::New(Box::new(n))
         };
         let codec = Codec::encrypted(b"default", Limits::default(), vec![Key::from_bytes(key)])
             .expect("the run's key");

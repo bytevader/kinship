@@ -34,6 +34,7 @@ mod metrics;
 mod probe;
 mod replay;
 mod rng;
+mod signing;
 mod suspicion;
 mod sync;
 mod table;
@@ -44,13 +45,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
 use kinship_proto::{
-    DecodeError, KeyringError, Message, NodeId, PacketKind, Payload, sealed_nonce,
+    DecodeError, KeyringError, MAX_WIRE_VERSION, Message, NodeId, PacketKind, Payload,
+    VersionedPayload, sealed_nonce,
 };
 
 use crate::broadcast::Outbox;
 use crate::probe::{Probe, Relay};
 use crate::replay::Replay;
 use crate::rng::Nonces;
+use crate::signing::{CHECKS_PER_INPUT, Keys, signing_keys};
 use crate::suspicion::Suspicion;
 use crate::sync::Sync;
 use crate::table::{Entry, Table};
@@ -59,10 +62,12 @@ use crate::user::Users;
 pub use config::{Config, ConfigError, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
+pub use kinship_proto::identity::{PublicKey, SigningKey};
 pub use kinship_proto::{HeaderCheck, Key, KeyError, KeyId, Limits, WIRE_VERSION};
 pub use member::{Member, State};
 pub use metrics::Metrics;
 pub use rng::Rng;
+pub use signing::{CERTIFICATE_SKEW_SECS, Credentials, Signatures};
 pub use time::Instant;
 
 /// Who this node is: its name, the address peers reach it on, its metadata, and which life of
@@ -168,6 +173,9 @@ pub struct Node {
     announced: Vec<SocketAddr>,
     /// User messages and broadcasts, apart from the broadcast queue in the outbox.
     user: Users,
+    /// Mode `sign`: this node's certificate, the ones it holds for members, and push-pull
+    /// records waiting for their checks. `None` in mode `off`.
+    keys: Option<Box<Keys>>,
 }
 
 impl Node {
@@ -191,6 +199,10 @@ impl Node {
                 reason: "must be at most max_meta_bytes",
             });
         }
+        let keys = match cfg.signatures.credentials() {
+            Some(credentials) => Some(Box::new(signing_keys(credentials, &cfg, &me, now)?)),
+            None => None,
+        };
         // The keys move into the codec and live nowhere else: the config the node keeps has none.
         let codec = cfg.take_codec().map_err(|_| ConfigError {
             field: "security",
@@ -221,7 +233,14 @@ impl Node {
             },
             since: now,
             vmin: 1,
-            vmax: WIRE_VERSION,
+            // A signing node speaks version 2 as well.
+            vmax: if keys.is_some() {
+                MAX_WIRE_VERSION
+            } else {
+                WIRE_VERSION
+            },
+            proof: None,
+            left: None,
         };
         let mut node = Self {
             cfg,
@@ -247,9 +266,11 @@ impl Node {
             joined: false,
             announced: Vec::new(),
             user: Users::default(),
+            keys,
         };
         node.out.stamp = node.replay.stamp(now);
-        node.broadcast(node.local_alive());
+        node.resign_local();
+        node.broadcast(node.local_alive_announced());
         Ok(node)
     }
 
@@ -299,6 +320,8 @@ impl Node {
             since: self.now,
             vmin: 1,
             vmax: WIRE_VERSION,
+            proof: None,
+            left: None,
         });
         Ok(())
     }
@@ -328,17 +351,38 @@ impl Node {
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(buf);
-        match self.out.codec.open(PacketKind::Datagram, &mut scratch) {
-            Ok(payload) => {
-                if self.accept_stamp(&stamp) {
-                    self.metrics.packets_received += 1;
-                    self.process(&payload);
+        if self.keys.is_some() {
+            // Mode `sign`: the envelope's version, which the AEAD authenticates, selects the
+            // grammar (docs/ki01-stage2.md, Opening a version 1 envelope).
+            match self
+                .out
+                .codec
+                .open_versioned(PacketKind::Datagram, &mut scratch)
+            {
+                Ok(payload) => {
+                    if self.accept_stamp(&stamp) {
+                        self.metrics.packets_received += 1;
+                        match payload {
+                            VersionedPayload::V1(payload) => self.process(&payload),
+                            VersionedPayload::V2(payload) => self.process_v2(&payload),
+                        }
+                    }
                 }
+                Err(e) => self.count_error(&e),
             }
-            Err(e) => self.count_error(&e),
+        } else {
+            match self.out.codec.open(PacketKind::Datagram, &mut scratch) {
+                Ok(payload) => {
+                    if self.accept_stamp(&stamp) {
+                        self.metrics.packets_received += 1;
+                        self.process(&payload);
+                    }
+                }
+                Err(e) => self.count_error(&e),
+            }
         }
         self.recv_buf = scratch;
-        self.check_leave();
+        self.after_input();
     }
 
     /// Something happened on a TCP connection.
@@ -348,7 +392,7 @@ impl Node {
     pub fn handle_stream(&mut self, now: Instant, conn: StreamId, ev: StreamEvent<'_>) {
         self.advance(now);
         self.on_stream(conn, ev);
-        self.check_leave();
+        self.after_input();
     }
 
     /// The deadline from [`poll_timeout`](Self::poll_timeout) has passed.
@@ -366,7 +410,7 @@ impl Node {
             let ticks = u32::try_from(missed + 1).unwrap_or(u32::MAX);
             self.next_gossip = self.next_gossip + interval * ticks;
         }
-        self.check_leave();
+        self.after_input();
     }
 
     /// Starts a command; its result arrives as [`Event::CommandDone`], at once for SetMeta
@@ -385,6 +429,7 @@ impl Node {
                 let local = &mut self.local.member;
                 local.meta = meta;
                 local.incarnation = local.incarnation.wrapping_add(1);
+                self.resign_local();
                 self.broadcast(self.local_alive());
                 self.finish(id, Ok(CommandOutput::Done));
             }
@@ -411,6 +456,7 @@ impl Node {
                 self.finish(id, r);
             }
         }
+        self.refresh_unsigned();
         id
     }
 
@@ -424,7 +470,12 @@ impl Node {
     /// driver can drop a connection that does not start like a frame for it before the rest
     /// arrives. Take a new one after every keyring command.
     pub fn header_check(&self) -> HeaderCheck {
-        self.out.codec.header_check()
+        if self.keys.is_some() {
+            // A signing node takes version 2 packets as well.
+            self.out.codec.header_check_versioned()
+        } else {
+            self.out.codec.header_check()
+        }
     }
 
     /// Counts a packet the driver dropped before handing it over, because this node's
@@ -468,6 +519,10 @@ impl Node {
         }
         if !self.out.broadcasts.is_empty() || !self.out.user.is_empty() {
             t = t.min(self.next_gossip);
+        }
+        if self.has_deferred() {
+            // Push-pull records wait for their checks: they go on the next input.
+            t = t.min(self.now);
         }
         Some(t)
     }
@@ -525,6 +580,25 @@ impl Node {
         self.now = self.now.max(now);
         self.replay.tick(self.now);
         self.out.stamp = self.replay.stamp(self.now);
+        if let Some(keys) = &mut self.keys {
+            keys.checks_left = CHECKS_PER_INPUT;
+        }
+        if self.has_deferred() {
+            self.drain_deferred();
+        }
+    }
+
+    /// What every input ends with: a Leave that is done finishes, and in mode `sign` the count
+    /// of unsigned members is brought up to date.
+    fn after_input(&mut self) {
+        self.check_leave();
+        self.refresh_unsigned();
+    }
+
+    fn refresh_unsigned(&mut self) {
+        if self.keys.is_some() {
+            self.metrics.unsigned_members = self.count_unsigned();
+        }
     }
 
     /// Checks an encrypted packet's stamp against the replay window, before anything is
@@ -607,9 +681,9 @@ impl Node {
                 Message::PingReq(r) => self.on_ping_req(now, &r),
                 Message::Ack { seq } => self.on_ack(seq),
                 Message::Nack { seq } => self.on_nack(seq),
-                Message::Alive(a) => self.on_alive(now, &a, &mut budget),
-                Message::Suspect(s) => self.on_suspect(now, &s),
-                Message::Dead(d) => self.on_dead(now, &d),
+                Message::Alive(a) => self.on_alive(now, &a, &mut budget, None),
+                Message::Suspect(s) => self.on_suspect(now, &s, None),
+                Message::Dead(d) => self.on_dead(now, &d, None),
                 // Push-pull runs over streams only.
                 Message::PushPull(_) => {}
                 Message::UserMessage(_) | Message::UserBroadcast(_) => user.push(msg),

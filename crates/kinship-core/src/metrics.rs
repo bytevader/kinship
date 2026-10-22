@@ -70,4 +70,15 @@ pub struct Metrics {
     /// Broadcasts dropped from a full queue, `user_broadcast_queue` long, and direct messages
     /// dropped while `max_stream_frame` bytes already waited for connections.
     pub user_queue_overflow: u64,
+    /// Mode `sign`: received statements and push-pull records whose signature failed under a
+    /// valid certificate. Each is dropped alone, and never taken as unsigned.
+    pub signatures_invalid: u64,
+    /// Mode `sign`: certificates refused when a statement needed one: not signed by a trust
+    /// anchor, for another cluster or another member, not yet valid or expired at this node's
+    /// clock, give or take 5 minutes. The statement is dropped.
+    pub certificates_refused: u64,
+    /// Mode `sign`: live members held without a checked signature of their current Alive,
+    /// under a certificate valid now. Unlike the counters above, a current count, which falls
+    /// to 0 once every member signs; 0 in mode `off`.
+    pub unsigned_members: u64,
 }

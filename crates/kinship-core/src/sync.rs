@@ -11,13 +11,22 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use kinship_proto::{Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records};
+use std::collections::BTreeSet;
+
+use kinship_proto::identity::CertificateId;
+use kinship_proto::v2;
+use kinship_proto::{
+    Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records, VersionedPayload,
+    WireVersion,
+};
 
 use crate::broadcast::{Gossip, id};
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
 use crate::io::{StreamEvent, StreamId, Transmit};
 use crate::member::{Admission, State};
 use crate::replay::stamp_of;
+use crate::signing::{Keys, LeftProof, packet_certs, signed_alive};
+use crate::table::Entry;
 use crate::time::Instant;
 use crate::{Node, Stamp};
 
@@ -44,6 +53,9 @@ pub(crate) struct Outbound {
     stamp: u64,
     /// This exchange repeats one the peer answered as stale; it is not repeated again.
     repeat: bool,
+    /// The wire version its frames are sealed at: 2 for the exchange of signed records with a
+    /// member that speaks it, 1 otherwise.
+    version: WireVersion,
 }
 
 /// A join in progress.
@@ -58,6 +70,9 @@ struct Seed {
     addr: SocketAddr,
     attempts: u32,
     state: SeedState,
+    /// Exchanges of the current attempt still open: two when a signing node tries version 2,
+    /// the exchange of signed records and the version 1 one beside it.
+    inflight: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,14 +176,38 @@ impl Node {
         let mut scratch = std::mem::take(&mut self.recv_buf);
         scratch.clear();
         scratch.extend_from_slice(frame);
-        let answered = match self.out.codec.open(PacketKind::Stream, &mut scratch) {
+        // Mode `sign` opens version 2 frames too, by the envelope's version.
+        let opened = if self.keys.is_some() {
+            self.out
+                .codec
+                .open_versioned(PacketKind::Stream, &mut scratch)
+        } else {
+            self.out
+                .codec
+                .open(PacketKind::Stream, &mut scratch)
+                .map(VersionedPayload::V1)
+        };
+        let answered = match opened {
             Ok(payload) if matches!(stamp, Stamp::Stale) => {
                 // An authentic request from a node that has fallen behind cluster time: one that
                 // just started, or a recording. Merge nothing, and answer a push-pull with this
                 // node's own record only: a real joiner catches up from it and asks again.
                 self.metrics.replays_dropped += 1;
-                let push_pull = payload.iter().any(|m| matches!(m, Message::PushPull(_)));
-                push_pull && self.send_state(conn, false, false)
+                match payload {
+                    VersionedPayload::V1(payload) => {
+                        let push_pull = payload.iter().any(|m| matches!(m, Message::PushPull(_)));
+                        push_pull && self.send_state(conn, false, false)
+                    }
+                    VersionedPayload::V2(payload) => {
+                        let known = payload.iter().find_map(|m| match m {
+                            v2::Message::PushPull(p) => Some(p.known_certificates),
+                            _ => None,
+                        });
+                        known.is_some_and(|known| {
+                            self.send_signed_state(conn, false, false, Some(known))
+                        })
+                    }
+                }
             }
             Ok(payload) => {
                 if self.accept_stamp(&stamp) {
@@ -177,32 +216,14 @@ impl Node {
                         Stamp::Fresh(nonce) => Some(stamp_of(&nonce)),
                         _ => None,
                     };
-                    // Every record in the frame shares one admission budget for new members.
-                    let mut budget = self.admission();
-                    let mut answered = false;
-                    // User messages wait for the rest, so that an Alive in the frame introduces
-                    // their sender; only a connection a peer opened carries them.
-                    let mut user = Vec::new();
-                    for msg in payload.iter() {
-                        if matches!(msg, Message::UserMessage(_) | Message::UserBroadcast(_)) {
-                            if conn.is_inbound() {
-                                user.push(msg);
-                            }
-                            continue;
+                    match payload {
+                        VersionedPayload::V1(payload) => {
+                            self.on_frame_v1(now, conn, &payload, reply_stamp)
                         }
-                        answered = if conn.is_inbound() {
-                            self.serve(now, conn, &msg, &mut budget)
-                        } else {
-                            self.on_reply(now, conn, &msg, reply_stamp, &mut budget)
-                        };
-                        if answered {
-                            break;
+                        VersionedPayload::V2(payload) => {
+                            self.on_frame_v2(now, conn, &payload, reply_stamp)
                         }
                     }
-                    for msg in &user {
-                        self.on_user(msg);
-                    }
-                    answered
                 } else {
                     false
                 }
@@ -214,6 +235,82 @@ impl Node {
         };
         self.recv_buf = scratch;
         self.end_stream(conn, answered);
+    }
+
+    /// Handles an authenticated version 1 frame. True if it was answered, or was the reply.
+    fn on_frame_v1(
+        &mut self,
+        now: Instant,
+        conn: StreamId,
+        payload: &kinship_proto::Payload<'_>,
+        reply_stamp: Option<u64>,
+    ) -> bool {
+        // Every record in the frame shares one admission budget for new members.
+        let mut budget = self.admission();
+        let mut answered = false;
+        // User messages wait for the rest, so that an Alive in the frame introduces their
+        // sender; only a connection a peer opened carries them.
+        let mut user = Vec::new();
+        for msg in payload.iter() {
+            if matches!(msg, Message::UserMessage(_) | Message::UserBroadcast(_)) {
+                if conn.is_inbound() {
+                    user.push(msg);
+                }
+                continue;
+            }
+            answered = if conn.is_inbound() {
+                self.serve(now, conn, &msg, &mut budget)
+            } else {
+                self.on_reply(now, conn, &msg, reply_stamp, &mut budget)
+            };
+            if answered {
+                break;
+            }
+        }
+        for msg in &user {
+            self.on_user(msg);
+        }
+        answered
+    }
+
+    /// Handles an authenticated version 2 frame: a push-pull of signed records and the
+    /// certificates beside it. True if it was answered, or was the reply.
+    fn on_frame_v2(
+        &mut self,
+        now: Instant,
+        conn: StreamId,
+        payload: &v2::Payload<'_>,
+        reply_stamp: Option<u64>,
+    ) -> bool {
+        let certs = packet_certs(payload.iter().filter_map(|m| match m {
+            v2::Message::Certificate(c) => Some(c),
+            _ => None,
+        }));
+        let mut budget = self.admission();
+        let Some(p) = payload.iter().find_map(|m| match m {
+            v2::Message::PushPull(p) => Some(p),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if conn.is_inbound() {
+            self.merge_v2(now, p.records, &certs, &mut budget);
+            if self.send_signed_state(conn, false, true, Some(p.known_certificates)) {
+                self.metrics.push_pulls_served += 1;
+            }
+            self.joined |= p.join;
+            return true;
+        }
+        let Some(out) = self.sync.streams.get(&conn).cloned() else {
+            return false;
+        };
+        match out.purpose {
+            Purpose::Join { .. } | Purpose::Sync => {
+                self.merge_v2(now, p.records, &certs, &mut budget);
+                self.pulled(&out, reply_stamp)
+            }
+            Purpose::Ping { .. } | Purpose::Message => false,
+        }
     }
 
     /// Answers the first frame of a connection a peer opened. True if `msg` was answered.
@@ -244,7 +341,7 @@ impl Node {
             }
             // The sender's Alive ahead of its user messages, which asks for no answer.
             Message::Alive(a) => {
-                self.on_alive(now, a, budget);
+                self.on_alive(now, a, budget, None);
                 false
             }
             _ => false,
@@ -268,19 +365,7 @@ impl Node {
         match (purpose, msg) {
             (Purpose::Join { .. } | Purpose::Sync, Message::PushPull(p)) => {
                 self.merge(now, p.records, budget);
-                let window = self.replay.window_ms();
-                let was_stale = stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window);
-                if was_stale && !out.repeat {
-                    // The peer found this node's request stale and sent only its own record.
-                    // This node has caught up from the reply, so it asks again at once.
-                    self.push_pull_with(out.to, purpose, true);
-                    return true;
-                }
-                self.metrics.push_pulls += 1;
-                if let Purpose::Join { cmd, seed } = purpose {
-                    self.seed_done(now, cmd, seed, true);
-                }
-                true
+                self.pulled(&out, stamp)
             }
             (Purpose::Ping { seq }, Message::Ack { seq: acked }) if seq == *acked => {
                 if let Some(p) = self.probe.as_mut().filter(|p| p.seq == seq && !p.acked) {
@@ -291,6 +376,24 @@ impl Node {
             }
             _ => false,
         }
+    }
+
+    /// Finishes a push-pull this node opened, once the reply merged. `stamp` is the cluster
+    /// time the reply was sealed at, when encrypted. True: the reply was the answer.
+    fn pulled(&mut self, out: &Outbound, stamp: Option<u64>) -> bool {
+        let window = self.replay.window_ms();
+        let was_stale = stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window);
+        if was_stale && !out.repeat {
+            // The peer found this node's request stale and sent only its own record.
+            // This node has caught up from the reply, so it asks again at once.
+            self.push_pull_with(out.to, out.purpose, true, out.version);
+            return true;
+        }
+        self.metrics.push_pulls += 1;
+        if let Purpose::Join { cmd, seed } = out.purpose {
+            self.seed_done(self.now, cmd, seed, true);
+        }
+        true
     }
 
     /// Closes `conn` after its frame was handled; an outbound exchange that got no usable
@@ -328,7 +431,7 @@ impl Node {
         for r in records.iter() {
             let a = r.alive;
             match r.state {
-                kinship_proto::State::Alive => self.on_alive(now, &a, budget),
+                kinship_proto::State::Alive => self.on_alive(now, &a, budget, None),
                 kinship_proto::State::Left => self.on_dead(
                     now,
                     &Dead {
@@ -337,6 +440,7 @@ impl Node {
                         from: a.node,
                         epoch: a.epoch,
                     },
+                    None,
                 ),
                 kinship_proto::State::Suspect | kinship_proto::State::Dead => {
                     self.on_merged_suspicion(now, a.node.as_str(), a.inc, a.epoch);
@@ -376,8 +480,84 @@ impl Node {
         sent
     }
 
-    /// Opens a connection to `to` and remembers why.
-    pub(crate) fn connect(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) -> StreamId {
+    /// Writes the version 2 push-pull of this node's signed records to `conn`, every member it
+    /// holds a proof for, or with `full` false its own only. A request (`known` is `None`)
+    /// carries this node's own certificate and the ids of every certificate it holds; a reply
+    /// carries the certificates of its records whose ids the request did not list. False if it
+    /// does not fit.
+    fn send_signed_state(
+        &mut self,
+        conn: StreamId,
+        join: bool,
+        full: bool,
+        known: Option<v2::CertificateIds<'_>>,
+    ) -> bool {
+        let Some(keys) = &self.keys else {
+            return false;
+        };
+        let me = self.local.member.name.as_str();
+        let unix = keys.unix_now(self.now);
+        let others = if full { self.table.len() } else { 0 };
+        let known: Option<BTreeSet<CertificateId>> = known.map(|k| k.iter().collect());
+        let mut records = Vec::new();
+        let mut certs = Vec::new();
+        for e in std::iter::once(&self.local).chain(self.table.iter().take(others)) {
+            let Some(r) = signed_record(e, keys, me, unix) else {
+                continue;
+            };
+            let cert = r.alive.certificate_id;
+            if known.as_ref().is_some_and(|k| !k.contains(&cert)) {
+                certs.extend(keys.held(me, &e.member.name, cert));
+            }
+            records.push(r);
+        }
+        let ids: Vec<CertificateId> = if known.is_none() {
+            certs.push(&keys.own);
+            std::iter::once(keys.own.id)
+                .chain(keys.certs.values().map(|c| c.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut msgs: Vec<v2::Message<'_>> = certs
+            .iter()
+            .filter_map(|c| c.certificate())
+            .map(v2::Message::Certificate)
+            .collect();
+        msgs.push(v2::Message::PushPull(v2::PushPull {
+            join,
+            records: v2::Records::Slice(&records),
+            known_certificates: v2::CertificateIds::Slice(&ids),
+        }));
+        let sent = self.out.frame_v2(conn, &msgs);
+        drop(msgs);
+        if !sent {
+            self.metrics.state_too_large += 1;
+        }
+        sent
+    }
+
+    /// Whether this node holds a record that a version 2 push-pull cannot carry: a member
+    /// without a proof of its Alive, or that left without its signed Left.
+    fn omits_records(&self) -> bool {
+        let Some(keys) = &self.keys else {
+            return false;
+        };
+        let me = self.local.member.name.as_str();
+        let unix = keys.unix_now(self.now);
+        std::iter::once(&self.local)
+            .chain(self.table.iter())
+            .any(|e| signed_record(e, keys, me, unix).is_none())
+    }
+
+    /// Opens a connection to `to` and remembers why, and at which `version` it is.
+    pub(crate) fn connect(
+        &mut self,
+        to: SocketAddr,
+        purpose: Purpose,
+        repeat: bool,
+        version: WireVersion,
+    ) -> StreamId {
         let conn = StreamId::outbound(self.sync.next_stream);
         self.sync.next_stream += 1;
         self.out.transmits.push_back(Transmit::Connect { conn, to });
@@ -388,21 +568,52 @@ impl Node {
             to,
             stamp: self.out.stamp,
             repeat,
+            version,
         };
         self.sync.streams.insert(conn, outbound);
         conn
     }
 
-    /// Opens a push-pull exchange with `to`.
-    fn push_pull(&mut self, to: SocketAddr, purpose: Purpose) {
-        self.push_pull_with(to, purpose, false);
+    /// Exchanges state with the member at `to`, at `version`: version 1, the push-pull 0.4
+    /// sends; or with a member that speaks version 2, the push-pull of signed records, and
+    /// beside it, on a second connection, the version 1 one, whenever this node holds a record
+    /// the first cannot carry or is joining (`docs/ki01-stage2.md`, Unsigned statements).
+    fn exchange(&mut self, to: SocketAddr, purpose: Purpose, version: WireVersion) {
+        self.push_pull_with(to, purpose, false, version);
+        if version == WireVersion::V2
+            && (matches!(purpose, Purpose::Join { .. }) || self.omits_records())
+        {
+            self.push_pull_with(to, purpose, false, WireVersion::V1);
+        }
     }
 
-    /// Opens a push-pull exchange with `to`; `repeat` marks the second try after a stale one.
-    fn push_pull_with(&mut self, to: SocketAddr, purpose: Purpose, repeat: bool) {
-        let conn = self.connect(to, purpose, repeat);
+    /// Opens a push-pull exchange with `to` at `version`; `repeat` marks the second try after
+    /// a stale one.
+    fn push_pull_with(
+        &mut self,
+        to: SocketAddr,
+        purpose: Purpose,
+        repeat: bool,
+        version: WireVersion,
+    ) {
+        if let (Purpose::Join { cmd, seed }, false) = (purpose, repeat) {
+            if let Some(s) = self
+                .sync
+                .joins
+                .get_mut(&cmd)
+                .and_then(|j| j.seeds.get_mut(seed))
+            {
+                s.inflight += 1;
+            }
+        }
+        let conn = self.connect(to, purpose, repeat, version);
         let join = matches!(purpose, Purpose::Join { .. });
-        if !self.send_state(conn, join, true) {
+        let sent = if version == WireVersion::V2 {
+            self.send_signed_state(conn, join, true, None)
+        } else {
+            self.send_state(conn, join, true)
+        };
+        if !sent {
             self.end_stream(conn, false);
         }
     }
@@ -410,7 +621,7 @@ impl Node {
     /// Sends the probe of round `seq` to `to` over TCP as well; the stream is closed with the
     /// round.
     pub(crate) fn tcp_ping(&mut self, to: SocketAddr, target: &str, seq: u32) -> StreamId {
-        let conn = self.connect(to, Purpose::Ping { seq }, false);
+        let conn = self.connect(to, Purpose::Ping { seq }, false, WireVersion::V1);
         let ping = Message::Ping(Ping {
             seq,
             target: id(target),
@@ -426,6 +637,17 @@ impl Node {
     pub(crate) fn close_stream(&mut self, conn: StreamId) {
         if self.sync.streams.remove(&conn).is_some() {
             self.out.transmits.push_back(Transmit::Close { conn });
+        }
+    }
+
+    /// The version attempt `attempts` of a join tries a seed at: in mode `sign`, version 2 on
+    /// the first attempt and every other one after, version 1 between; version 1 in `off`.
+    /// A seed is an address this node may hold no member at.
+    fn join_version(&self, attempts: u32) -> WireVersion {
+        if self.keys.is_some() && attempts % 2 == 1 {
+            WireVersion::V2
+        } else {
+            WireVersion::V1
         }
     }
 
@@ -449,18 +671,22 @@ impl Node {
                 addr,
                 attempts: 1,
                 state: SeedState::Trying,
+                inflight: 0,
             })
             .collect();
         self.sync.joins.insert(id, Join { seeds, answered: 0 });
+        let version = self.join_version(1);
         for (seed, addr) in addrs.into_iter().enumerate() {
-            self.push_pull(addr, Purpose::Join { cmd: id, seed });
+            self.exchange(addr, Purpose::Join { cmd: id, seed }, version);
         }
     }
 
-    /// Records the outcome of one attempt with a seed and finishes the join when it can.
+    /// Records the outcome of one exchange with a seed and finishes the join when it can.
     ///
     /// A join waits for the first attempt with every seed, so it can say how many answered.
-    /// Seeds that failed are retried, with backoff, only while none has answered.
+    /// Seeds that failed are retried, with backoff, only while none has answered. An attempt
+    /// at version 2 opens two exchanges; the seed answered when either did, and failed when
+    /// both did.
     fn seed_done(&mut self, now: Instant, cmd: CommandId, seed: usize, ok: bool) {
         let retries = self.cfg.join_retries;
         let base = self.cfg.probe_interval;
@@ -470,10 +696,17 @@ impl Node {
         let Some(s) = join.seeds.get_mut(seed) else {
             return;
         };
+        s.inflight = s.inflight.saturating_sub(1);
+        if s.state != SeedState::Trying {
+            return;
+        }
         if ok {
             s.state = SeedState::Answered;
             join.answered += 1;
             self.joined = true;
+        } else if s.inflight > 0 {
+            // The other exchange of this attempt may still answer.
+            return;
         } else if s.attempts < retries {
             s.state = SeedState::Waiting(now + base * (1 << (s.attempts - 1).min(16)));
         } else {
@@ -498,14 +731,19 @@ impl Node {
         if self.has_left() {
             return self.finish(id, Ok(CommandOutput::Done));
         }
-        let me = &mut self.local.member;
-        me.state = State::Left;
-        let gossip = Gossip::Dead {
-            inc: me.incarnation,
-            node: me.name.clone(),
-            from: me.name.clone(),
-            epoch: me.epoch,
+        self.local.member.state = State::Left;
+        let me = &self.local.member;
+        let (name, inc, epoch) = (me.name.clone(), me.incarnation, me.epoch);
+        let dead = Dead {
+            inc,
+            node: crate::broadcast::id(&name),
+            from: crate::broadcast::id(&name),
+            epoch,
         };
+        // In mode `sign` the Left is signed, and kept for push-pull records of this node.
+        let proof = self.sign_dead(&dead);
+        self.local.left = proof.map(|proof| LeftProof { inc, epoch, proof });
+        let gossip = Gossip::dead(&dead, proof);
         // Sends to members that are dead or gone do not count: a leave that reached only them
         // has told nobody.
         self.broadcast_to_live(gossip);
@@ -566,12 +804,13 @@ impl Node {
                 if matches!(s.state, SeedState::Waiting(t) if t <= now) {
                     s.state = SeedState::Trying;
                     s.attempts += 1;
-                    retries.push((s.addr, Purpose::Join { cmd, seed: i }));
+                    retries.push((s.addr, Purpose::Join { cmd, seed: i }, s.attempts));
                 }
             }
         }
-        for (addr, purpose) in retries {
-            self.push_pull(addr, purpose);
+        for (addr, purpose, attempts) in retries {
+            let version = self.join_version(attempts);
+            self.exchange(addr, purpose, version);
         }
 
         if let Some(t) = self.sync.next_push_pull.filter(|&t| t <= now) {
@@ -581,9 +820,10 @@ impl Node {
                     .table
                     .random(1, &mut self.rng, |e| e.member.state.is_live())
                     .first()
-                    .map(|e| e.member.addr);
-                if let Some(to) = to {
-                    self.push_pull(to, Purpose::Sync);
+                    .map(|e| (e.member.addr, e.member.name.clone()));
+                if let Some((to, name)) = to {
+                    let version = self.version_for(Some(&name), to);
+                    self.exchange(to, Purpose::Sync, version);
                 }
             }
         }
@@ -597,9 +837,10 @@ impl Node {
                     .table
                     .random(1, &mut self.rng, |e| e.member.state == State::Dead)
                     .first()
-                    .map(|e| e.member.addr);
-                if let Some(to) = to {
-                    self.push_pull(to, Purpose::Sync);
+                    .map(|e| (e.member.addr, e.member.name.clone()));
+                if let Some((to, name)) = to {
+                    let version = self.version_for(Some(&name), to);
+                    self.exchange(to, Purpose::Sync, version);
                 }
             }
         }
@@ -618,6 +859,44 @@ impl Node {
             .chain(self.sync.next_push_pull)
             .chain(self.sync.next_reconnect)
             .min()
+    }
+}
+
+/// The version 2 push-pull record of `e`: its member's signed Alive, as the member signed it,
+/// with the state it is held in, and for a member that left, its signed Left. `None` if this
+/// node holds no proof for it, or its certificate is not valid at Unix second `now`.
+fn signed_record<'a>(e: &'a Entry, keys: &Keys, me: &str, now: u64) -> Option<v2::Record<'a>> {
+    let proof = e.proof?;
+    let m = &e.member;
+    keys.held(me, &m.name, proof.cert)
+        .filter(|c| c.is_current(now))?;
+    let state = match m.state {
+        State::Alive if proof.inc == m.incarnation => v2::RecordState::Alive,
+        State::Alive => return None,
+        State::Suspect => v2::RecordState::Suspect { inc: m.incarnation },
+        State::Dead => v2::RecordState::Dead { inc: m.incarnation },
+        State::Left => {
+            let left = e.left.filter(|l| l.epoch == m.epoch)?;
+            v2::RecordState::Left {
+                inc: left.inc,
+                at: left.proof.at,
+                certificate_id: left.proof.cert,
+                signature: left.proof.sig,
+            }
+        }
+    };
+    let alive = Alive {
+        inc: m.incarnation,
+        node: id(&m.name),
+        addr: m.addr,
+        meta: &m.meta,
+        vmin: e.vmin,
+        vmax: e.vmax,
+        epoch: m.epoch,
+    };
+    match signed_alive(&alive, &proof) {
+        v2::Message::Alive(alive) => Some(v2::Record { alive, state }),
+        _ => None,
     }
 }
 
@@ -1045,6 +1324,7 @@ mod tests {
                 epoch: 0,
             },
             &mut b.admission(),
+            None,
         );
         b.on_dead(
             t,
@@ -1054,6 +1334,7 @@ mod tests {
                 from: id("b"),
                 epoch: 0,
             },
+            None,
         );
         assert_eq!(b.member("a").unwrap().state, State::Dead);
         let mut p = Pair::new(node("a", 1), b);
@@ -1097,7 +1378,7 @@ mod tests {
             vmax: 1,
             epoch,
         };
-        b.on_alive(t, &a, &mut b.admission());
+        b.on_alive(t, &a, &mut b.admission(), None);
         b
     }
 
@@ -1299,13 +1580,13 @@ mod tests {
             from: id(r),
             epoch: 0,
         };
-        a.on_suspect(t, &from("d"));
+        a.on_suspect(t, &from("d"), None);
         assert_eq!(a.suspicions["b"].confirmations(), 0);
         assert_eq!(a.suspicions["b"].deadline, full);
         // A merge that repeats it leaves it as it is.
         a.merge(t, Records::Slice(&records[..1]), &mut a.admission());
         assert_eq!(a.suspicions["b"].confirmations(), 0);
-        a.on_suspect(t, &from("e"));
+        a.on_suspect(t, &from("e"), None);
         assert_eq!(a.suspicions["b"].confirmations(), 1);
         assert!(a.suspicions["b"].deadline < full);
     }
@@ -1323,7 +1604,7 @@ mod tests {
             from: id("b"),
             epoch: 0,
         };
-        a.on_dead(t0, &dead);
+        a.on_dead(t0, &dead, None);
         let cmd = a.command(t0, Command::Leave);
         let limit = a.retransmit_limit();
         let (mut to_b, mut to_c) = (0, 0);
@@ -1377,7 +1658,7 @@ mod tests {
             from: id("b"),
             epoch: 0,
         };
-        p.nodes[0].on_suspect(t, &rumour);
+        p.nodes[0].on_suspect(t, &rumour, None);
         p.nodes[0].handle_timeout(t + Duration::from_secs(5));
         assert_eq!(p.nodes[0].metrics().probes_sent, probes);
         assert_eq!(p.nodes[0].local().incarnation, 0);
