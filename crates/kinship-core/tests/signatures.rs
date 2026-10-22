@@ -87,6 +87,17 @@ fn codec() -> Codec {
     Codec::encrypted(LABEL, Limits::default(), vec![cluster_key()]).unwrap()
 }
 
+/// The nonce numbered `n`: its big-endian bytes at offset 8, zeros elsewhere.
+fn nonce(n: u64) -> [u8; 24] {
+    let count = n.to_be_bytes();
+    std::array::from_fn(|i| {
+        i.checked_sub(8)
+            .and_then(|j| count.get(j))
+            .copied()
+            .unwrap_or(0)
+    })
+}
+
 /// Seals packets for node "a" with fresh nonces at cluster time 0.
 struct Peer {
     codec: Codec,
@@ -102,10 +113,8 @@ impl Peer {
     }
 
     fn nonce(&mut self) -> [u8; 24] {
-        let mut nonce = [0; 24];
-        nonce[8..16].copy_from_slice(&self.next.to_be_bytes());
         self.next += 1;
-        nonce
+        nonce(self.next - 1)
     }
 
     fn v2(&mut self, n: &mut Node, msgs: &[v2::Message<'_>]) {
@@ -213,28 +222,25 @@ fn events(n: &mut Node) -> Vec<Event> {
     std::iter::from_fn(|| n.poll_event()).collect()
 }
 
+/// Why each of [`bad_certs`] is refused, in order.
+const REFUSALS: [&str; 4] = [
+    "expired",
+    "not yet valid",
+    "another cluster",
+    "unknown anchor",
+];
+
 /// The certificates that must be refused: expired, not yet valid, another cluster's, and one
-/// from a CA no node trusts. Each is for `name`'s own key.
-fn bad_certs(name: &str) -> [(&'static str, Vec<u8>); 4] {
+/// from a CA no node trusts. Each is for `name`'s own key, paired with its [`REFUSALS`] label.
+fn bad_certs(name: &str) -> impl Iterator<Item = (&'static str, Vec<u8>)> {
     let other_ca = SigningKey::from_bytes([2; 32]);
-    [
-        (
-            "expired",
-            issue_with(&ca(), LABEL, name, NOW - 3 * DAY, NOW - DAY),
-        ),
-        (
-            "not yet valid",
-            issue_with(&ca(), LABEL, name, NOW + DAY, NOW + 3 * DAY),
-        ),
-        (
-            "another cluster",
-            issue_with(&ca(), b"other", name, NOW - DAY, NOW + DAY),
-        ),
-        (
-            "unknown anchor",
-            issue_with(&other_ca, LABEL, name, NOW - DAY, NOW + DAY),
-        ),
-    ]
+    let certs = [
+        issue_with(&ca(), LABEL, name, NOW - 3 * DAY, NOW - DAY),
+        issue_with(&ca(), LABEL, name, NOW + DAY, NOW + 3 * DAY),
+        issue_with(&ca(), b"other", name, NOW - DAY, NOW + DAY),
+        issue_with(&other_ca, LABEL, name, NOW - DAY, NOW + DAY),
+    ];
+    REFUSALS.into_iter().zip(certs)
 }
 
 /// A node that holds `name` at `port` from its signed Alive, its certificate with it.
@@ -507,7 +513,7 @@ fn push_pull_frame(records: &[Record<'_>], certs: &[Vec<u8>], join: bool) -> Vec
             WireVersion::V2,
             PacketKind::Stream,
             &msgs,
-            &[0; 24],
+            &nonce(0),
             &mut frame,
         )
         .unwrap();
@@ -775,7 +781,7 @@ fn off_takes_no_version_2_packet() {
             WireVersion::V2,
             PacketKind::Stream,
             &[certificate(&b)],
-            &[0; 24],
+            &nonce(0),
             &mut head,
         )
         .unwrap();
