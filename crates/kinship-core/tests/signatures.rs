@@ -76,7 +76,7 @@ fn node() -> Node {
 
 fn node_with(cfg: Config) -> Node {
     let me = Identity::new("a", addr(1)).unwrap().with_epoch(EPOCH);
-    let mut n = Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap();
+    let mut n = Node::new(cfg, me, Instant::ZERO, 1, &nonce_key()).unwrap();
     while n.poll_event().is_some() {}
     while n.poll_transmit().is_some() {}
     n
@@ -231,16 +231,20 @@ const REFUSALS: [&str; 4] = [
 ];
 
 /// The certificates that must be refused: expired, not yet valid, another cluster's, and one
-/// from a CA no node trusts. Each is for `name`'s own key, paired with its [`REFUSALS`] label.
-fn bad_certs(name: &str) -> impl Iterator<Item = (&'static str, Vec<u8>)> {
+/// from a CA no node trusts. Each is for `name`'s own key, in the order of [`REFUSALS`].
+fn bad_certs(name: &str) -> [Vec<u8>; 4] {
     let other_ca = SigningKey::from_bytes([2; 32]);
-    let certs = [
+    [
         issue_with(&ca(), LABEL, name, NOW - 3 * DAY, NOW - DAY),
         issue_with(&ca(), LABEL, name, NOW + DAY, NOW + 3 * DAY),
         issue_with(&ca(), b"other", name, NOW - DAY, NOW + DAY),
         issue_with(&other_ca, LABEL, name, NOW - DAY, NOW + DAY),
-    ];
-    REFUSALS.into_iter().zip(certs)
+    ]
+}
+
+/// The key a node draws its packet nonces from, built without an array literal.
+fn nonce_key() -> [u8; 32] {
+    std::array::from_fn(|i| i as u8 + 1)
 }
 
 /// A node that holds `name` at `port` from its signed Alive, its certificate with it.
@@ -308,7 +312,9 @@ fn signed_alive_statements() {
     assert_eq!(state(&n, "b"), None);
 
     // Certificates that must be refused.
-    for (what, bad) in bad_certs("b") {
+    let certs = bad_certs("b");
+    for (i, what) in REFUSALS.into_iter().enumerate() {
+        let bad = certs[i].clone();
         let mut n = node();
         peer.v2(
             &mut n,
@@ -361,7 +367,9 @@ fn signed_left() {
     );
 
     // A member held unsigned, whose Left brings a certificate that must be refused.
-    for (what, bad) in bad_certs("b") {
+    let certs = bad_certs("b");
+    for (i, what) in REFUSALS.into_iter().enumerate() {
+        let bad = certs[i].clone();
         let mut n = node();
         knows_unsigned(&mut n, &mut peer, "b", 2);
         peer.v2(
@@ -402,7 +410,9 @@ fn signed_suspect_statements() {
     peer.v1(&mut n, &[Message::Suspect(suspect(0))]);
     assert_eq!(state(&n, "b"), Some(State::Suspect), "missing: unsigned");
 
-    for (what, bad) in bad_certs("c") {
+    let certs = bad_certs("c");
+    for (i, what) in REFUSALS.into_iter().enumerate() {
+        let bad = certs[i].clone();
         let mut n = node();
         knows(&mut n, &mut peer, "b", 2);
         knows_unsigned(&mut n, &mut peer, "c", 3);
@@ -486,7 +496,9 @@ fn signed_dead_statements() {
     peer.v1(&mut n, &[Message::Dead(dead(0))]);
     assert_eq!(state(&n, "b"), Some(State::Dead), "missing: unsigned");
 
-    for (what, bad) in bad_certs("c") {
+    let certs = bad_certs("c");
+    for (i, what) in REFUSALS.into_iter().enumerate() {
+        let bad = certs[i].clone();
         let mut n = node();
         knows(&mut n, &mut peer, "b", 2);
         knows_unsigned(&mut n, &mut peer, "c", 3);
@@ -797,7 +809,7 @@ fn off_takes_no_version_2_packet() {
 #[test]
 fn the_config_is_checked() {
     let field = |cfg: Config, me: Identity| {
-        Node::new(cfg, me, Instant::ZERO, 1, &[1; 32])
+        Node::new(cfg, me, Instant::ZERO, 1, &nonce_key())
             .map(|_| ())
             .unwrap_err()
             .field
@@ -828,7 +840,9 @@ fn the_config_is_checked() {
         "certificate",
         "the certificate is for another key"
     );
-    for (what, bad) in bad_certs("a") {
+    let certs = bad_certs("a");
+    for (i, what) in REFUSALS.into_iter().enumerate() {
+        let bad = certs[i].clone();
         assert_eq!(
             field(with(&|c| c.certificate = bad.clone()), me()),
             "certificate",
@@ -843,6 +857,6 @@ fn the_config_is_checked() {
     let mut small = signing_config("a");
     small.limits.udp_max_payload = 900;
     assert_eq!(field(small, me()), "udp_max_payload");
-    let ok = Node::new(signing_config("a"), me(), Instant::ZERO, 1, &[1; 32]).unwrap();
+    let ok = Node::new(signing_config("a"), me(), Instant::ZERO, 1, &nonce_key()).unwrap();
     assert_eq!(ok.local().epoch, EPOCH);
 }
