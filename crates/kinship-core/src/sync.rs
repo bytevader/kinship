@@ -221,7 +221,9 @@ impl Node {
                             self.on_frame_v1(now, conn, &payload, reply_stamp)
                         }
                         VersionedPayload::V2(payload) => {
-                            self.on_frame_v2(now, conn, &payload, reply_stamp)
+                            // Direct messages are signed over the frame's nonce.
+                            let nonce = kinship_proto::sealed_nonce(frame);
+                            self.on_frame_v2(now, conn, &payload, reply_stamp, nonce.as_ref())
                         }
                     }
                 } else {
@@ -273,24 +275,71 @@ impl Node {
         answered
     }
 
-    /// Handles an authenticated version 2 frame: a push-pull of signed records and the
-    /// certificates beside it. True if it was answered, or was the reply.
+    /// Handles an authenticated version 2 frame sealed with `nonce`: a push-pull of signed
+    /// records and the certificates beside it, a TCP fallback Ping and its Ack, or a sender's
+    /// signed Alive and its direct messages. True if it was answered, or was the reply.
     fn on_frame_v2(
         &mut self,
         now: Instant,
         conn: StreamId,
         payload: &v2::Payload<'_>,
         reply_stamp: Option<u64>,
+        nonce: Option<&[u8; 24]>,
     ) -> bool {
         let certs = packet_certs(payload.iter().filter_map(|m| match m {
             v2::Message::Certificate(c) => Some(c),
             _ => None,
         }));
         let mut budget = self.admission();
+        if let Some(ping) = payload
+            .iter()
+            .find(|m| matches!(m, v2::Message::Ping { .. }))
+        {
+            if conn.is_inbound() {
+                let me = self.local.member.name.clone();
+                if let Some(ack) = self.signed_ack(&ping, &me) {
+                    self.out.frame_v2(conn, &[ack]);
+                }
+                return true;
+            }
+            return false;
+        }
+        if let Some(ack) = payload
+            .iter()
+            .find(|m| matches!(m, v2::Message::Ack { .. }))
+        {
+            let v2::Message::Ack { seq: acked, .. } = ack else {
+                return false;
+            };
+            let purpose = self.sync.streams.get(&conn).map(|o| o.purpose);
+            if purpose != Some(Purpose::Ping { seq: acked }) {
+                return false;
+            }
+            if self.on_signed_ack(&ack, &certs) {
+                self.metrics.tcp_ping_acks += 1;
+            }
+            return true;
+        }
         let Some(p) = payload.iter().find_map(|m| match m {
             v2::Message::PushPull(p) => Some(p),
             _ => None,
         }) else {
+            if conn.is_inbound() {
+                // A sender's signed Alive ahead of its direct messages, which ask for no answer.
+                let mut user = Vec::new();
+                for msg in payload.iter() {
+                    match msg {
+                        v2::Message::Alive(sa) => {
+                            self.on_signed_alive(now, &sa, &certs, &mut budget, false);
+                        }
+                        v2::Message::UserMessage { .. } | v2::Message::UserBroadcast { .. } => {
+                            user.push(msg);
+                        }
+                        _ => {}
+                    }
+                }
+                self.on_signed_users(&user, &certs, nonce);
+            }
             return false;
         };
         if conn.is_inbound() {
@@ -368,7 +417,10 @@ impl Node {
                 self.pulled(&out, stamp)
             }
             (Purpose::Ping { seq }, Message::Ack { seq: acked }) if seq == *acked => {
-                if let Some(p) = self.probe.as_mut().filter(|p| p.seq == seq && !p.acked) {
+                // A version 1 Ack answers no version 2 round.
+                let v1 =
+                    |p: &&mut crate::probe::Probe| p.seq == seq && !p.acked && p.signed.is_none();
+                if let Some(p) = self.probe.as_mut().filter(v1) {
                     p.acked = true;
                     self.metrics.tcp_ping_acks += 1;
                 }
@@ -619,16 +671,41 @@ impl Node {
     }
 
     /// Sends the probe of round `seq` to `to` over TCP as well; the stream is closed with the
-    /// round.
-    pub(crate) fn tcp_ping(&mut self, to: SocketAddr, target: &str, seq: u32) -> StreamId {
-        let conn = self.connect(to, Purpose::Ping { seq }, false, WireVersion::V1);
-        let ping = Message::Ping(Ping {
+    /// round. A version 2 round, with its `signed` challenge and this node's epoch, sends its
+    /// own version 2 Ping in a version 2 frame.
+    pub(crate) fn tcp_ping(
+        &mut self,
+        to: SocketAddr,
+        target: &str,
+        seq: u32,
+        signed: Option<(v2::ProbeChallenge, u64)>,
+    ) -> StreamId {
+        let version = match signed {
+            Some(_) => WireVersion::V2,
+            None => WireVersion::V1,
+        };
+        let conn = self.connect(to, Purpose::Ping { seq }, false, version);
+        let me = self.local.member.name.clone();
+        let ping = Ping {
             seq,
             target: id(target),
-            source: id(&self.local.member.name),
+            source: id(&me),
             source_addr: self.local.member.addr,
-        });
-        self.out.frame(conn, &[ping]);
+        };
+        match signed {
+            None => {
+                self.out.frame(conn, &[Message::Ping(ping)]);
+            }
+            Some((challenge, source_epoch)) => {
+                let ping = v2::Message::Ping {
+                    ping,
+                    source_epoch,
+                    challenge,
+                    requester: None,
+                };
+                self.out.frame_v2(conn, &[ping]);
+            }
+        }
         self.metrics.tcp_pings += 1;
         conn
     }

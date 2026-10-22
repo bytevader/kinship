@@ -121,9 +121,19 @@ impl core::fmt::Debug for Rng {
 /// 64-bit block counter never runs out.
 pub(crate) struct Nonces(ChaCha20Legacy);
 
+/// The stream IV of probe challenges, beside nonces' zero one (`docs/ki01-stage2.md`, The
+/// challenge source).
+const CHALLENGE_IV: [u8; 8] = *b"kchallng";
+
 impl Nonces {
     pub fn new(key: &[u8; 32]) -> Self {
         Self(ChaCha20Legacy::new(key.into(), &[0; 8].into()))
+    }
+
+    /// The probe challenges of mode `sign`: the keystream of the same key under a stream IV of
+    /// their own, independent of the nonces' and of every other output.
+    pub fn challenges(key: &[u8; 32]) -> Self {
+        Self(ChaCha20Legacy::new(key.into(), &CHALLENGE_IV.into()))
     }
 
     /// Fills `out` with the next bytes of the keystream.
@@ -197,6 +207,25 @@ mod tests {
         let mut other = [0; 8];
         Nonces::new(&[1; 32]).fill(&mut other);
         assert_ne!(other, a);
+    }
+
+    #[test]
+    fn challenges_are_a_stream_of_their_own() {
+        // The same key, another stream IV: neither stream's bytes are the other's, and drawing
+        // challenges moves no nonce.
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let (mut nonces, mut challenges) = (Nonces::new(&key), Nonces::challenges(&key));
+        let mut c = [0; 16];
+        challenges.fill(&mut c);
+        let mut n = [0; 16];
+        nonces.fill(&mut n);
+        assert_ne!(c, n);
+        let mut again = [0; 16];
+        Nonces::new(&key).fill(&mut again);
+        assert_eq!(n, again, "the nonces do not depend on the challenges drawn");
+        let mut next = [0; 16];
+        challenges.fill(&mut next);
+        assert_ne!(next, c, "each round its own");
     }
 
     #[test]

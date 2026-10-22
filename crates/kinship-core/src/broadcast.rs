@@ -345,6 +345,11 @@ impl Broadcasts {
         self.queue[&rank].len
     }
 
+    /// Bytes the version 2 form of the rumour queued at `rank` takes, its certificate included.
+    fn signed_len_of(&self, rank: Rank) -> usize {
+        self.queue[&rank].signed_len.unwrap_or(0)
+    }
+
     /// Entries that fit in `budget` bytes, best first: in queue order, skipping any that do
     /// not fit what is left so that smaller ones behind it still can. Stops once what is left
     /// is too small for any rumour, so a long queue costs only what a packet takes from it.
@@ -472,7 +477,7 @@ impl Outbox {
 
     /// A fresh nonce: the cluster time, then random bytes. All zero in plaintext mode, which
     /// sends no nonce.
-    fn nonce(&mut self) -> [u8; kinship_proto::NONCE_LEN] {
+    pub fn nonce(&mut self) -> [u8; kinship_proto::NONCE_LEN] {
         let mut nonce = [0; kinship_proto::NONCE_LEN];
         if self.codec.is_encrypted() {
             nonce[..STAMP_LEN].copy_from_slice(&self.stamp.to_be_bytes());
@@ -498,7 +503,7 @@ impl Outbox {
         limit: Option<u32>,
     ) -> bool {
         if version == WireVersion::V2 {
-            return self.send_split(to, live, head, limit);
+            return self.send_split(to, live, head, &[], limit);
         }
         let max = datagram_room(&self.codec);
         let used: usize = head.iter().map(Message::encoded_len).sum();
@@ -550,42 +555,68 @@ impl Outbox {
         true
     }
 
-    /// What [`send`](Self::send) sends to a member that speaks version 2: `head`, the unsigned
-    /// rumours and user broadcasts in a version 1 datagram, as `off` would, and the signed
-    /// rumours, each new Alive behind its certificate, in a version 2 datagram. Each fills the
-    /// room of its own datagram, in queue order, and a rumour counts one send.
+    /// Sends the version 2 `head` to `to`, a member that speaks version 2, filling the room left
+    /// with queued gossip as [`send_split`](Self::send_split) does. Returns whether a datagram
+    /// was queued.
+    pub fn send_v2(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[v2::Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        self.send_split(to, live, &[], head, limit)
+    }
+
+    /// What [`send`](Self::send) sends to a member that speaks version 2, in up to two
+    /// datagrams (`docs/ki01-stage2.md`, Packets once probes are version 2): a version 2 one
+    /// with `head_v2`, the signed rumours, each new Alive behind its certificate, and the signed
+    /// user broadcasts; and a version 1 one, as `off` would send it, with `head_v1`, the
+    /// unsigned rumours and the unsigned user broadcasts, sent only when it holds any of them.
+    /// Each fills the room of its own datagram, in queue order, membership first, and a rumour
+    /// or broadcast counts one send.
     fn send_split(
         &mut self,
         to: SocketAddr,
         live: bool,
-        head: &[Message<'_>],
+        head_v1: &[Message<'_>],
+        head_v2: &[v2::Message<'_>],
         limit: Option<u32>,
     ) -> bool {
         let max = datagram_room(&self.codec);
-        let used: usize = head.iter().map(Message::encoded_len).sum();
+        let used_v1: usize = head_v1.iter().map(Message::encoded_len).sum();
+        let used_v2: usize = head_v2.iter().map(v2::Message::encoded_len).sum();
+        let (room_v1, room_v2) = (max.saturating_sub(used_v1), max.saturating_sub(used_v2));
         let (unsigned, signed) = match limit {
-            Some(_) => self.broadcasts.select_split(max.saturating_sub(used), max),
+            Some(_) => self.broadcasts.select_split(room_v1, room_v2),
             None => (Vec::new(), Vec::new()),
         };
-        let users = match limit {
+        let (users_v1, users_v2) = match limit {
             Some(_) if live && !self.user.is_empty() => {
-                let rumours: usize = unsigned.iter().map(|&r| self.broadcasts.len_of(r)).sum();
-                self.user.select(max.saturating_sub(used + rumours))
+                let rumours_v1: usize = unsigned.iter().map(|&r| self.broadcasts.len_of(r)).sum();
+                let rumours_v2: usize = signed
+                    .iter()
+                    .map(|&r| self.broadcasts.signed_len_of(r))
+                    .sum();
+                self.user.select_split(
+                    room_v1.saturating_sub(rumours_v1),
+                    room_v2.saturating_sub(rumours_v2),
+                )
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         };
         let mut queued = false;
-        if !head.is_empty() || !unsigned.is_empty() || !users.is_empty() {
+        if !head_v1.is_empty() || !unsigned.is_empty() || !users_v1.is_empty() {
             let nonce = self.nonce();
-            let mut msgs = Vec::with_capacity(head.len() + unsigned.len() + users.len());
-            msgs.extend_from_slice(head);
+            let mut msgs = Vec::with_capacity(head_v1.len() + unsigned.len() + users_v1.len());
+            msgs.extend_from_slice(head_v1);
             msgs.extend(
                 unsigned
                     .iter()
                     .map(|&rank| self.broadcasts.gossip(rank).message()),
             );
             msgs.extend(
-                users
+                users_v1
                     .iter()
                     .map(|&rank| self.user.broadcast(rank).message()),
             );
@@ -600,11 +631,18 @@ impl Outbox {
                 queued = true;
             }
         }
-        if !signed.is_empty() {
+        if !head_v2.is_empty() || !signed.is_empty() || !users_v2.is_empty() {
             let nonce = self.nonce();
-            let mut msgs = Vec::with_capacity(signed.len() * 2);
+            let mut msgs = Vec::with_capacity(head_v2.len() + signed.len() * 2 + users_v2.len());
+            msgs.extend_from_slice(head_v2);
             for &rank in &signed {
                 if let Some((cert, msg)) = self.broadcasts.gossip(rank).signed() {
+                    msgs.extend(cert.map(v2::Message::Certificate));
+                    msgs.push(msg);
+                }
+            }
+            for &rank in &users_v2 {
+                if let Some((cert, msg)) = self.user.broadcast(rank).signed() {
                     msgs.extend(cert.map(v2::Message::Certificate));
                     msgs.push(msg);
                 }
@@ -630,6 +668,8 @@ impl Outbox {
             let mut sent = unsigned;
             sent.extend(signed);
             self.broadcasts.sent(&sent, limit, live);
+            let mut users = users_v1;
+            users.extend(users_v2);
             if !users.is_empty() {
                 self.user.sent(&users, limit);
             }
@@ -656,27 +696,51 @@ impl Outbox {
     /// Sends version 2 `msgs` to `to` alone in one version 2 datagram.
     pub fn send_signed(&mut self, to: SocketAddr, msgs: &[v2::Message<'_>]) {
         let nonce = self.nonce();
+        self.send_signed_at(to, msgs, &nonce);
+    }
+
+    /// Sends version 2 `msgs` to `to` alone in one version 2 datagram sealed with `nonce`, which
+    /// the caller drew from [`nonce`](Self::nonce) to sign a direct message over it. Returns
+    /// whether it was queued.
+    pub fn send_signed_at(
+        &mut self,
+        to: SocketAddr,
+        msgs: &[v2::Message<'_>],
+        nonce: &[u8; kinship_proto::NONCE_LEN],
+    ) -> bool {
         let mut payload = Vec::new();
         let sealed = self.codec.seal_v2(
             WireVersion::V2,
             PacketKind::Datagram,
             msgs,
-            &nonce,
+            nonce,
             &mut payload,
         );
         if sealed.is_ok() {
             self.transmits.push_back(Transmit::Datagram { to, payload });
         }
+        sealed.is_ok()
     }
 
     /// Writes version 2 `msgs` to `conn` as one stream frame at version 2. Returns false,
     /// sending nothing, if they do not fit in `max_stream_frame`.
     pub fn frame_v2(&mut self, conn: StreamId, msgs: &[v2::Message<'_>]) -> bool {
         let nonce = self.nonce();
+        self.frame_v2_at(conn, msgs, &nonce)
+    }
+
+    /// [`frame_v2`](Self::frame_v2) sealed with `nonce`, which the caller drew to sign the direct
+    /// messages in it over.
+    pub fn frame_v2_at(
+        &mut self,
+        conn: StreamId,
+        msgs: &[v2::Message<'_>],
+        nonce: &[u8; kinship_proto::NONCE_LEN],
+    ) -> bool {
         let mut frame = Vec::new();
         if self
             .codec
-            .seal_v2_stream_frame(WireVersion::V2, msgs, &nonce, &mut frame)
+            .seal_v2_stream_frame(WireVersion::V2, msgs, nonce, &mut frame)
             .is_err()
         {
             return false;
@@ -816,6 +880,19 @@ impl Node {
     ) -> bool {
         let version = self.version_for(peer, to);
         self.may_send(to) && self.out.send(to, live, version, head, limit)
+    }
+
+    /// Sends the version 2 `head` to `to`, a member that speaks version 2: the sender of a
+    /// version 2 probe message, or a target or relay of a version 2 round. Queued gossip fills
+    /// the room as [`Outbox::send_v2`] does. Returns whether a datagram was queued.
+    pub(crate) fn send_to_v2(
+        &mut self,
+        to: SocketAddr,
+        live: bool,
+        head: &[v2::Message<'_>],
+        limit: Option<u32>,
+    ) -> bool {
+        self.may_send(to) && self.out.send_v2(to, live, head, limit)
     }
 
     /// The highest wire version this node and the member `peer` at `to` both speak: version 2
