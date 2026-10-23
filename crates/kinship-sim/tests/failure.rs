@@ -15,8 +15,11 @@
 //!    them again.
 //!
 //! Each property has a quick test over a few seeds and an ignored sweep over 1,000 that CI runs
-//! with `cargo test --release -p kinship-sim --test failure -- --ignored --nocapture`.
-//! `KINSHIP_SEED=<seed>` replays one seed and `KINSHIP_SEEDS` changes the count.
+//! with `cargo test --release -p kinship-sim --test failure -- --ignored --nocapture`, once in
+//! mode `off` and once with every node in mode `sign`, where every node also ends with no
+//! signature or certificate refused; a node without an epoch cannot sign, so the restart
+//! without epochs runs in `off` only. `KINSHIP_SEED=<seed>` replays one seed and
+//! `KINSHIP_SEEDS` changes the count.
 
 mod common;
 
@@ -24,7 +27,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Log, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
+use common::{Log, Mode, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
 use kinship_core::{Command, CommandOutput, Config, Event, Instant, Rng, State};
 use kinship_sim::{
     Action, Delay, LinkConfig, NodeSpec, Scenario, Sim, TraceConfig, addr_of, name_of,
@@ -168,6 +171,23 @@ struct Measured {
     conflicts: usize,
     /// The jump ended a probe round before its Ack arrived.
     cut_short: bool,
+    /// Live members the running nodes held unsigned at the end, in mode `sign`.
+    unsigned: u64,
+}
+
+/// [`Mode::check`] for every running node; returns the members they hold unsigned.
+fn signing(sim: &Sim<Observed>, mode: Mode, nodes: usize) -> Result<u64, String> {
+    mode.check_all((0..nodes).filter_map(|o| sim.node(o)).map(|n| &n.node))
+}
+
+/// What the sweeps in mode `sign` add to their summaries: the members held unsigned at the end.
+fn unsigned(runs: &[Measured], mode: Mode) -> String {
+    if mode == Mode::Off {
+        return String::new();
+    }
+    let total: u64 = runs.iter().map(|r| r.unsigned).sum();
+    let with = runs.iter().filter(|r| r.unsigned > 0).count();
+    format!("; {total} members held unsigned at the end, in {with} runs")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -179,7 +199,7 @@ struct Measured {
 // nodes that do not send epochs, the restarted node learns its old incarnation from its join
 // and refutes above it.
 
-fn restart(seed: u64, nodes: usize, epochs: bool) -> Result<Measured, String> {
+fn restart(seed: u64, nodes: usize, epochs: bool, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x5245_5354);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -214,7 +234,8 @@ fn restart(seed: u64, nodes: usize, epochs: bool) -> Result<Measured, String> {
     let (mut sim, log) = sim(seed, scenario, move |spec, log| {
         let fresh = spec.now == Instant::ZERO;
         let epoch = if epochs { spec.epoch() } else { 0 };
-        Observed::with_epoch(spec, &spec.name, epoch, config(), log, move |_| fresh)
+        let cfg = mode.config(spec, &spec.name);
+        Observed::with_epoch(spec, &spec.name, epoch, cfg, log, move |_| fresh)
     });
     let fail = |msg: String| {
         Err(format!(
@@ -382,37 +403,56 @@ fn restart(seed: u64, nodes: usize, epochs: bool) -> Result<Measured, String> {
             }
         }
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![at - restarted],
         tombstone,
+        unsigned,
         ..Measured::default()
     })
 }
 
 #[test]
 fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation() {
-    let runs = check_all(0..8, |seed| restart(seed, 20, true));
+    let runs = check_all(0..8, |seed| restart(seed, 20, true, Mode::Off));
     assert!(runs.iter().any(|r| r.tombstone) && runs.iter().any(|r| !r.tombstone));
+}
+
+fn restart_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, true, mode));
+    let tombstones = runs.iter().filter(|r| r.tombstone).count();
+    println!(
+        "restart with epochs: {} seeds x 50 nodes{} ({tombstones} after the tombstone spread), \
+         a later life at incarnation 0, never reported dead after the restart, reported as \
+         left and joined, Alive everywhere: {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, true));
-    let tombstones = runs.iter().filter(|r| r.tombstone).count();
-    println!(
-        "restart with epochs: {} seeds x 50 nodes ({tombstones} after the tombstone spread), \
-         a later life at incarnation 0, never reported dead after the restart, reported as \
-         left and joined, Alive everywhere: {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    restart_sweep(Mode::Off);
+}
+
+/// The restart in mode `sign`, with a new key in the new life. A node without an epoch cannot
+/// sign, so the restart without epochs has no signed sweep.
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_restarted_node_replaces_its_old_life_at_a_lower_incarnation_thousand_seeds_signed() {
+    restart_sweep(Mode::Sign);
 }
 
 #[test]
 fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins() {
-    let runs = check_all(0..8, |seed| restart(seed, 20, false));
+    let runs = check_all(0..8, |seed| restart(seed, 20, false, Mode::Off));
     assert!(runs.iter().any(|r| r.tombstone) && runs.iter().any(|r| !r.tombstone));
 }
 
@@ -420,7 +460,7 @@ fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins() {
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins_thousand_seeds() {
     let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, false));
+    let runs = check_all(seeds.clone(), |seed| restart(seed, 50, false, Mode::Off));
     let tombstones = runs.iter().filter(|r| r.tombstone).count();
     println!(
         "restart without epochs: {} seeds x 50 nodes ({tombstones} after the tombstone \
@@ -433,7 +473,7 @@ fn a_restarted_node_without_an_epoch_learns_its_incarnation_and_rejoins_thousand
 // ---------------------------------------------------------------------------------------------
 // 2. A second live node takes a member's name.
 
-fn conflict(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn conflict(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4e41_4d45);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -477,9 +517,12 @@ fn conflict(seed: u64, nodes: usize) -> Result<Measured, String> {
     );
     let (mut sim, log) = sim(seed, scenario, move |spec, log| {
         if spec.index == impostor {
-            Observed::with_name(spec, &name_of(victim), config(), log, |_| false)
+            // In `sign` the impostor holds a certificate for the name too, under its own key:
+            // the CA is not what keeps the name, the rule that the first claimant keeps it is.
+            let name = name_of(victim);
+            Observed::with_name(spec, &name, mode.config(spec, &name), log, |_| false)
         } else {
-            Observed::new(spec, log, |j| j != impostor)
+            Observed::in_mode(mode, spec, log, |j| j != impostor)
         }
     });
     let fail = |msg: String| {
@@ -548,38 +591,55 @@ fn conflict(seed: u64, nodes: usize) -> Result<Measured, String> {
             return fail(format!("{} ends with {name} as {v:?}", name_of(o)));
         }
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![both.unwrap_or(joined) - joined],
         conflicts: conflicts.len(),
+        unsigned,
         ..Measured::default()
     })
 }
 
 #[test]
 fn a_second_node_with_a_live_name_never_takes_it() {
-    check_all(0..8, |seed| conflict(seed, 20));
+    check_all(0..8, |seed| conflict(seed, 20, Mode::Off));
+}
+
+fn conflict_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| conflict(seed, 50, mode));
+    let reports: Vec<usize> = runs.iter().map(|r| r.conflicts).collect();
+    println!(
+        "name conflict: {} seeds x 50 nodes{}, the original kept its name everywhere; reported \
+         by {} to {} nodes, both claimants within {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        reports.iter().min().unwrap_or(&0),
+        reports.iter().max().unwrap_or(&0),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_second_node_with_a_live_name_never_takes_it_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| conflict(seed, 50));
-    let reports: Vec<usize> = runs.iter().map(|r| r.conflicts).collect();
-    println!(
-        "name conflict: {} seeds x 50 nodes, the original kept its name everywhere; reported by \
-         {} to {} nodes, both claimants within {}",
-        seeds.end - seeds.start,
-        reports.iter().min().unwrap_or(&0),
-        reports.iter().max().unwrap_or(&0),
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    conflict_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_second_node_with_a_live_name_never_takes_it_thousand_seeds_signed() {
+    conflict_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 3. A node's clock jumps forward.
 
-fn jump(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn jump(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4a55_4d50);
     // No loss, so any suspicion is the jump's doing.
@@ -595,8 +655,8 @@ fn jump(seed: u64, nodes: usize) -> Result<Measured, String> {
         .duration(start - Instant::ZERO + secs(5) + settle)
         .link(link)
         .trace(TraceConfig::OFF);
-    let (mut sim, log) = sim(seed, scenario, |spec, log| {
-        Observed::new(spec, log, |_| true)
+    let (mut sim, log) = sim(seed, scenario, move |spec, log| {
+        Observed::in_mode(mode, spec, log, |_| true)
     });
     let fail = |msg: String| {
         Err(format!(
@@ -702,31 +762,48 @@ fn jump(seed: u64, nodes: usize) -> Result<Measured, String> {
     if !all_alive(&sim) {
         return fail("not all Alive at the end".into());
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![at - jumped],
         cut_short,
+        unsigned,
         ..Measured::default()
     })
 }
 
 #[test]
 fn a_clock_jump_is_absorbed_without_a_false_death() {
-    let runs = check_all(0..8, |seed| jump(seed, 20));
+    let runs = check_all(0..8, |seed| jump(seed, 20, Mode::Off));
     assert!(runs.iter().any(|r| r.cut_short));
+}
+
+fn jump_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| jump(seed, 50, mode));
+    let cut = runs.iter().filter(|r| r.cut_short).count();
+    println!(
+        "clock jump: {} seeds x 50 nodes{}, no false deaths; {cut} jumps cut a probe round \
+         short and the target refuted; everyone Alive again within {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| jump(seed, 50));
-    let cut = runs.iter().filter(|r| r.cut_short).count();
-    println!(
-        "clock jump: {} seeds x 50 nodes, no false deaths; {cut} jumps cut a probe round short \
-         and the target refuted; everyone Alive again within {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    jump_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_clock_jump_is_absorbed_without_a_false_death_thousand_seeds_signed() {
+    jump_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -740,7 +817,7 @@ fn partition_bound(cfg: &Config, n: usize) -> Duration {
     cfg.probe_interval * rounds * (cfg.awareness_max + 1) + longest_suspicion(cfg, n) + secs(2)
 }
 
-fn long_partition(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn long_partition(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4c4f_4e47);
     // No loss, so nobody loses a member of its own side: the split is the partition's alone.
@@ -781,8 +858,8 @@ fn long_partition(seed: u64, nodes: usize) -> Result<Measured, String> {
                 b: other.clone().into(),
             },
         );
-    let (mut sim, log) = sim(seed, scenario, |spec, log| {
-        Observed::new(spec, log, |_| true)
+    let (mut sim, log) = sim(seed, scenario, move |spec, log| {
+        Observed::in_mode(mode, spec, log, |_| true)
     });
     let fail = |msg: String| {
         Err(format!(
@@ -853,26 +930,43 @@ fn long_partition(seed: u64, nodes: usize) -> Result<Measured, String> {
             }
         }
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![at - joined],
+        unsigned,
         ..Measured::default()
     })
 }
 
 #[test]
 fn a_partition_longer_than_dead_reclaim_needs_a_join() {
-    check_all(0..4, |seed| long_partition(seed, 20));
+    check_all(0..4, |seed| long_partition(seed, 20, Mode::Off));
+}
+
+fn long_partition_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| long_partition(seed, 50, mode));
+    println!(
+        "long partition: {} seeds x 50 nodes{}, the sides stayed apart after the heal until one \
+         join merged them: {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_partition_longer_than_dead_reclaim_needs_a_join_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| long_partition(seed, 50));
-    println!(
-        "long partition: {} seeds x 50 nodes, the sides stayed apart after the heal until one \
-         join merged them: {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    long_partition_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_partition_longer_than_dead_reclaim_needs_a_join_thousand_seeds_signed() {
+    long_partition_sweep(Mode::Sign);
 }

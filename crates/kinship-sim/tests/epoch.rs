@@ -15,7 +15,8 @@
 //!    them, and nobody declares it, or anyone, dead.
 //!
 //! Each test runs a few fixed seeds; `KINSHIP_SEED=<seed>` replays one, and the
-//! `_thousand_seeds` sweeps run 1,000 in release mode in CI.
+//! `_thousand_seeds` sweeps run 1,000 in release mode in CI, once in mode `off` and once with
+//! every node that has an epoch in mode `sign`.
 
 mod common;
 
@@ -24,7 +25,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Log, Observed, check_all, config, ms, percentiles, secs, seeds};
+use common::{Log, Mode, Observed, check_all, config, ms, percentiles, secs, seeds};
 use kinship_core::{
     Command, CommandId, Event, Instant, Key, Rng, State, StreamEvent, StreamId, Transmit,
 };
@@ -72,8 +73,17 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(spec: &NodeSpec, log: Log, old: bool, knows: impl Fn(usize) -> bool) -> Self {
-        let cfg = config();
+    /// Node `spec`, in `mode` unless it is `old`: a node older than 0.3 has no epoch, and so
+    /// cannot sign.
+    fn new(
+        spec: &NodeSpec,
+        log: Log,
+        old: bool,
+        mode: Mode,
+        knows: impl Fn(usize) -> bool,
+    ) -> Self {
+        let mode = if old { Mode::Off } else { mode };
+        let cfg = mode.config(spec, &spec.name);
         let codec = Codec::encrypted(
             cfg.cluster.as_bytes(),
             cfg.limits,
@@ -305,6 +315,25 @@ fn at(t: Duration) -> Instant {
     Instant::ZERO + t
 }
 
+/// [`Mode::check`] for every running node; returns the members they hold unsigned.
+fn signing(sim: &Sim<Peer>, mode: Mode, nodes: usize) -> Result<u64, String> {
+    mode.check_all(
+        (0..nodes)
+            .filter_map(|o| sim.node(o))
+            .map(|n| &n.inner.node),
+    )
+}
+
+/// A sweep's summary of what [`stale`] or [`mixed`] returned.
+fn summary(runs: Vec<(Duration, u64)>, mode: Mode) -> String {
+    let unsigned: u64 = runs.iter().map(|r| r.1).sum();
+    let took = percentiles(runs.into_iter().map(|r| r.0).collect());
+    match mode {
+        Mode::Off => took,
+        Mode::Sign => format!("{took}; {unsigned} members held unsigned at the end"),
+    }
+}
+
 /// A run of `nodes` nodes, those `old` picks running as before 0.3, in which `victim` changes
 /// its metadata a few times and so reaches incarnation `changes` or more. Every first
 /// instance knows every node, as a static member list would; a restarted one knows nobody
@@ -314,6 +343,7 @@ fn cluster(
     nodes: usize,
     victim: usize,
     old: fn(usize) -> bool,
+    mode: Mode,
     rng: &mut Rng,
 ) -> (Sim<Peer>, Log, u32) {
     let changes = 2 + rng.index(3) as u32;
@@ -335,7 +365,13 @@ fn cluster(
     let factory_log = log.clone();
     let sim = Sim::new(seed, scenario, move |spec: &NodeSpec| {
         let fresh = spec.now == Instant::ZERO;
-        Peer::new(spec, factory_log.clone(), old(spec.index), move |_| fresh)
+        Peer::new(
+            spec,
+            factory_log.clone(),
+            old(spec.index),
+            mode,
+            move |_| fresh,
+        )
     });
     (sim, log, changes)
 }
@@ -365,9 +401,9 @@ const VICTIM: usize = 0;
 const LIAR: usize = 1;
 const SEED_NODE: usize = 2;
 
-fn stale(seed: u64) -> Result<Duration, String> {
+fn stale(seed: u64, mode: Mode) -> Result<(Duration, u64), String> {
     let mut rng = Rng::new(seed ^ 0x4550_4f43);
-    let (mut sim, log, changes) = cluster(seed, NODES, VICTIM, |_| false, &mut rng);
+    let (mut sim, log, changes) = cluster(seed, NODES, VICTIM, |_| false, mode, &mut rng);
     let fail = |msg: String| Err(format!("seed {seed}: {msg}"));
     let others = || (0..NODES).filter(|&o| o != VICTIM);
 
@@ -495,25 +531,41 @@ fn stale(seed: u64) -> Result<Duration, String> {
     if !about(&log, VICTIM, control).iter().any(|e| e.1 == "joined") {
         return fail("an Alive for the dead life itself was not applied".into());
     }
-    Ok(took - restarted)
+    match signing(&sim, mode, NODES) {
+        Ok(unsigned) => Ok((took - restarted, unsigned)),
+        Err(e) => fail(e),
+    }
 }
 
 #[test]
 fn rumours_about_an_earlier_life_neither_kill_nor_revive_the_later_one() {
-    check_all(seeds(8), stale);
+    check_all(seeds(8), |seed| stale(seed, Mode::Off));
+}
+
+fn stale_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| stale(seed, mode));
+    println!(
+        "stale epochs: {} seeds x {NODES} nodes{}, the old life's Suspect, Dead and Alive \
+         applied nowhere, the new life everywhere after: {}",
+        seeds.end - seeds.start,
+        mode.label(),
+        summary(runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn rumours_about_an_earlier_life_neither_kill_nor_revive_the_later_one_thousand_seeds() {
-    let seeds = seeds(1000);
-    let took = check_all(seeds.clone(), stale);
-    println!(
-        "stale epochs: {} seeds x {NODES} nodes, the old life's Suspect, Dead and Alive \
-         applied nowhere, the new life everywhere after: {}",
-        seeds.end - seeds.start,
-        percentiles(took)
-    );
+    stale_sweep(Mode::Off);
+}
+
+/// In mode `sign` the liar's rumours are unsigned version 1 ones, which `sign` accepts as it
+/// accepts a 0.4 node's.
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn rumours_about_an_earlier_life_neither_kill_nor_revive_the_later_one_thousand_seeds_signed() {
+    stale_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -525,9 +577,9 @@ fn old(i: usize) -> bool {
     i % 2 == 1
 }
 
-fn mixed(seed: u64) -> Result<Duration, String> {
+fn mixed(seed: u64, mode: Mode) -> Result<(Duration, u64), String> {
     let mut rng = Rng::new(seed ^ 0x4d49_5845);
-    let (mut sim, log, changes) = cluster(seed, MIXED, VICTIM, old, &mut rng);
+    let (mut sim, log, changes) = cluster(seed, MIXED, VICTIM, old, mode, &mut rng);
     let fail = |msg: String| Err(format!("seed {seed}: {msg}"));
     // Through a node of either version.
     let seed_node = 1 + rng.index(MIXED - 1);
@@ -598,23 +650,42 @@ fn mixed(seed: u64) -> Result<Duration, String> {
             }
         }
     }
-    Ok(took - restarted)
+    match signing(&sim, mode, MIXED) {
+        Ok(unsigned) => Ok((took - restarted, unsigned)),
+        Err(e) => fail(e),
+    }
 }
 
 #[test]
 fn older_nodes_without_epochs_mix_with_newer_ones() {
-    check_all(seeds(8), mixed);
+    check_all(seeds(8), |seed| mixed(seed, Mode::Off));
+}
+
+fn mixed_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| mixed(seed, mode));
+    println!(
+        "mixed versions: {} seeds x {MIXED} nodes, half without epochs{}, a restart \
+         through either, no member declared dead, the new life everywhere after: {}",
+        seeds.end - seeds.start,
+        if mode == Mode::Sign {
+            ", the rest in mode sign"
+        } else {
+            ""
+        },
+        summary(runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn older_nodes_without_epochs_mix_with_newer_ones_thousand_seeds() {
-    let seeds = seeds(1000);
-    let took = check_all(seeds.clone(), mixed);
-    println!(
-        "mixed versions: {} seeds x {MIXED} nodes, half without epochs, a restart through \
-         either, no member declared dead, the new life everywhere after: {}",
-        seeds.end - seeds.start,
-        percentiles(took)
-    );
+    mixed_sweep(Mode::Off);
+}
+
+/// The newer nodes in mode `sign`; the older ones have no epoch, and so cannot sign.
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn older_nodes_without_epochs_mix_with_newer_ones_thousand_seeds_signed() {
+    mixed_sweep(Mode::Sign);
 }

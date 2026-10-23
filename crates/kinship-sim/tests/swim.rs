@@ -15,6 +15,8 @@
 //!    false deaths included: push-pull anti-entropy repairs them;
 //! 4. no node ever sees an incarnation go down, its own or anyone else's.
 //!
+//! In mode `sign` every node also ends with no signature or certificate refused.
+//!
 //! A failure prints its seed. Replay one with
 //! `KINSHIP_SEED=<seed> cargo test --release -p kinship-sim --test swim -- --ignored --nocapture`.
 
@@ -24,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Log, Observed, check_all, config, index_of, ms, secs, seeds};
+use common::{Log, Mode, Observed, check_all, config, index_of, ms, secs, seeds};
 use kinship_core::{Command, Config, Event, Instant, Rng};
 use kinship_sim::{Action, Delay, LinkConfig, Scenario, Sim, TraceConfig, name_of};
 
@@ -265,15 +267,17 @@ struct Outcome {
     lossy_deaths: u64,
     /// From the end of the scenario to every live view being right.
     settled: Option<Duration>,
+    /// Live members the live nodes held unsigned at the end, in mode `sign`.
+    unsigned: u64,
 }
 
-/// Runs one seed and checks every property, returning the first violation.
-fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
+/// Runs one seed in `mode` and checks every property, returning the first violation.
+fn check(seed: u64, nodes: usize, mode: Mode) -> Result<Outcome, String> {
     let plan = Plan::random(seed, nodes);
     let log: Log = Rc::default();
     let factory_log = log.clone();
     let mut sim = Sim::new(seed, plan.scenario(), move |spec| {
-        Observed::new(spec, factory_log.clone(), |_| true)
+        Observed::in_mode(mode, spec, factory_log.clone(), |_| true)
     });
     let fail = |msg: String| Err(format!("seed {seed}: {msg}\nplan: {plan:?}"));
 
@@ -429,6 +433,10 @@ fn check(seed: u64, nodes: usize) -> Result<Outcome, String> {
         let n = &sim.node(o).expect("alive").node;
         out.suspicions += n.metrics().suspicions;
         out.refutations += n.metrics().refutations;
+        out.unsigned += Mode::unsigned(n);
+        if let Err(e) = mode.check(n) {
+            return fail(e);
+        }
     }
     match settled {
         Some(d) => out.settled = Some(d),
@@ -457,7 +465,7 @@ fn summarize(outcomes: &[Outcome]) -> String {
     d.sort_unstable();
     let pct = |p: usize| d.get((d.len() * p / 100).min(d.len().saturating_sub(1)));
     format!(
-        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance; settled after the scenario in {}",
+        "{} detections: p50 {:?}, p99 {:?}, max {:?}; {} suspicions ({} of live nodes), {} refutations, {} deaths inside a minority partition, {} under loss above the tolerance; settled after the scenario in {}; {} members held unsigned at the end, in {} runs",
         d.len(),
         pct(50),
         pct(99),
@@ -468,13 +476,29 @@ fn summarize(outcomes: &[Outcome]) -> String {
         outcomes.iter().map(|o| o.partition_deaths).sum::<u64>(),
         outcomes.iter().map(|o| o.lossy_deaths).sum::<u64>(),
         common::percentiles(outcomes.iter().filter_map(|o| o.settled).collect()),
+        outcomes.iter().map(|o| o.unsigned).sum::<u64>(),
+        outcomes.iter().filter(|o| o.unsigned > 0).count(),
     )
 }
 
 #[test]
 fn swim_properties_hold_on_random_scenarios() {
-    let outcomes = check_all(0..32, |seed| check(seed, 20));
+    let outcomes = check_all(0..32, |seed| check(seed, 20, Mode::Off));
     assert!(outcomes.iter().any(|o| !o.detections.is_empty()));
+}
+
+fn sweep(mode: Mode) {
+    let nodes = common::env("KINSHIP_NODES").unwrap_or(50) as usize;
+    let seeds = seeds(1000);
+    let started = std::time::Instant::now();
+    let outcomes = check_all(seeds.clone(), |seed| check(seed, nodes, mode));
+    println!(
+        "{} seeds x {nodes} nodes{} passed in {:?}: {}",
+        seeds.end - seeds.start,
+        mode.label(),
+        started.elapsed(),
+        summarize(&outcomes)
+    );
 }
 
 /// The week-6 gate: 1,000 seeds at 50 nodes. CI runs it in release mode with
@@ -484,16 +508,14 @@ fn swim_properties_hold_on_random_scenarios() {
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn thousand_seeds_fifty_nodes() {
-    let nodes = common::env("KINSHIP_NODES").unwrap_or(50) as usize;
-    let seeds = seeds(1000);
-    let started = std::time::Instant::now();
-    let outcomes = check_all(seeds.clone(), |seed| check(seed, nodes));
-    println!(
-        "{} seeds x {nodes} nodes passed in {:?}: {}",
-        seeds.end - seeds.start,
-        started.elapsed(),
-        summarize(&outcomes)
-    );
+    sweep(Mode::Off);
+}
+
+/// The same sweep with every node in mode `sign` (KI-01 Stage 2c).
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn thousand_seeds_fifty_nodes_signed() {
+    sweep(Mode::Sign);
 }
 
 #[test]

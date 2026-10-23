@@ -14,7 +14,8 @@
 //!    membership goes on as before, and the newer nodes still hear every broadcast.
 //!
 //! Each test runs a few fixed seeds; `KINSHIP_SEED=<seed>` replays one, and
-//! `user_messages_thousand_seeds` runs 1,000 in release mode in CI.
+//! `user_messages_thousand_seeds` runs 1,000 in release mode in CI, as
+//! `user_messages_thousand_seeds_signed` does with every node of this version in mode `sign`.
 
 mod common;
 
@@ -23,13 +24,13 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use common::{check_all, ms, secs, seeds};
+use common::{Mode, check_all, ms, secs, seeds};
 use kinship_core::{
     Command, CommandError, CommandId, CommandOutput, Config, Event, Identity, Instant, Key, Limits,
     Node, Rng, Security, StreamEvent, StreamId, Transmit,
 };
 use kinship_core_0_3 as old;
-use kinship_proto::{Codec, Message, PacketKind};
+use kinship_proto::{Codec, Message, PacketKind, VersionedPayload, v2};
 use kinship_sim::{
     Action, LinkConfig, NodeSpec, Scenario, Sim, SimNode, TraceConfig, WALL_CLOCK_AT_ZERO_MS,
     addr_of, name_of,
@@ -98,13 +99,15 @@ fn stream_id(id: old::StreamId) -> StreamId {
 }
 
 impl Peer {
-    /// Node `spec`, on 0.3.0 if `on_0_3` and otherwise on this version with `tune` applied to
-    /// its config. It knows every other node from the start, as a static member list would.
+    /// Node `spec`, on 0.3.0 if `on_0_3` and otherwise on this version in `mode` with `tune`
+    /// applied to its config. It knows every other node from the start, as a static member list
+    /// would.
     fn new(
         spec: &NodeSpec,
         log: &Log,
         key: [u8; 32],
         on_0_3: bool,
+        mode: Mode,
         tune: &dyn Fn(usize, &mut Config),
     ) -> Self {
         let others: Vec<usize> = (0..spec.nodes).filter(|&j| j != spec.index).collect();
@@ -121,7 +124,8 @@ impl Peer {
             while n.poll_event().is_some() {}
             Inner::Old(Box::new(n))
         } else {
-            let mut cfg = Config::lan(Security::Keys(vec![Key::from_bytes(key)]));
+            let mut cfg = mode.config(spec, &spec.name);
+            cfg.security = Security::Keys(vec![Key::from_bytes(key)]);
             tune(spec.index, &mut cfg);
             let me = Identity::new(spec.name.clone(), spec.addr)
                 .unwrap()
@@ -157,18 +161,33 @@ impl Peer {
         }
     }
 
-    /// Counts the broadcasts in a datagram this node sends.
+    /// Counts the broadcasts in a datagram this node sends, in either version.
     fn count_copies(&self, payload: &[u8]) {
         let mut buf = payload.to_vec();
-        let Ok(p) = self.codec.open(PacketKind::Datagram, &mut buf) else {
+        let Ok(p) = self.codec.open_versioned(PacketKind::Datagram, &mut buf) else {
             return;
         };
+        let broadcasts: Vec<(String, u64)> = match p {
+            VersionedPayload::V1(p) => p
+                .iter()
+                .filter_map(|m| match m {
+                    Message::UserBroadcast(b) => Some((b.from.as_str().to_owned(), b.seq)),
+                    _ => None,
+                })
+                .collect(),
+            VersionedPayload::V2(p) => p
+                .iter()
+                .filter_map(|m| match m {
+                    v2::Message::UserBroadcast { broadcast: b, .. } => {
+                        Some((b.from.as_str().to_owned(), b.seq))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        };
         let mut log = self.log.borrow_mut();
-        for m in p.iter() {
-            if let Message::UserBroadcast(b) = m {
-                let key = (self.index, b.from.as_str().to_owned(), b.seq);
-                *log.copies.entry(key).or_default() += 1;
-            }
+        for (from, seq) in broadcasts {
+            *log.copies.entry((self.index, from, seq)).or_default() += 1;
         }
     }
 }
@@ -322,12 +341,13 @@ fn broadcast(node: usize, data: Vec<u8>) -> Action<Command> {
     Action::Command { node, cmd }
 }
 
-/// Runs `scenario` from `seed`: the last `on_0_3` nodes run 0.3.0, the others this version with
-/// `tune` applied to their config.
+/// Runs `scenario` from `seed`: the last `on_0_3` nodes run 0.3.0, the others this version in
+/// `mode` with `tune` applied to their config.
 fn run(
     seed: u64,
     scenario: Scenario<Command>,
     on_0_3: usize,
+    mode: Mode,
     tune: impl Fn(usize, &mut Config) + 'static,
 ) -> (Sim<Peer>, Log) {
     let key = cluster_key(seed);
@@ -335,7 +355,7 @@ fn run(
     let shared = log.clone();
     let mut sim = Sim::new(seed, scenario, move |spec| {
         let old = spec.index >= spec.nodes - on_0_3;
-        Peer::new(spec, &shared, key, old, &tune)
+        Peer::new(spec, &shared, key, old, mode, &tune)
     });
     sim.run();
     (sim, log)
@@ -377,7 +397,13 @@ impl std::ops::AddAssign for Outcome {
 /// make four broadcasts and send six direct messages, every other one too large for a datagram,
 /// at random times in the first ten seconds. Checks what must always hold, and returns how many
 /// of the messages arrived.
-fn traffic(seed: u64, nodes: usize, on_0_3: usize, link: LinkConfig) -> Result<Outcome, String> {
+fn traffic(
+    seed: u64,
+    nodes: usize,
+    on_0_3: usize,
+    link: LinkConfig,
+    mode: Mode,
+) -> Result<Outcome, String> {
     let mut rng = Rng::new(seed);
     let new: Vec<usize> = (0..nodes - on_0_3).collect();
     let mut scenario = Scenario::new(nodes)
@@ -405,7 +431,7 @@ fn traffic(seed: u64, nodes: usize, on_0_3: usize, link: LinkConfig) -> Result<O
         );
         direct.push((from, to, data));
     }
-    let (sim, log) = run(seed, scenario, on_0_3, |_, _| {});
+    let (sim, log) = run(seed, scenario, on_0_3, mode, |_, _| {});
     let rec = log.borrow();
     let fail = |what: String| {
         Err(format!(
@@ -471,6 +497,11 @@ fn traffic(seed: u64, nodes: usize, on_0_3: usize, link: LinkConfig) -> Result<O
         if errors > 0 {
             return fail(format!("n{i} counted {errors} decode errors"));
         }
+        if let Some(Inner::New(n)) = sim.node(i).map(|p| &p.inner) {
+            if let Err(e) = mode.check(n) {
+                return fail(e);
+            }
+        }
     }
     Ok(out)
 }
@@ -485,7 +516,9 @@ fn ratio((expected, got): (usize, usize)) -> f64 {
 
 #[test]
 fn messages_reach_their_members_once() {
-    let outcomes = check_all(seeds(8), |seed| traffic(seed, 8, 0, LinkConfig::lan()));
+    let outcomes = check_all(seeds(8), |seed| {
+        traffic(seed, 8, 0, LinkConfig::lan(), Mode::Off)
+    });
     let mut total = Outcome::default();
     for o in outcomes {
         total += o;
@@ -515,7 +548,7 @@ fn oversized_messages_are_refused_by_the_sender_and_dropped_by_a_stricter_receiv
                 cfg.max_user_broadcast = 512;
             }
         };
-        let (sim, log) = run(seed, scenario, 0, tune);
+        let (sim, log) = run(seed, scenario, 0, Mode::Off, tune);
         let rec = log.borrow();
         let n1: Vec<_> = rec.done.iter().filter(|d| d.0 == 1).map(|d| d.1).collect();
         let too_large = Err(CommandError::MessageTooLarge);
@@ -563,7 +596,7 @@ fn a_message_for_an_earlier_run_is_dropped_by_the_new_one() {
             // Once n0 knows: one for the old run is refused, one for any run arrives.
             .at(secs(15), send(0, 2, first_run, b"refused".to_vec()))
             .at(secs(15), send(0, 2, 0, b"for the new run".to_vec()));
-        let (sim, log) = run(seed, scenario, 0, |_, _| {});
+        let (sim, log) = run(seed, scenario, 0, Mode::Off, |_, _| {});
         let rec = log.borrow();
         let at_n2: Vec<&[u8]> = rec
             .delivered
@@ -588,7 +621,7 @@ fn a_message_for_an_earlier_run_is_dropped_by_the_new_one() {
 /// Five nodes, n4 on 0.3.0: two broadcasts, direct messages between newer nodes, and a small
 /// and a large one to n4. Returns how many of the newer nodes' deliveries of the broadcasts
 /// were expected and how many happened.
-fn mixed(seed: u64) -> Result<(usize, usize), String> {
+fn mixed(seed: u64, mode: Mode) -> Result<(usize, usize), String> {
     let scenario = Scenario::new(5)
         .link(LinkConfig::lan())
         .trace(TraceConfig::OFF)
@@ -599,7 +632,7 @@ fn mixed(seed: u64) -> Result<(usize, usize), String> {
         .at(secs(3), send(2, 4, 0, vec![7; 5_000]))
         .at(secs(3), send(3, 1, 0, b"small".to_vec()))
         .at(secs(3), send(1, 2, 0, vec![8; 5_000]));
-    let (sim, log) = run(seed, scenario, 1, |_, _| {});
+    let (sim, log) = run(seed, scenario, 1, mode, |_, _| {});
     let rec = log.borrow();
     let fail = |what: String| Err(format!("seed {seed}: {what}"));
     let count = |at: usize, data: &[u8]| {
@@ -646,12 +679,17 @@ fn mixed(seed: u64) -> Result<(usize, usize), String> {
     if n2.user_messages_dropped != 0 || n2.user_messages_sent != 1 {
         return fail(format!("n2 counted {n2:?}"));
     }
+    for i in 0..4 {
+        if let Err(e) = mode.check(sim.node(i).unwrap().node()) {
+            return fail(e);
+        }
+    }
     Ok(broadcasts)
 }
 
 #[test]
 fn a_0_3_node_in_the_cluster_skips_user_messages() {
-    let reached = check_all(seeds(8), mixed);
+    let reached = check_all(seeds(8), |seed| mixed(seed, Mode::Off));
     let total = reached.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     // Copies sent to the 0.3.0 node are lost, so the newer nodes hear a broadcast a little less
     // surely than in a cluster of newer nodes alone.
@@ -664,6 +702,18 @@ fn a_0_3_node_in_the_cluster_skips_user_messages() {
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn user_messages_thousand_seeds() {
+    sweep(Mode::Off);
+}
+
+/// The same sweep with every node of this version in mode `sign`: signed direct messages and
+/// broadcasts between them, unsigned ones to and from the 0.3.0 nodes.
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn user_messages_thousand_seeds_signed() {
+    sweep(Mode::Sign);
+}
+
+fn sweep(mode: Mode) {
     let seeds = seeds(1000);
     let started = std::time::Instant::now();
     let outcomes = check_all(seeds.clone(), |seed| {
@@ -679,8 +729,8 @@ fn user_messages_thousand_seeds() {
             .with_loss(loss)
             .with_duplicate(0.01)
             .with_reorder(0.01, kinship_sim::Delay::Fixed(ms(5)));
-        let out = traffic(seed, nodes, on_0_3, link)?;
-        let five = mixed(seed)?;
+        let out = traffic(seed, nodes, on_0_3, link, mode)?;
+        let five = mixed(seed, mode)?;
         Ok((out, on_0_3 > 0, five))
     });
     let (mut all, mut pure, mut five) = (Outcome::default(), Outcome::default(), (0, 0));
@@ -692,8 +742,9 @@ fn user_messages_thousand_seeds() {
         five = (five.0 + f.0, five.1 + f.1);
     }
     println!(
-        "{} seeds passed in {:?}: broadcasts reached {:.4} of their members, {:.4} in clusters without 0.3.0 nodes and {:.4} beside one in five; direct messages arrived {:.4} in a datagram and {:.4} over TCP",
+        "{} seeds{} passed in {:?}: broadcasts reached {:.4} of their members, {:.4} in clusters without 0.3.0 nodes and {:.4} beside one in five; direct messages arrived {:.4} in a datagram and {:.4} over TCP",
         seeds.end - seeds.start,
+        mode.label(),
         started.elapsed(),
         ratio(all.broadcasts),
         ratio(pure.broadcasts),

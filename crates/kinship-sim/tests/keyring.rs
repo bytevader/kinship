@@ -9,8 +9,10 @@
 //!    reconverge on the full live set.
 //!
 //! Each property has a quick test over a few seeds and an ignored sweep over 1,000 that CI runs
-//! with `cargo test --release -p kinship-sim --test keyring -- --ignored --nocapture`.
-//! `KINSHIP_SEED=<seed>` replays one seed and `KINSHIP_SEEDS` changes the count.
+//! with `cargo test --release -p kinship-sim --test keyring -- --ignored --nocapture`, once in
+//! mode `off` and once with every node in mode `sign`, where every node also ends with no
+//! signature or certificate refused. `KINSHIP_SEED=<seed>` replays one seed and
+//! `KINSHIP_SEEDS` changes the count.
 
 mod common;
 
@@ -18,7 +20,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Log, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
+use common::{Log, Mode, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
 use kinship_core::{Command, Config, Event, Instant, Key, KeyId, Rng};
 use kinship_sim::{Action, Delay, LinkConfig, Scenario, Sim, TraceConfig, name_of};
 
@@ -89,11 +91,11 @@ fn detection_bound(cfg: &Config, n: usize) -> Duration {
     cfg.probe_interval * rounds + Duration::from_secs_f64(suspicion) + secs(2)
 }
 
-fn sim(seed: u64, scenario: Scenario<Command>) -> (Sim<Observed>, Log) {
+fn sim(seed: u64, mode: Mode, scenario: Scenario<Command>) -> (Sim<Observed>, Log) {
     let log: Log = Rc::default();
     let factory_log = log.clone();
     let sim = Sim::new(seed, scenario, move |spec| {
-        Observed::new(spec, factory_log.clone(), |_| true)
+        Observed::in_mode(mode, spec, factory_log.clone(), |_| true)
     });
     (sim, log)
 }
@@ -156,7 +158,7 @@ fn command_results(log: &Log) -> Vec<(usize, bool)> {
 // ---------------------------------------------------------------------------------------------
 // 1. A cluster rotates through install, use and remove without a suspicion.
 
-fn rotate(seed: u64, nodes: usize) -> Result<(), String> {
+fn rotate(seed: u64, nodes: usize, mode: Mode) -> Result<u64, String> {
     let mut rng = Rng::new(seed ^ 0x4b45_5952);
     let link = random_link(&mut rng);
     let all = || 0..nodes;
@@ -178,7 +180,7 @@ fn rotate(seed: u64, nodes: usize) -> Result<(), String> {
     scenario = step(scenario, &mut rng, t_remove, all(), || {
         Command::RemoveKey(old_key())
     });
-    let (mut sim, log) = sim(seed, scenario);
+    let (mut sim, log) = sim(seed, mode, scenario);
     let fail = |msg: String| Err(format!("seed {seed}: {msg}"));
 
     // Each step is finished on every node before the next starts.
@@ -243,23 +245,36 @@ fn rotate(seed: u64, nodes: usize) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    mode.check_all(all().filter_map(|o| sim.node(o)).map(|n| &n.node))
+        .or_else(fail)
 }
 
 #[test]
 fn rotating_every_node_never_raises_a_suspicion() {
-    check_all(0..8, |seed| rotate(seed, 12));
+    check_all(0..8, |seed| rotate(seed, 12, Mode::Off));
+}
+
+fn rotate_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let unsigned = check_all(seeds.clone(), |seed| rotate(seed, 50, mode));
+    println!(
+        "rotate: {} seeds x 50 nodes{}, install, use, remove: no suspicions, no decrypt failures; {} members held unsigned at the end",
+        seeds.end - seeds.start,
+        mode.label(),
+        unsigned.iter().sum::<u64>()
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn rotating_every_node_never_raises_a_suspicion_thousand_seeds() {
-    let seeds = seeds(1000);
-    check_all(seeds.clone(), |seed| rotate(seed, 50));
-    println!(
-        "rotate: {} seeds x 50 nodes, install, use, remove: no suspicions, no decrypt failures",
-        seeds.end - seeds.start
-    );
+    rotate_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn rotating_every_node_never_raises_a_suspicion_thousand_seeds_signed() {
+    rotate_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -269,9 +284,11 @@ fn rotating_every_node_never_raises_a_suspicion_thousand_seeds() {
 struct Behind {
     /// From the laggard's catch-up to every node holding the full live set again.
     reconverged: Vec<Duration>,
+    /// Live members the nodes held unsigned at the end, in mode `sign`.
+    unsigned: u64,
 }
 
-fn fall_behind(seed: u64, nodes: usize) -> Result<Behind, String> {
+fn fall_behind(seed: u64, nodes: usize, mode: Mode) -> Result<Behind, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4c41_4747);
     let link = random_link(&mut rng);
@@ -315,7 +332,7 @@ fn fall_behind(seed: u64, nodes: usize) -> Result<Behind, String> {
                 cmd: Command::RemoveKey(old_key()),
             },
         );
-    let (mut sim, log) = sim(seed, scenario);
+    let (mut sim, log) = sim(seed, mode, scenario);
     let fail = |msg: String| {
         Err(format!(
             "seed {seed}: {msg}\n{} falls behind among {nodes} nodes",
@@ -414,24 +431,41 @@ fn fall_behind(seed: u64, nodes: usize) -> Result<Behind, String> {
     if !ok.is_empty() {
         return fail(format!("key commands were refused: {ok:?}"));
     }
+    let unsigned = match mode.check_all((0..nodes).filter_map(|o| sim.node(o)).map(|n| &n.node)) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Behind {
         reconverged: vec![reconverged - caught_up],
+        unsigned,
     })
 }
 
 #[test]
 fn a_node_that_falls_behind_dies_and_rejoins() {
-    check_all(0..8, |seed| fall_behind(seed, 10));
+    check_all(0..8, |seed| fall_behind(seed, 10, Mode::Off));
+}
+
+fn fall_behind_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| fall_behind(seed, 20, mode));
+    println!(
+        "fall behind: {} seeds x 20 nodes{}, dead to every peer, then reconverged after the catch-up; reconvergence took {}; {} members held unsigned at the end",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.reconverged.clone()).collect()),
+        runs.iter().map(|r| r.unsigned).sum::<u64>()
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_node_that_falls_behind_dies_and_rejoins_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| fall_behind(seed, 20));
-    println!(
-        "fall behind: {} seeds x 20 nodes, dead to every peer, then reconverged after the catch-up; reconvergence took {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.reconverged.clone()).collect())
-    );
+    fall_behind_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_node_that_falls_behind_dies_and_rejoins_thousand_seeds_signed() {
+    fall_behind_sweep(Mode::Sign);
 }

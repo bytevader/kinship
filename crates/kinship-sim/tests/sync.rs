@@ -10,8 +10,10 @@
 //!    [`dissemination_bound`]: it knows every member, and every member knows it.
 //!
 //! Each property has a quick test over a few seeds and an ignored sweep over 1,000 that CI runs
-//! with `cargo test --release -p kinship-sim --test sync -- --ignored --nocapture`.
-//! `KINSHIP_SEED=<seed>` replays one seed and `KINSHIP_SEEDS` changes the count.
+//! with `cargo test --release -p kinship-sim --test sync -- --ignored --nocapture`, once in mode
+//! `off` and once with every node in mode `sign`, where every node also ends with no signature
+//! or certificate refused. `KINSHIP_SEED=<seed>` replays one seed and `KINSHIP_SEEDS` changes
+//! the count.
 
 mod common;
 
@@ -19,7 +21,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Log, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
+use common::{Log, Mode, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
 use kinship_core::{Command, CommandOutput, Config, Event, Instant, Rng, State};
 use kinship_sim::{Action, Delay, LinkConfig, NodeSet, Scenario, Sim, TraceConfig, name_of};
 
@@ -106,9 +108,10 @@ fn detection_bound(cfg: &Config, n: usize) -> Duration {
     cfg.probe_interval * rounds + Duration::from_secs_f64(suspicion) + secs(2)
 }
 
-/// Builds the sim, every node logging into the returned log.
+/// Builds the sim, every node running in `mode` and logging into the returned log.
 fn sim(
     seed: u64,
+    mode: Mode,
     scenario: Scenario<Command>,
     knows: impl Fn(usize, usize) -> bool + 'static,
 ) -> (Sim<Observed>, Log) {
@@ -116,7 +119,7 @@ fn sim(
     let factory_log = log.clone();
     let sim = Sim::new(seed, scenario, move |spec| {
         let me = spec.index;
-        Observed::new(spec, factory_log.clone(), |j| knows(me, j))
+        Observed::in_mode(mode, spec, factory_log.clone(), |j| knows(me, j))
     });
     (sim, log)
 }
@@ -153,12 +156,19 @@ struct Measured {
     took: Vec<Duration>,
     /// Members declared dead while the partition stood, so the heal had something to repair.
     split_deaths: u64,
+    /// Live members the running nodes held unsigned at the end, in mode `sign`.
+    unsigned: u64,
+}
+
+/// [`Mode::check`] for every running node; returns the members they hold unsigned.
+fn signing(sim: &Sim<Observed>, mode: Mode, nodes: usize) -> Result<u64, String> {
+    mode.check_all((0..nodes).filter_map(|o| sim.node(o)).map(|n| &n.node))
 }
 
 // ---------------------------------------------------------------------------------------------
 // 1. A healed partition reconverges.
 
-fn heal(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn heal(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4845_414c);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -181,7 +191,7 @@ fn heal(seed: u64, nodes: usize) -> Result<Measured, String> {
             },
         )
         .at(start + length, Action::Heal);
-    let (mut sim, log) = sim(seed, scenario, |_, _| true);
+    let (mut sim, log) = sim(seed, mode, scenario, |_, _| true);
     let fail = |msg: String| {
         Err(format!(
             "seed {seed}: {msg}\nloss {loss:.4}, partition {start:?} for {length:?}, side {side:?}"
@@ -212,30 +222,57 @@ fn heal(seed: u64, nodes: usize) -> Result<Measured, String> {
             bad.join("; ")
         ));
     };
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![at - healed],
         split_deaths,
+        unsigned,
     })
 }
 
 #[test]
 fn healed_partitions_reconverge() {
-    let runs = check_all(0..8, |seed| heal(seed, 20));
+    let runs = check_all(0..8, |seed| heal(seed, 20, Mode::Off));
     assert!(runs.iter().any(|r| r.split_deaths > 0));
+}
+
+/// What the sweeps in mode `sign` add to their summaries: the members held unsigned at the end.
+fn unsigned(runs: &[Measured], mode: Mode) -> String {
+    if mode == Mode::Off {
+        return String::new();
+    }
+    let total: u64 = runs.iter().map(|r| r.unsigned).sum();
+    let with = runs.iter().filter(|r| r.unsigned > 0).count();
+    format!("; {total} members held unsigned at the end, in {with} runs")
+}
+
+fn heal_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| heal(seed, 50, mode));
+    let with_deaths = runs.iter().filter(|r| r.split_deaths > 0).count();
+    println!(
+        "heal: {} seeds x 50 nodes{} reconverged ({} had deaths to repair): {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        with_deaths,
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn healed_partitions_reconverge_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| heal(seed, 50));
-    let with_deaths = runs.iter().filter(|r| r.split_deaths > 0).count();
-    println!(
-        "heal: {} seeds x 50 nodes reconverged ({} had deaths to repair): {}",
-        seeds.end - seeds.start,
-        with_deaths,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    heal_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn healed_partitions_reconverge_thousand_seeds_signed() {
+    heal_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -244,7 +281,7 @@ fn healed_partitions_reconverge_thousand_seeds() {
 /// How long `leave()` waits by default before the driver closes the node anyway.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn leave(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn leave(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4c45_4156);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -263,7 +300,7 @@ fn leave(seed: u64, nodes: usize) -> Result<Measured, String> {
                 cmd: Command::Leave,
             },
         );
-    let (mut sim, log) = sim(seed, scenario, |_, _| true);
+    let (mut sim, log) = sim(seed, mode, scenario, |_, _| true);
     let fail = |msg: String| {
         Err(format!(
             "seed {seed}: {msg}\nloss {loss:.4}, {} leaves at {at:?}",
@@ -328,33 +365,50 @@ fn leave(seed: u64, nodes: usize) -> Result<Measured, String> {
             return fail(format!("{} ends with it {view:?}", name_of(o)));
         }
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![done - left],
         split_deaths: 0,
+        unsigned,
     })
 }
 
 #[test]
 fn a_node_that_left_is_never_reported_dead() {
-    check_all(0..8, |seed| leave(seed, 20));
+    check_all(0..8, |seed| leave(seed, 20, Mode::Off));
+}
+
+fn leave_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| leave(seed, 50, mode));
+    println!(
+        "leave: {} seeds x 50 nodes{}, never reported dead; leave() took {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_node_that_left_is_never_reported_dead_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| leave(seed, 50));
-    println!(
-        "leave: {} seeds x 50 nodes, never reported dead; leave() took {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    leave_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_node_that_left_is_never_reported_dead_thousand_seeds_signed() {
+    leave_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 3. Metadata reaches every node.
 
-fn metadata(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn metadata(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4d45_5441);
     let (link, loss) = random_link(&mut rng, MAX_LOSS);
@@ -386,7 +440,7 @@ fn metadata(seed: u64, nodes: usize) -> Result<Measured, String> {
             },
         );
     }
-    let (mut sim, _log) = sim(seed, scenario, |_, _| true);
+    let (mut sim, _log) = sim(seed, mode, scenario, |_, _| true);
     let fail = |msg: String| Err(format!("seed {seed}: {msg}\nloss {loss:.4}, {updates:?}"));
 
     // Every node, for every update, until it holds the new metadata.
@@ -424,9 +478,14 @@ fn metadata(seed: u64, nodes: usize) -> Result<Measured, String> {
             }
         }
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took,
         split_deaths: 0,
+        unsigned,
     })
 }
 
@@ -447,31 +506,43 @@ fn mostly_by_gossip(runs: &[Measured], nodes: usize) -> f64 {
 
 #[test]
 fn metadata_updates_reach_every_node() {
-    let runs = check_all(0..8, |seed| metadata(seed, 20));
+    let runs = check_all(0..8, |seed| metadata(seed, 20, Mode::Off));
     mostly_by_gossip(&runs, 20);
+}
+
+fn metadata_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| metadata(seed, 50, mode));
+    let share = mostly_by_gossip(&runs, 50);
+    println!(
+        "metadata: {} seeds x 50 nodes{}, every update reached every node within {:?}, {:.3}% \
+         by gossip within {:?}: {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        dissemination_bound(&config(), 50),
+        share * 100.0,
+        gossip_bound(&config(), 50),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn metadata_updates_reach_every_node_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| metadata(seed, 50));
-    let share = mostly_by_gossip(&runs, 50);
-    println!(
-        "metadata: {} seeds x 50 nodes, every update reached every node within {:?}, {:.3}% \
-         by gossip within {:?}: {}",
-        seeds.end - seeds.start,
-        dissemination_bound(&config(), 50),
-        share * 100.0,
-        gossip_bound(&config(), 50),
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    metadata_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn metadata_updates_reach_every_node_thousand_seeds_signed() {
+    metadata_sweep(Mode::Sign);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 4. A new node joins a large cluster.
 
-fn join(seed: u64, nodes: usize) -> Result<Measured, String> {
+fn join(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, String> {
     let cfg = config();
     let mut rng = Rng::new(seed ^ 0x4a4f_494e);
     let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
@@ -502,7 +573,9 @@ fn join(seed: u64, nodes: usize) -> Result<Measured, String> {
     if let Some(d) = down {
         scenario = scenario.at(Duration::ZERO, Action::Crash(d));
     }
-    let (mut sim, log) = sim(seed, scenario, move |me, j| me != newcomer && j != newcomer);
+    let (mut sim, log) = sim(seed, mode, scenario, move |me, j| {
+        me != newcomer && j != newcomer
+    });
     let fail = |msg: String| {
         Err(format!(
             "seed {seed}: {msg}\nloss {loss:.4}, join at {at:?} via {seed_nodes:?}, down {down:?}"
@@ -552,25 +625,42 @@ fn join(seed: u64, nodes: usize) -> Result<Measured, String> {
             "join reported {answered:?} seeds, expected {expected}"
         ));
     }
+    let unsigned = match signing(&sim, mode, nodes) {
+        Ok(u) => u,
+        Err(e) => return fail(e),
+    };
     Ok(Measured {
         took: vec![t - joined_at],
         split_deaths: 0,
+        unsigned,
     })
 }
 
 #[test]
 fn a_new_node_joins_and_converges() {
-    check_all(0..4, |seed| join(seed, 50));
+    check_all(0..4, |seed| join(seed, 50, Mode::Off));
+}
+
+fn join_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs = check_all(seeds.clone(), |seed| join(seed, 200, mode));
+    println!(
+        "join: {} seeds{}, a new node joined 200 and converged: {}{}",
+        seeds.end - seeds.start,
+        mode.label(),
+        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        unsigned(&runs, mode)
+    );
 }
 
 #[test]
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_new_node_joins_a_200_node_cluster_thousand_seeds() {
-    let seeds = seeds(1000);
-    let runs = check_all(seeds.clone(), |seed| join(seed, 200));
-    println!(
-        "join: {} seeds, a new node joined 200 and converged: {}",
-        seeds.end - seeds.start,
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect())
-    );
+    join_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_new_node_joins_a_200_node_cluster_thousand_seeds_signed() {
+    join_sweep(Mode::Sign);
 }

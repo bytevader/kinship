@@ -15,6 +15,9 @@
 //! - `screen`: one field at a time, and the combinations that pointed to, at 50, 200 and
 //!   1,000 nodes (see [`screen`] for the cells and seeds).
 //! - `grid`: `lan` and the candidates the screen left, every cell at 50, 200 and 1,000 nodes.
+//! - `signed`: `lan()` with every node in mode `sign` (KI-01 Stage 2c) against `lan()` in mode
+//!   `off`, both with epochs, on the screen's cells and seeds; `signed_verdict` compares them,
+//!   and `docs/results/signed.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -32,7 +35,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{check_all, index_of, ms, secs};
+use common::{Mode, check_all, index_of, ms, secs};
 use kinship_core::{
     Command, CommandId, Config, Event, Identity, Instant, Key, Node, Rng, Security, StreamEvent,
     StreamId, Transmit,
@@ -77,14 +80,34 @@ const SCREEN: &[&str] = &[
 /// `lan()` and the combinations the screen pointed to.
 const GRID: &[&str] = &["lan"];
 
+/// `lan()` in mode `sign` (KI-01 Stage 2c), every node under a certificate from one CA, which
+/// the `signed` sweep compares with [`EPOCHS`]. It combines with field changes, as in
+/// `signed suspicion_mult=3`.
+const SIGNED: &str = "signed";
+
+/// `lan()` with every node starting at an epoch, as drivers since 0.3 start them and as mode
+/// `sign` requires: its Alives, Suspects and Deads carry 8 bytes more than the screen's, whose
+/// nodes have none.
+const EPOCHS: &str = "epochs";
+
+/// Whether every node of `variant` runs in mode `sign`.
+fn signs(variant: &str) -> bool {
+    variant.split(' ').any(|c| c == SIGNED)
+}
+
+/// Whether the nodes of `variant` start at an epoch: those of a signed one do.
+fn has_epochs(variant: &str) -> bool {
+    signs(variant) || variant.split(' ').any(|c| c == EPOCHS)
+}
+
 /// Builds a variant's config from `lan()`. Sealed, as production runs, so packet sizes are the
-/// real ones.
+/// real ones. A `signed` variant's nodes add their credentials to it in [`run`].
 fn config(variant: &str) -> Config {
     let mut cfg = Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]));
     if variant == "lan" {
         return cfg;
     }
-    for change in variant.split(' ') {
+    for change in variant.split(' ').filter(|&c| c != SIGNED && c != EPOCHS) {
         let (field, value) = change
             .split_once('=')
             .unwrap_or_else(|| panic!("{variant}: {change} is not field=value"));
@@ -235,7 +258,8 @@ impl SimNode for Counted {
     }
 }
 
-fn run(cell: Cell, cfg: &Config, seed: u64) -> Run {
+/// One run of `cell` with `cfg`, its nodes at an epoch if `epochs` and in mode `sign` if `signed`.
+fn run(cell: Cell, cfg: &Config, (epochs, signed): (bool, bool), seed: u64) -> Run {
     let n = cell.nodes;
     let mut rng = Rng::new(seed ^ 0x4c49_4645_4755_4152);
     let mut order: Vec<usize> = (0..n).collect();
@@ -263,8 +287,15 @@ fn run(cell: Cell, cfg: &Config, seed: u64) -> Run {
     let factory_tally = tally.clone();
     let cfg = cfg.clone();
     let mut sim = Sim::new(seed, scenario, move |spec| {
-        let me = Identity::new(&spec.name, spec.addr).unwrap();
-        let mut node = Node::new(cfg.clone(), me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
+        let mut cfg = cfg.clone();
+        let mut me = Identity::new(&spec.name, spec.addr).unwrap();
+        if epochs {
+            me = me.with_epoch(spec.epoch());
+        }
+        if signed {
+            cfg.signatures = Mode::Sign.config(spec, &spec.name).signatures;
+        }
+        let mut node = Node::new(cfg, me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
         for j in (0..spec.nodes).filter(|&j| j != spec.index) {
             node.add_member(spec.now, &name_of(j), addr_of(j)).unwrap();
         }
@@ -447,8 +478,9 @@ fn worker() {
         starved: f[2].parse().unwrap(),
     };
     let cfg = config(f[3]);
+    let modes = (has_epochs(f[3]), signs(f[3]));
     for seed in f[4].split(',').map(|s| s.parse::<u64>().unwrap()) {
-        let line = run(cell, &cfg, seed).to_line(seed);
+        let line = run(cell, &cfg, modes, seed).to_line(seed);
         println!("{line}");
     }
 }
@@ -613,13 +645,11 @@ fn sweep(stage: &str, sizes: &[Size], variants: &[String]) {
     }
 }
 
-/// One field at a time: every cell at 50 and 200 nodes, and at 1,000 nodes the cells without
-/// starved nodes or with 1% of them, since a 1,000-node run with 10% starved takes five
+/// The screen's cells and seeds: every cell at 50 and 200 nodes, and at 1,000 nodes the cells
+/// without starved nodes or with 1% of them, since a 1,000-node run with 10% starved takes five
 /// minutes.
-#[test]
-#[ignore = "about seven hours in release mode"]
-fn screen() {
-    let sizes = [
+fn screen_sizes() -> [Size; 3] {
+    [
         Size {
             nodes: 50,
             starved: &STARVED,
@@ -635,8 +665,115 @@ fn screen() {
             starved: &STARVED[..2],
             seeds: 16,
         },
-    ];
-    sweep("screen", &sizes, &variants(SCREEN));
+    ]
+}
+
+/// One field at a time, on [`screen_sizes`].
+#[test]
+#[ignore = "about seven hours in release mode"]
+fn screen() {
+    sweep("screen", &screen_sizes(), &variants(SCREEN));
+}
+
+/// Mode `sign` (KI-01 Stage 2c): `lan()` with every node signing against `lan()` in mode `off`,
+/// both with epochs, on the screen's cells and seeds. `signed_verdict` compares them.
+#[test]
+#[ignore = "several hours in release mode"]
+fn signed() {
+    sweep("signed", &screen_sizes(), &variants(&[EPOCHS, SIGNED]));
+}
+
+/// Per cluster size, `signed` against `epochs` on the same cells and seeds: the bandwidth
+/// ratio, the change in detection p50 and p99, and false deaths, false suspicions and
+/// undetected crashes per run, summed over the cells; then every cell.
+fn signed_table(csv: &str) -> String {
+    let rows: Vec<Row> = csv
+        .lines()
+        .skip(1)
+        .map(Row::parse)
+        .filter(|r| r.stage == "signed")
+        .collect();
+    let base: BTreeMap<&str, &Row> = rows
+        .iter()
+        .filter(|r| r.variant == EPOCHS)
+        .map(|r| (r.cell.as_str(), r))
+        .collect();
+    let pairs: Vec<(&Row, &Row)> = rows
+        .iter()
+        .filter(|r| r.variant == SIGNED)
+        .filter_map(|r| Some((r, *base.get(r.cell.as_str())?)))
+        .collect();
+    let nodes = |r: &Row| -> usize { r.cell.split(',').next().unwrap().parse().unwrap() };
+    let mut out = String::from(concat!(
+        "| Nodes | Cells | Bandwidth, mean | Bandwidth, worst | p50 change (s) | ",
+        "p99 change, mean (s) | p99 change, worst (s) | False deaths per run, off | ",
+        "False deaths per run, sign | False suspicions per run, off | ",
+        "False suspicions per run, sign | Undetected |\n",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
+    let sizes: BTreeSet<usize> = pairs.iter().map(|(s, _)| nodes(s)).collect();
+    for size in sizes {
+        let cells: Vec<&(&Row, &Row)> = pairs.iter().filter(|(s, _)| nodes(s) == size).collect();
+        let ratios: Vec<f64> = cells.iter().map(|(s, b)| s.bytes / b.bytes).collect();
+        let dp50: Vec<f64> = cells.iter().map(|(s, b)| s.p50 - b.p50).collect();
+        let dp99: Vec<f64> = cells.iter().map(|(s, b)| s.p99 - b.p99).collect();
+        let sum = |f: &dyn Fn(&Row) -> f64, pick: usize| -> f64 {
+            cells
+                .iter()
+                .map(|p| f(if pick == 0 { p.0 } else { p.1 }))
+                .sum()
+        };
+        writeln!(
+            out,
+            "| {size} | {} | {:.3} | {:.3} | {:+.2} | {:+.2} | {:+.2} | {:.2} | {:.2} | {:.1} | \
+             {:.1} | {} off, {} sign |",
+            cells.len(),
+            mean_sd(&ratios).0,
+            ratios.iter().copied().fold(0.0, f64::max),
+            mean_sd(&dp50).0,
+            mean_sd(&dp99).0,
+            dp99.iter().copied().fold(f64::MIN, f64::max),
+            sum(&|r| r.deaths, 1),
+            sum(&|r| r.deaths, 0),
+            sum(&|r| r.suspicions, 1),
+            sum(&|r| r.suspicions, 0),
+            cells.iter().map(|(_, b)| b.undetected).sum::<u64>(),
+            cells.iter().map(|(s, _)| s.undetected).sum::<u64>(),
+        )
+        .unwrap();
+    }
+    out.push_str(concat!(
+        "\n| Cell (nodes, loss, starved) | Bytes per node per second, off | Sign | Ratio | ",
+        "p50 off (s) | p50 sign (s) | p99 off (s) | p99 sign (s) | False deaths off | ",
+        "False deaths sign |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
+    for (s, b) in &pairs {
+        writeln!(
+            out,
+            "| {} | {:.0} | {:.0} | {:.3} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+            s.cell,
+            b.bytes,
+            s.bytes,
+            s.bytes / b.bytes,
+            b.p50,
+            s.p50,
+            b.p99,
+            s.p99,
+            b.deaths,
+            s.deaths
+        )
+        .unwrap();
+    }
+    out
+}
+
+/// Prints [`signed_table`] from `docs/results/tuning.csv`.
+#[test]
+#[ignore = "reads the CSV the sweeps write"]
+fn signed_verdict() {
+    let csv = std::fs::read_to_string(csv_path()).expect("run the signed sweep first");
+    print!("{}", signed_table(&csv));
 }
 
 /// `lan()` and the candidates, every cell at 50, 200 and 1,000 nodes.
@@ -763,7 +900,7 @@ fn faster_probes_cost_bytes_and_detect_sooner() {
     };
     let measure = |variant: &str| {
         let cfg = config(variant);
-        let runs = check_all(0..4, |seed| Ok(run(cell, &cfg, seed)));
+        let runs = check_all(0..4, |seed| Ok(run(cell, &cfg, (false, false), seed)));
         let bytes: u64 = runs.iter().map(|r| r.udp_bytes).sum();
         let mut d: Vec<Duration> = runs.into_iter().flat_map(|r| r.detections).collect();
         d.sort_unstable();

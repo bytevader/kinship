@@ -9,10 +9,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use kinship_core::{
-    Command, CommandId, Config, Event, Identity, Instant, Key, Node, Security, StreamEvent,
-    StreamId, Transmit,
+    Command, CommandId, Config, Credentials, Event, Identity, Instant, Key, Node, Rng, Security,
+    Signatures, SigningKey, StreamEvent, StreamId, Transmit,
 };
-use kinship_sim::{NodeSpec, SimNode, addr_of, name_of};
+use kinship_proto::NodeId;
+use kinship_proto::identity::Certificate;
+use kinship_sim::{NodeSpec, SimNode, WALL_CLOCK_AT_ZERO_MS, addr_of, name_of};
 
 pub fn secs(s: u64) -> Duration {
     Duration::from_secs(s)
@@ -25,6 +27,99 @@ pub fn ms(m: u64) -> Duration {
 /// `lan()` with encryption, as production runs.
 pub fn config() -> Config {
     Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]))
+}
+
+/// What the nodes of a sweep run: mode `off`, the default, which sends the bytes 0.4 sends, or
+/// mode `sign` (KI-01, `docs/ki01-stage2.md`), every node signing under a certificate from one
+/// CA. The 1,000-seed sweeps run in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    Sign,
+}
+
+/// `N` bytes drawn from the RNG seeded with `seed`, the same in every run.
+pub fn drawn<const N: usize>(seed: u64) -> [u8; N] {
+    let mut rng = Rng::new(seed);
+    std::array::from_fn(|_| rng.next_u64().to_le_bytes()[0])
+}
+
+/// The CA every signing node trusts, drawn from a fixed seed: "sweep ca" in ASCII.
+pub fn ca() -> SigningKey {
+    SigningKey::from_bytes(drawn(0x7377_6565_7020_6361))
+}
+
+impl Mode {
+    /// [`config`] for the instance `spec` calling itself `name`: in `sign`, with a key drawn
+    /// from the instance's seed, so that a restart brings a new key as a reinstalled machine
+    /// would, and a certificate for `name` from [`ca`], valid a day either side of the
+    /// simulator's wall clock.
+    pub fn config(self, spec: &NodeSpec, name: &str) -> Config {
+        let mut cfg = config();
+        if self == Self::Sign {
+            const DAY: u64 = 86_400;
+            // "sign key" in ASCII, so that the key's stream is not the seed's own.
+            let key = SigningKey::from_bytes(drawn(spec.seed ^ 0x7369_676e_206b_6579));
+            let now = WALL_CLOCK_AT_ZERO_MS / 1000;
+            let name = NodeId::new(name).expect("simulator names are valid");
+            let certificate = Certificate::issue(
+                &ca(),
+                cfg.cluster.as_bytes(),
+                name,
+                key.public_key(),
+                now - DAY,
+                now + DAY,
+            )
+            .expect("a valid certificate")
+            .encode();
+            cfg.signatures = Signatures::Sign(Credentials {
+                signing_key: key,
+                certificate,
+                trust_anchors: vec![ca().public_key()],
+            });
+        }
+        cfg
+    }
+
+    /// Checks what every node ends a run with in this mode: in `sign`, no signature that failed
+    /// and no certificate refused. Members held unsigned are allowed: a 0.4 relay, a forged
+    /// version 1 rumour or a static member list leaves members unsigned until anti-entropy
+    /// brings their proofs, which [`Mode::unsigned`] counts.
+    pub fn check(self, node: &Node) -> Result<(), String> {
+        let m = node.metrics();
+        if self == Self::Sign && (m.signatures_invalid, m.certificates_refused) != (0, 0) {
+            return Err(format!(
+                "{} counted {} invalid signatures and {} refused certificates",
+                node.local().name,
+                m.signatures_invalid,
+                m.certificates_refused
+            ));
+        }
+        Ok(())
+    }
+
+    /// The live members `node` holds unsigned: always 0 in `off`.
+    pub fn unsigned(node: &Node) -> u64 {
+        node.metrics().unsigned_members
+    }
+
+    /// [`Mode::check`] for each of `nodes`; returns the members they hold unsigned.
+    pub fn check_all<'a>(self, nodes: impl IntoIterator<Item = &'a Node>) -> Result<u64, String> {
+        let mut unsigned = 0;
+        for n in nodes {
+            self.check(n)?;
+            unsigned += Self::unsigned(n);
+        }
+        Ok(unsigned)
+    }
+
+    /// A suffix for sweep summaries.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "",
+            Self::Sign => ", every node in mode sign",
+        }
+    }
 }
 
 /// One event a node reported, and when.
@@ -51,6 +146,11 @@ impl Observed {
     /// member list would, and logs into `log`.
     pub fn new(spec: &NodeSpec, log: Log, knows: impl Fn(usize) -> bool) -> Self {
         Self::with_config(spec, config(), log, knows)
+    }
+
+    /// Like [`Observed::new`], running [`config`] in `mode`.
+    pub fn in_mode(mode: Mode, spec: &NodeSpec, log: Log, knows: impl Fn(usize) -> bool) -> Self {
+        Self::with_config(spec, mode.config(spec, &spec.name), log, knows)
     }
 
     /// Like [`Observed::new`], running `cfg`.
