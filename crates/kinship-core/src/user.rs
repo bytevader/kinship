@@ -14,13 +14,16 @@
 use core::net::SocketAddr;
 use std::collections::{BTreeMap, VecDeque};
 
-use kinship_proto::{Message, PacketKind, UserBroadcast, UserMessage};
+use kinship_proto::identity::{Certificate, CertificateId, Signature};
+use kinship_proto::v2;
+use kinship_proto::{Message, PacketKind, UserBroadcast, UserMessage, WireVersion};
 
 use crate::Node;
 use crate::broadcast::{COUNT_LEN, id};
 use crate::event::{CommandError, CommandOutput, Event};
 use crate::io::StreamId;
 use crate::member::{Life, Member, life};
+use crate::signing::PacketCerts;
 use crate::sync::Purpose;
 
 /// How many sequence numbers below the highest it has seen from a member a node remembers.
@@ -30,23 +33,57 @@ pub(crate) const SEEN_WINDOW: u64 = 256;
 /// [`COUNT_LEN`] keeps for it.
 const MAX_FRAME_MESSAGES: usize = 16_000;
 
-/// A broadcast waiting to be spread, owned so it can outlive the packet it arrived in.
+/// A broadcast waiting to be spread, owned so it can outlive the packet it arrived in. In mode
+/// `sign` it keeps its sender's signature, when it came with one, and the sender's certificate
+/// to go ahead of it in every version 2 packet, so that a member that has not checked the
+/// sender's certificate yet can check the broadcast (`docs/ki01-stage2.md`, Signed user
+/// messages).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Broadcast {
     pub from: String,
     pub from_epoch: u64,
     pub seq: u64,
     pub data: Vec<u8>,
+    pub sig: Option<(CertificateId, Signature)>,
+    pub cert: Option<Vec<u8>>,
 }
 
 impl Broadcast {
+    /// The broadcast in the version 1 grammar, without a signature.
     pub fn message(&self) -> Message<'_> {
-        Message::UserBroadcast(UserBroadcast {
+        Message::UserBroadcast(self.body())
+    }
+
+    fn body(&self) -> UserBroadcast<'_> {
+        UserBroadcast {
             from: id(&self.from),
             from_epoch: self.from_epoch,
             seq: self.seq,
             data: &self.data,
-        })
+        }
+    }
+
+    /// The broadcast in the version 2 grammar, behind its certificate if it carries one; `None`
+    /// if it is unsigned.
+    pub fn signed(&self) -> Option<(Option<Certificate<'_>>, v2::Message<'_>)> {
+        let (certificate_id, signature) = self.sig?;
+        let cert = self
+            .cert
+            .as_deref()
+            .and_then(|c| Certificate::decode(c).ok());
+        let msg = v2::Message::UserBroadcast {
+            broadcast: self.body(),
+            certificate_id,
+            signature,
+        };
+        Some((cert, msg))
+    }
+
+    /// Bytes the version 2 form takes in a payload, its certificate included.
+    fn signed_len(&self) -> Option<usize> {
+        let (cert, msg) = self.signed()?;
+        let cert = cert.map_or(0, |c| v2::Message::Certificate(c).encoded_len());
+        Some(cert + msg.encoded_len())
     }
 }
 
@@ -55,6 +92,8 @@ struct Queued {
     broadcast: Broadcast,
     /// Encoded size inside a payload.
     len: usize,
+    /// Encoded size of its version 2 form, certificate included, when it is signed.
+    signed_len: Option<usize>,
 }
 
 /// Where a broadcast stands in the queue: fewest sends first, and among those the oldest first,
@@ -86,7 +125,15 @@ impl UserQueue {
         };
         self.next_id += 1;
         let len = broadcast.message().encoded_len();
-        self.queue.insert(rank, Queued { broadcast, len });
+        let signed_len = broadcast.signed_len();
+        self.queue.insert(
+            rank,
+            Queued {
+                broadcast,
+                len,
+                signed_len,
+            },
+        );
         if self.queue.len() <= capacity {
             return true;
         }
@@ -124,6 +171,33 @@ impl UserQueue {
             }
         }
         picked
+    }
+
+    /// Like [`select`](Self::select) for a member that speaks version 2: signed entries in their
+    /// version 2 form fill `signed` bytes, the unsigned ones `unsigned` bytes. Returns the
+    /// entries for each.
+    pub fn select_split(&self, unsigned: usize, signed: usize) -> (Vec<Rank>, Vec<Rank>) {
+        let smallest = smallest_broadcast();
+        let (mut left_v1, mut left_v2) = (unsigned, signed);
+        let (mut v1, mut v2) = (Vec::new(), Vec::new());
+        for (&rank, q) in &self.queue {
+            if left_v1 < smallest && left_v2 < smallest {
+                break;
+            }
+            match q.signed_len {
+                Some(len) if len <= left_v2 => {
+                    left_v2 -= len;
+                    v2.push(rank);
+                }
+                Some(_) => {}
+                None if q.len <= left_v1 => {
+                    left_v1 -= q.len;
+                    v1.push(rank);
+                }
+                None => {}
+            }
+        }
+        (v1, v2)
     }
 
     /// Counts one more send of each entry in `sent`, then drops every entry that has reached
@@ -207,6 +281,20 @@ impl Seen {
     fn is_marked(&self, seq: u64) -> bool {
         let (word, bit) = Self::slot(seq);
         self.bits[word] & bit != 0
+    }
+
+    /// What [`check`](Self::check) would say of broadcast `seq` of the life `epoch`, recording
+    /// nothing.
+    fn peek(&self, epoch: u64, seq: u64) -> Copy {
+        if epoch != self.epoch || seq > self.high {
+            Copy::New
+        } else if self.high - seq >= SEEN_WINDOW {
+            Copy::TooOld
+        } else if self.is_marked(seq) {
+            Copy::Seen
+        } else {
+            Copy::New
+        }
     }
 
     /// Records broadcast `seq` of the life `epoch`, which starts over at a new life.
@@ -304,6 +392,10 @@ impl Node {
         let Some((addr, to_epoch)) = held else {
             return Err(CommandError::NotAMember);
         };
+        if self.version_for(Some(to), addr) == WireVersion::V2 {
+            self.send_user_signed(to, addr, to_epoch, data);
+            return Ok(CommandOutput::Done);
+        }
         let me = self.local.member.name.clone();
         let msg = Message::UserMessage(UserMessage {
             to: id(to),
@@ -337,6 +429,54 @@ impl Node {
         Ok(CommandOutput::Done)
     }
 
+    /// Mode `sign`, to a member that speaks version 2: the message goes signed over the nonce of
+    /// the version 2 datagram that carries it, which is drawn first and seals it (Stage 1, the
+    /// direct-message nonce binding). This node's certificate goes ahead of it, and its Alive
+    /// too while that is still being spread, as far as they fit, so that a receiver can check
+    /// it whatever it heard of this node so far. A message too large for a datagram goes over
+    /// a connection.
+    fn send_user_signed(&mut self, to: &str, addr: SocketAddr, to_epoch: u64, data: Vec<u8>) {
+        let me = self.local.member.name.clone();
+        let unsigned = v2::Message::UserMessage {
+            message: UserMessage {
+                to: id(to),
+                to_epoch,
+                from: id(&me),
+                from_epoch: self.local.member.epoch,
+                data: &data,
+            },
+            certificate_id: CertificateId::default(),
+            signature: [0; 64],
+        };
+        // A signature does not change the length, so the nonce is drawn only for a datagram.
+        let room = crate::broadcast::datagram_room(&self.out.codec);
+        let len = unsigned.encoded_len();
+        if len > room {
+            return self.send_user_stream(to, addr, Waiting { to_epoch, data });
+        }
+        let gossip = self.local_alive_announced();
+        let mut ahead: Vec<v2::Message<'_>> = Vec::new();
+        if let Some((cert, alive)) = gossip.signed() {
+            ahead.extend(cert.map(v2::Message::Certificate));
+            if self.out.broadcasts.contains(&me) {
+                ahead.push(alive);
+            }
+        }
+        // Whatever of the certificate and the Alive fits beside the message, the Alive first to go.
+        while ahead.iter().map(v2::Message::encoded_len).sum::<usize>() + len > room {
+            ahead.pop();
+        }
+        let nonce = self.out.nonce();
+        let Some(msg) = self.signed(unsigned, Some(&nonce)) else {
+            return;
+        };
+        ahead.push(msg);
+        // No gossip rides along, as in version 1.
+        if self.may_send(addr) && self.out.send_signed_at(addr, &ahead, &nonce) {
+            self.metrics.user_messages_sent += 1;
+        }
+    }
+
     /// Sends a message too large for a datagram over a connection to `to` at `addr`, or has it
     /// wait for the next one while one is open.
     fn send_user_stream(&mut self, to: &str, addr: SocketAddr, message: Waiting) {
@@ -357,30 +497,63 @@ impl Node {
     /// A frame too small for both, which only a much lowered `max_stream_frame` makes, goes
     /// without the Alive.
     fn open_user_stream(&mut self, to: &str, addr: SocketAddr, batch: Vec<Waiting>) {
-        let conn = self.connect(
-            addr,
-            Purpose::Message,
-            false,
-            kinship_proto::WireVersion::V1,
-        );
+        let version = self.version_for(Some(to), addr);
+        let conn = self.connect(addr, Purpose::Message, false, version);
         let me = self.local.member.name.clone();
         let from_epoch = self.local.member.epoch;
-        let alive = self.local_alive();
-        let mut msgs = Vec::with_capacity(batch.len() + 1);
-        msgs.push(alive.message());
-        msgs.extend(batch.iter().map(|w| {
-            Message::UserMessage(UserMessage {
+        fn message<'a>(
+            to: &'a str,
+            from: &'a str,
+            from_epoch: u64,
+            w: &'a Waiting,
+        ) -> UserMessage<'a> {
+            UserMessage {
                 to: id(to),
                 to_epoch: w.to_epoch,
-                from: id(&me),
+                from: id(from),
                 from_epoch,
                 data: &w.data,
-            })
-        }));
-        let len: usize = msgs.iter().map(Message::encoded_len).sum();
-        let with_alive = len <= frame_room(&self.out.codec);
-        let sent = self.out.frame(conn, &msgs[usize::from(!with_alive)..]);
-        drop(msgs);
+            }
+        }
+        let sent = if version == WireVersion::V2 {
+            // Mode `sign`: every message signed over the frame's nonce, behind this node's signed
+            // Alive and its certificate, so that the receiver can check them.
+            let nonce = self.out.nonce();
+            let gossip = self.local_alive_announced();
+            let mut msgs: Vec<v2::Message<'_>> = Vec::with_capacity(batch.len() + 2);
+            if let Some((cert, alive)) = gossip.signed() {
+                msgs.extend(cert.map(v2::Message::Certificate));
+                msgs.push(alive);
+            }
+            let ahead = msgs.len();
+            for w in &batch {
+                let unsigned = v2::Message::UserMessage {
+                    message: message(to, &me, from_epoch, w),
+                    certificate_id: CertificateId::default(),
+                    signature: [0; 64],
+                };
+                msgs.extend(self.signed(unsigned, Some(&nonce)));
+            }
+            let len: usize = msgs.iter().map(v2::Message::encoded_len).sum();
+            let skip = if len <= frame_room(&self.out.codec) {
+                0
+            } else {
+                ahead
+            };
+            self.out.frame_v2_at(conn, &msgs[skip..], &nonce)
+        } else {
+            let alive = self.local_alive();
+            let mut msgs = Vec::with_capacity(batch.len() + 1);
+            msgs.push(alive.message());
+            msgs.extend(
+                batch
+                    .iter()
+                    .map(|w| Message::UserMessage(message(to, &me, from_epoch, w))),
+            );
+            let len: usize = msgs.iter().map(Message::encoded_len).sum();
+            let with_alive = len <= frame_room(&self.out.codec);
+            self.out.frame(conn, &msgs[usize::from(!with_alive)..])
+        };
         let n = batch.len() as u64;
         if !sent {
             // Validated limits keep every message small enough for a frame of its own.
@@ -422,6 +595,9 @@ impl Node {
             .filter(|e| e.member.state.is_live())
             .map(|e| (e.member.addr, e.member.epoch));
         let room = frame_room(&self.out.codec);
+        // Signed, each message takes its certificate id and signature more.
+        let signed =
+            held.is_some_and(|(addr, _)| self.version_for(Some(to), addr) == WireVersion::V2);
         let Some(target) = self.user.targets.get_mut(to) else {
             return;
         };
@@ -439,14 +615,23 @@ impl Node {
                 target.waiting.pop_front();
                 continue;
             };
-            let len = Message::UserMessage(UserMessage {
+            let message = UserMessage {
                 to: id(to),
                 to_epoch: w.to_epoch.max(epoch),
                 from: id(&me.name),
                 from_epoch: me.epoch,
                 data: &w.data,
-            })
-            .encoded_len();
+            };
+            let len = if signed {
+                v2::Message::UserMessage {
+                    message,
+                    certificate_id: CertificateId::default(),
+                    signature: [0; 64],
+                }
+                .encoded_len()
+            } else {
+                Message::UserMessage(message).encoded_len()
+            };
             if !batch.is_empty() && (used + len > room || batch.len() == MAX_FRAME_MESSAGES) {
                 break;
             }
@@ -475,12 +660,32 @@ impl Node {
         let seq = self.user.next_seq;
         self.user.next_seq += 1;
         self.metrics.user_messages_sent += 1;
-        self.queue_user_broadcast(Broadcast {
+        let mut broadcast = Broadcast {
             from: self.local.member.name.clone(),
             from_epoch: self.local.member.epoch,
             seq,
             data,
-        });
+            sig: None,
+            cert: None,
+        };
+        // Mode `sign`: signed over its sender, epoch, number and data, and spread with it,
+        // behind this node's certificate.
+        let unsigned = v2::Message::UserBroadcast {
+            broadcast: broadcast.body(),
+            certificate_id: CertificateId::default(),
+            signature: [0; 64],
+        };
+        let sig = match self.signed(unsigned, None) {
+            Some(v2::Message::UserBroadcast {
+                certificate_id,
+                signature,
+                ..
+            }) => Some((certificate_id, signature)),
+            _ => None,
+        };
+        broadcast.sig = sig;
+        broadcast.cert = self.keys.as_ref().map(|k| k.own.bytes.clone());
+        self.queue_user_broadcast(broadcast);
         Ok(CommandOutput::Done)
     }
 
@@ -493,16 +698,80 @@ impl Node {
     /// A user message or broadcast arrived; see the module docs.
     pub(crate) fn on_user(&mut self, msg: &Message<'_>) {
         match msg {
-            Message::UserMessage(m) => self.on_user_message(m),
-            Message::UserBroadcast(b) => self.on_user_broadcast(b),
+            Message::UserMessage(m) => {
+                if let Some(sender) = self.direct_sender(m) {
+                    self.deliver_direct(sender, m.data);
+                }
+            }
+            Message::UserBroadcast(b) => self.on_user_broadcast(b, None),
             _ => {}
         }
     }
 
-    fn on_user_message(&mut self, m: &UserMessage<'_>) {
+    /// The user messages and broadcasts of a version 2 packet sealed with `nonce`, in order,
+    /// with the certificates it carries. A direct message whose proof is a repeat of one
+    /// already in the packet is not handled again (Stage 1, the duplicate-proof note).
+    pub(crate) fn on_signed_users(
+        &mut self,
+        msgs: &[v2::Message<'_>],
+        packet: &PacketCerts<'_>,
+        nonce: Option<&[u8; 24]>,
+    ) {
+        let mut proofs: BTreeMap<Signature, usize> = BTreeMap::new();
+        for (i, msg) in msgs.iter().enumerate() {
+            match msg {
+                v2::Message::UserMessage { signature, .. } => {
+                    let first = *proofs.entry(*signature).or_insert(i);
+                    if first != i && msgs[first] == *msg {
+                        continue;
+                    }
+                    self.on_signed_user_message(msg, packet, nonce);
+                }
+                v2::Message::UserBroadcast { broadcast, .. } => {
+                    self.on_user_broadcast(broadcast, Some((msg, packet)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A signed direct message: delivered only if it is for this run of this node, from a
+    /// member it holds, and its signature over the packet's `nonce` checks, in that order.
+    fn on_signed_user_message(
+        &mut self,
+        msg: &v2::Message<'_>,
+        packet: &PacketCerts<'_>,
+        nonce: Option<&[u8; 24]>,
+    ) {
+        let v2::Message::UserMessage {
+            message: m,
+            certificate_id,
+            ..
+        } = *msg
+        else {
+            return;
+        };
+        let Some(sender) = self.direct_sender(&m) else {
+            return;
+        };
+        let from = m.from.as_str();
+        let checked = nonce.is_some_and(|nonce| {
+            self.check_bound(msg, from, certificate_id, packet, Some(nonce))
+                .is_some()
+        });
+        if !checked {
+            self.metrics.user_messages_dropped += 1;
+            return;
+        }
+        self.deliver_direct(sender, m.data);
+    }
+
+    /// The member that sent the direct message `m`, if it is one to deliver: within this node's
+    /// limit, for this run of it, and from a member it holds at that epoch. Counts what is not.
+    fn direct_sender(&mut self, m: &UserMessage<'_>) -> Option<Member> {
         if m.data.len() > self.cfg.max_user_message {
             self.metrics.user_messages_too_large += 1;
-            return;
+            return None;
         }
         let me = &self.local.member;
         let for_me = m.to.as_str() == me.name
@@ -510,19 +779,30 @@ impl Node {
         let sender = for_me
             .then(|| self.sender(m.from.as_str(), m.from_epoch))
             .flatten();
-        let Some(sender) = sender else {
+        if sender.is_none() {
             self.metrics.user_messages_dropped += 1;
-            return;
-        };
+        }
+        sender
+    }
+
+    fn deliver_direct(&mut self, sender: Member, data: &[u8]) {
         self.metrics.user_messages_received += 1;
         self.events.push_back(Event::UserMessage {
             sender,
-            data: m.data.to_vec(),
+            data: data.to_vec(),
             broadcast: false,
         });
     }
 
-    fn on_user_broadcast(&mut self, b: &UserBroadcast<'_>) {
+    /// A user broadcast, with `proof`, the version 2 message it came in and the certificates
+    /// beside it, when it came signed. The copy rules come first, then the signature, and only
+    /// a broadcast that passes both is remembered as seen, delivered and queued to relay, with
+    /// its signature when it had one (rule 4).
+    fn on_user_broadcast(
+        &mut self,
+        b: &UserBroadcast<'_>,
+        proof: Option<(&v2::Message<'_>, &PacketCerts<'_>)>,
+    ) {
         if b.data.len() > self.cfg.max_user_broadcast {
             self.metrics.user_messages_too_large += 1;
             return;
@@ -537,15 +817,11 @@ impl Node {
             self.metrics.user_messages_dropped += 1;
             return;
         };
-        let copy = match self.user.seen.get_mut(from) {
-            Some(seen) => seen.check(b.from_epoch, b.seq),
-            None => {
-                self.user
-                    .seen
-                    .insert(from.to_owned(), Seen::new(b.from_epoch, b.seq));
-                Copy::New
-            }
-        };
+        let copy = self
+            .user
+            .seen
+            .get(from)
+            .map_or(Copy::New, |seen| seen.peek(b.from_epoch, b.seq));
         match copy {
             Copy::Seen => return,
             Copy::TooOld => {
@@ -553,6 +829,38 @@ impl Node {
                 return;
             }
             Copy::New => {}
+        }
+        let (mut sig, mut cert) = (None, None);
+        if let Some((msg, packet)) = proof {
+            let v2::Message::UserBroadcast {
+                certificate_id,
+                signature,
+                ..
+            } = *msg
+            else {
+                return;
+            };
+            let Some(signed) = self.check(msg, from, certificate_id, packet) else {
+                // Not remembered either: a good copy may still come.
+                self.metrics.user_messages_dropped += 1;
+                return;
+            };
+            sig = Some((certificate_id, signature));
+            // The certificate it was checked under goes ahead of it.
+            cert = match signed.cert {
+                Some(c) => Some(c.bytes),
+                None => self.cert_bytes(from, certificate_id),
+            };
+        }
+        match self.user.seen.get_mut(from) {
+            Some(seen) => {
+                seen.check(b.from_epoch, b.seq);
+            }
+            None => {
+                self.user
+                    .seen
+                    .insert(from.to_owned(), Seen::new(b.from_epoch, b.seq));
+            }
         }
         self.metrics.user_messages_received += 1;
         self.events.push_back(Event::UserMessage {
@@ -565,6 +873,8 @@ impl Node {
             from_epoch: b.from_epoch,
             seq: b.seq,
             data: b.data.to_vec(),
+            sig,
+            cert,
         });
     }
 
@@ -1074,6 +1384,8 @@ mod tests {
             from_epoch: 1,
             seq,
             data: Vec::new(),
+            sig: None,
+            cert: None,
         };
         let seqs = |q: &UserQueue| -> Vec<u64> {
             let picked = q.select(usize::MAX);

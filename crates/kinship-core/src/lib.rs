@@ -200,7 +200,10 @@ impl Node {
             });
         }
         let keys = match cfg.signatures.credentials() {
-            Some(credentials) => Some(Box::new(signing_keys(credentials, &cfg, &me, now)?)),
+            Some(credentials) => {
+                let keys = signing_keys(credentials, &cfg, &me, now, nonce_key)?;
+                Some(Box::new(keys))
+            }
             None => None,
         };
         // The keys move into the codec and live nowhere else: the config the node keeps has none.
@@ -364,7 +367,11 @@ impl Node {
                         self.metrics.packets_received += 1;
                         match payload {
                             VersionedPayload::V1(payload) => self.process(&payload),
-                            VersionedPayload::V2(payload) => self.process_v2(&payload),
+                            VersionedPayload::V2(payload) => {
+                                // Direct messages are signed over the packet's nonce.
+                                let nonce = sealed_nonce(buf);
+                                self.process_v2(&payload, nonce.as_ref());
+                            }
                         }
                     }
                 }

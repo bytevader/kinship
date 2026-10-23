@@ -5,8 +5,8 @@ use core::net::{Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use kinship_proto::{
-    Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, PacketKind, Ping, UserBroadcast,
-    UserMessage,
+    Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, PacketKind, Ping, PingReq,
+    UserBroadcast, UserMessage,
 };
 
 use kinship_proto::identity::{Certificate, IdentityError};
@@ -255,13 +255,15 @@ impl Config {
                 fail("max_user_message", "must fit a max_stream_frame frame")
             };
         }
-        self.validate_signatures(room)
+        self.validate_signatures(room, frame)
     }
 
     /// Checks what mode `sign` needs that does not depend on the node: encryption, a certificate
     /// for the signing key from a trust anchor for this cluster, and room in a datagram for a
-    /// signed Alive behind its certificate. The node checks its name and its clock.
-    fn validate_signatures(&self, room: usize) -> Result<(), ConfigError> {
+    /// signed Alive behind its certificate, for a signed Alive or broadcast beside the largest
+    /// version 2 probe message, and in a frame for a signed direct message. The node checks its
+    /// name and its clock.
+    fn validate_signatures(&self, room: usize, frame: usize) -> Result<(), ConfigError> {
         let fail = |field, reason| Err(ConfigError { field, reason });
         let Some(c) = self.signatures.credentials() else {
             return Ok(());
@@ -291,7 +293,8 @@ impl Config {
             }
             Err(_) => return fail("certificate", "must be signed by one of trust_anchors"),
         }
-        if largest_signed_alive(self.limits.max_meta_bytes, room) > room {
+        let alive = largest_signed_alive(self.limits.max_meta_bytes, room);
+        if alive + LARGEST_CERTIFICATE > room {
             return if self.limits.udp_max_payload < Limits::DEFAULT_UDP_MAX_PAYLOAD {
                 fail(
                     "udp_max_payload",
@@ -301,6 +304,42 @@ impl Config {
                 fail(
                     "max_meta_bytes",
                     "must leave a signed Alive and its certificate that fit a datagram",
+                )
+            };
+        }
+        // A refutation rides the Ack of a version 2 round, as it rides a Ping's in version 1.
+        if largest_v2_probe() + alive > room {
+            return if self.limits.udp_max_payload < Limits::DEFAULT_UDP_MAX_PAYLOAD {
+                fail(
+                    "udp_max_payload",
+                    "must fit a signed Alive with max_meta_bytes of metadata beside a signed Ack",
+                )
+            } else {
+                fail(
+                    "max_meta_bytes",
+                    "must leave a signed Alive that fits a datagram beside a signed Ack",
+                )
+            };
+        }
+        // A signed broadcast goes behind its sender's certificate.
+        let broadcast = signed_len(largest_broadcast(self.max_user_broadcast, room));
+        if largest_v2_probe() + broadcast + LARGEST_CERTIFICATE > room {
+            return fail(
+                "max_user_broadcast",
+                "must fit a udp_max_payload datagram, signed and behind a certificate, beside \
+                 the largest Ping",
+            );
+        }
+        if signed_len(largest_user_message(self.max_user_message, frame)) > frame {
+            return if self.limits.max_stream_frame < Limits::DEFAULT_MAX_STREAM_FRAME {
+                fail(
+                    "max_stream_frame",
+                    "must fit a signed max_user_message message",
+                )
+            } else {
+                fail(
+                    "max_user_message",
+                    "must fit a max_stream_frame frame, signed",
                 )
             };
         }
@@ -368,9 +407,8 @@ fn largest_alive(max_meta: usize, cap: usize) -> usize {
     .encoded_len()
 }
 
-/// Encoded size of the largest signed Alive, in version 2, behind the largest certificate: a
-/// 64-byte name in both, an IPv6 address, an epoch and `max_meta` bytes of metadata, counted
-/// up to `cap` bytes of it.
+/// Encoded size of the largest signed Alive, in version 2: a 64-byte name, an IPv6 address, an
+/// epoch and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
 fn largest_signed_alive(max_meta: usize, cap: usize) -> usize {
     let name = longest_name();
     let meta = vec![0; max_meta.min(cap.saturating_add(1))];
@@ -387,7 +425,79 @@ fn largest_signed_alive(max_meta: usize, cap: usize) -> usize {
         certificate_id: [0; 8],
         signature: [0; 64],
     });
-    alive.encoded_len() + LARGEST_CERTIFICATE
+    alive.encoded_len()
+}
+
+/// Encoded size of the largest version 2 probe message, which a datagram's signed rumours and
+/// broadcasts ride beside: the largest of a relay's Ping, a PingReq, an Ack and a Nack, with
+/// 64-byte names and IPv6 addresses.
+fn largest_v2_probe() -> usize {
+    let name = longest_name();
+    let n = id(&name);
+    let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+    let challenge = v2::ProbeChallenge::default();
+    let (certificate_id, signature) = (Default::default(), [0; 64]);
+    let probes = [
+        v2::Message::Ping {
+            ping: Ping {
+                seq: u32::MAX,
+                target: n,
+                source: n,
+                source_addr: addr,
+            },
+            source_epoch: u64::MAX,
+            challenge,
+            requester: Some(v2::Probe {
+                requester: n,
+                epoch: u64::MAX,
+                seq: u32::MAX,
+            }),
+        },
+        v2::Message::PingReq {
+            request: PingReq {
+                seq: u32::MAX,
+                target: n,
+                target_addr: addr,
+                requester_addr: addr,
+                want_nack: true,
+            },
+            requester: n,
+            requester_epoch: u64::MAX,
+            challenge,
+        },
+        v2::Message::Ack {
+            seq: u32::MAX,
+            target_epoch: u64::MAX,
+            requester: n,
+            requester_epoch: u64::MAX,
+            target: n,
+            challenge,
+            certificate_id,
+            signature,
+        },
+        v2::Message::Nack {
+            seq: u32::MAX,
+            relay: n,
+            relay_epoch: u64::MAX,
+            requester: n,
+            requester_epoch: u64::MAX,
+            target: n,
+            challenge,
+            certificate_id,
+            signature,
+        },
+    ];
+    probes
+        .iter()
+        .map(v2::Message::encoded_len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// What a user message or broadcast of `len` encoded bytes takes signed: its certificate id
+/// and signature, and a byte more of length.
+fn signed_len(len: usize) -> usize {
+    len + 8 + 64 + 1
 }
 
 /// A certificate message for a 64-byte name: its type, a two-byte length, and a body of the

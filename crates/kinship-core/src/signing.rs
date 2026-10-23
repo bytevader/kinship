@@ -14,12 +14,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
 use kinship_proto::identity::{Certificate, CertificateId, PublicKey, Signature, SigningKey};
-use kinship_proto::v2::{self, RecordState, SignedAlive};
+use kinship_proto::v2::{self, ProbeChallenge, RecordState, SignedAlive};
 use kinship_proto::{Alive, Dead, Suspect};
 
 use crate::Node;
 use crate::broadcast::id;
 use crate::member::{Admission, Life, at_least, life, newer};
+use crate::rng::Nonces;
 use crate::time::Instant;
 
 /// How far a certificate's validity may be from this node's clock, on either side, in seconds.
@@ -197,10 +198,12 @@ pub(crate) struct Keys {
     pub deferred_len: usize,
     /// Checks this input may still spend on push-pull records.
     pub checks_left: usize,
+    /// Where the challenges of version 2 probe rounds come from.
+    challenges: Nonces,
 }
 
 impl Keys {
-    pub fn new(own: HeldCert, started: Instant, start_ms: u64) -> Self {
+    pub fn new(own: HeldCert, started: Instant, start_ms: u64, challenges: Nonces) -> Self {
         Self {
             own,
             started,
@@ -209,7 +212,20 @@ impl Keys {
             deferred: VecDeque::new(),
             deferred_len: 0,
             checks_left: CHECKS_PER_INPUT,
+            challenges,
         }
+    }
+
+    /// A fresh challenge for a version 2 probe round.
+    pub fn challenge(&mut self) -> ProbeChallenge {
+        let mut challenge = ProbeChallenge::default();
+        self.challenges.fill(&mut challenge);
+        challenge
+    }
+
+    /// The certificate held for member `name`, if it is valid at Unix second `now`.
+    pub fn current(&self, name: &str, now: u64) -> Option<&HeldCert> {
+        self.certs.get(name).filter(|c| c.is_current(now))
     }
 
     /// This node's estimate of Unix time in seconds: its epoch, the wall clock in milliseconds
@@ -311,8 +327,40 @@ impl Node {
     }
 
     fn sign(&self, msg: &v2::Message<'_>) -> Option<Signature> {
-        let bytes = msg.signed_bytes(self.cfg.cluster.as_bytes(), None).ok()?;
+        self.sign_bound(msg, None)
+    }
+
+    /// Signs `msg`, a direct user message over the `nonce` of the packet that carries it.
+    fn sign_bound(&self, msg: &v2::Message<'_>, nonce: Option<&[u8; 24]>) -> Option<Signature> {
+        let bytes = msg.signed_bytes(self.cfg.cluster.as_bytes(), nonce).ok()?;
         Some(self.signing_key()?.sign(&bytes))
+    }
+
+    /// `msg`, an Ack, Nack, UserMessage or UserBroadcast this node authors, under its own
+    /// certificate and signed; a direct message over the `nonce` of its packet. `None` in mode
+    /// `off`.
+    pub(crate) fn signed<'a>(
+        &self,
+        mut msg: v2::Message<'a>,
+        nonce: Option<&[u8; 24]>,
+    ) -> Option<v2::Message<'a>> {
+        let own = self.own_cert()?;
+        match &mut msg {
+            v2::Message::Ack { certificate_id, .. }
+            | v2::Message::Nack { certificate_id, .. }
+            | v2::Message::UserMessage { certificate_id, .. }
+            | v2::Message::UserBroadcast { certificate_id, .. } => *certificate_id = own,
+            _ => return None,
+        }
+        let sig = self.sign_bound(&msg, nonce)?;
+        match &mut msg {
+            v2::Message::Ack { signature, .. }
+            | v2::Message::Nack { signature, .. }
+            | v2::Message::UserMessage { signature, .. }
+            | v2::Message::UserBroadcast { signature, .. } => *signature = sig,
+            _ => {}
+        }
+        Some(msg)
     }
 
     /// The signature of this node's own Alive `a`, when it signs.
@@ -384,6 +432,19 @@ impl Node {
         cert: CertificateId,
         packet: &PacketCerts<'_>,
     ) -> Option<SignedBy> {
+        self.check_bound(msg, signer, cert, packet, None)
+    }
+
+    /// [`check`](Self::check), for a direct user message over the `nonce` of the packet it came
+    /// in.
+    pub(crate) fn check_bound(
+        &mut self,
+        msg: &v2::Message<'_>,
+        signer: &str,
+        cert: CertificateId,
+        packet: &PacketCerts<'_>,
+        nonce: Option<&[u8; 24]>,
+    ) -> Option<SignedBy> {
         let carried = packet.iter().any(|(id, _)| *id == cert);
         let anchors = &self.cfg.signatures.credentials()?.trust_anchors;
         let label = self.cfg.cluster.as_bytes();
@@ -411,7 +472,7 @@ impl Node {
         keys.checks_left = keys.checks_left.saturating_sub(1);
         let signature = msg.signature()?;
         let good = msg
-            .signed_bytes(label, None)
+            .signed_bytes(label, nonce)
             .is_ok_and(|bytes| key.verify(&bytes, signature).is_ok());
         if !good {
             self.metrics.signatures_invalid += 1;
@@ -531,16 +592,18 @@ impl Node {
         self.on_dead(now, &dead, Some(proof));
     }
 
-    /// Handles every message of an authenticated version 2 payload: the certificates it
-    /// carries, then its statements in order. Stage 2a sends no probe, user message or
-    /// revocation at version 2, and ignores those it receives.
-    pub(crate) fn process_v2(&mut self, payload: &v2::Payload<'_>) {
+    /// Handles every message of an authenticated version 2 payload sealed with `nonce`: the
+    /// certificates it carries, then its statements and probe messages in order, then its user
+    /// messages, so that an Alive in the packet introduces their sender. Revocations are
+    /// Stage 4, and ignored.
+    pub(crate) fn process_v2(&mut self, payload: &v2::Payload<'_>, nonce: Option<&[u8; 24]>) {
         let now = self.now;
         let mut budget = self.admission();
         let certs = packet_certs(payload.iter().filter_map(|m| match m {
             v2::Message::Certificate(c) => Some(c),
             _ => None,
         }));
+        let mut user = Vec::new();
         for msg in payload.iter() {
             match msg {
                 v2::Message::Alive(sa) => {
@@ -548,9 +611,19 @@ impl Node {
                 }
                 v2::Message::Suspect { .. } => self.on_signed_suspect(now, &msg, &certs),
                 v2::Message::Dead { .. } => self.on_signed_dead(now, &msg, &certs),
+                v2::Message::Ping { .. } => self.on_signed_ping(&msg),
+                v2::Message::PingReq { .. } => self.on_signed_ping_req(now, &msg),
+                v2::Message::Ack { .. } => {
+                    self.on_signed_ack(&msg, &certs);
+                }
+                v2::Message::Nack { .. } => self.on_signed_nack(&msg, &certs),
+                v2::Message::UserMessage { .. } | v2::Message::UserBroadcast { .. } => {
+                    user.push(msg);
+                }
                 _ => {}
             }
         }
+        self.on_signed_users(&user, &certs, nonce);
     }
 
     /// What a version 2 push-pull record needs: each record as the Alive or Left it carries,
@@ -838,6 +911,7 @@ pub(crate) fn signing_keys(
     cfg: &crate::Config,
     me: &crate::Identity,
     now: Instant,
+    nonce_key: &[u8; 32],
 ) -> Result<Keys, crate::ConfigError> {
     let fail = |field, reason| Err(crate::ConfigError { field, reason });
     if me.epoch() == 0 {
@@ -854,7 +928,8 @@ pub(crate) fn signing_keys(
     if cert.name().as_str() != me.name() {
         return fail("certificate", "must name this node");
     }
-    let keys = Keys::new(HeldCert::new(&cert), now, me.epoch());
+    let challenges = Nonces::challenges(nonce_key);
+    let keys = Keys::new(HeldCert::new(&cert), now, me.epoch(), challenges);
     let label = cfg.cluster.as_bytes();
     let anchors = &credentials.trust_anchors;
     match cert.verify(anchors, label, keys.unix_now(now), CERTIFICATE_SKEW_SECS) {
