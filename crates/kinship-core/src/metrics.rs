@@ -81,4 +81,10 @@ pub struct Metrics {
     /// under a certificate valid now. Unlike the counters above, a current count, which falls
     /// to 0 once every member signs; 0 in mode `off`.
     pub unsigned_members: u64,
+    /// Mode `sign`: statements this node signed: its Alives, accusations, Lefts, probe answers
+    /// and user messages.
+    pub signatures_made: u64,
+    /// Mode `sign`: Ed25519 signatures this node verified, good or bad: those of statements,
+    /// and the CA's on a certificate it did not hold yet. Each costs about 80 µs of a core.
+    pub signatures_checked: u64,
 }

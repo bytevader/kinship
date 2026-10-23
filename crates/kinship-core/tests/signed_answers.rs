@@ -10,7 +10,10 @@
 //! target's Ack byte for byte and a relay's forged Ack is refused, a TCP fallback round is
 //! answered with the round's own challenge, version 2 probe packets carry the signed rumours,
 //! and a direct message signed over its packet's nonce arrives, once however often its proof
-//! repeats in the packet.
+//! repeats in the packet. Last, three found by the 1,000-seed sweeps in mode `sign` (Stage
+//! 2c): an Ack to a relay's Ping goes behind the target's certificate, a later life heard of
+//! unsigned gets version 1 rounds, and a member back from the dead is relayed behind its
+//! certificate.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -1251,6 +1254,191 @@ fn direct_messages_and_broadcasts_between_signing_nodes() {
         );
         assert_eq!(m.user_messages_dropped, 0, "{m:?}");
     }
+}
+
+/// The messages of the version 2 datagrams `a` sent to `port`, each datagram's in order.
+fn v2_to(a: &Lone, port: u16) -> Vec<Vec<v2::Message<'static>>> {
+    a.sent
+        .iter()
+        .filter(|(to, _)| *to == addr(port))
+        .filter_map(|(_, p)| opened(p, PacketKind::Datagram).ok())
+        .map(|msgs| {
+            msgs.into_iter()
+                .map(|m| parse(Box::leak(m.into_boxed_slice())))
+                .collect()
+        })
+        .collect()
+}
+
+/// Found by the 1,000-seed sweeps in mode `sign`: a relay checks the target's Ack before it
+/// forwards it, and a relay the prober chose may not hold the target's certificate. The target
+/// answers a relay's Ping behind its own certificate, and a direct Ping without it.
+#[test]
+fn an_ack_to_a_relays_ping_goes_behind_the_targets_certificate() {
+    let mut a = Lone::new(&["c"], &[]);
+    // a's own first Alive, which carries its certificate, has been spread by now.
+    a.run(secs(10));
+    let ping = |requester: Option<v2::Probe<'static>>| v2::Message::Ping {
+        ping: kinship_proto::Ping {
+            seq: 7,
+            target: id("a"),
+            source: id("c"),
+            source_addr: addr(2),
+        },
+        source_epoch: EPOCH + 2,
+        challenge: drawn(0x7265_6c61),
+        requester,
+    };
+    let relayed = v2::Probe {
+        requester: id("b"),
+        epoch: EPOCH + 3,
+        seq: 41,
+    };
+    let head = |a: &mut Lone, msg| {
+        a.sent.clear();
+        a.v2(&[msg]);
+        let packets = v2_to(a, 2);
+        let acked = packets.into_iter().find(|p| {
+            p.iter()
+                .any(|m| matches!(m, v2::Message::Ack { challenge, .. } if *challenge == drawn(0x7265_6c61)))
+        });
+        acked.expect("a answered the Ping")
+    };
+    let to_relay = head(&mut a, ping(Some(relayed)));
+    let own = cert_id(&cert("a"));
+    assert!(
+        matches!(to_relay[0], v2::Message::Certificate(c) if c.id() == own),
+        "the certificate first"
+    );
+    assert!(matches!(
+        to_relay[1],
+        v2::Message::Ack { requester, seq: 41, .. } if requester.as_str() == "b"
+    ));
+    let direct = head(&mut a, ping(None));
+    assert!(
+        matches!(direct[0], v2::Message::Ack { seq: 7, .. }),
+        "the Ack first"
+    );
+}
+
+/// Found by the 1,000-seed sweeps in mode `sign`: a later life of a member, heard of unsigned,
+/// may sign under another key than the earlier one, whose certificate the node held. Rounds to
+/// it are version 1 until its own proof arrives, rather than version 2 rounds it can never
+/// answer in a way the node can check.
+#[test]
+fn a_later_life_heard_of_unsigned_is_probed_in_version_1() {
+    let mut a = Lone::new(&["b"], &[]);
+    a.until_sent(2, is_ping);
+    let later = EPOCH + 2 + 60_000;
+    a.v1(&[Message::Alive(Alive {
+        epoch: later,
+        ..alive("b", 2)
+    })]);
+    assert_eq!(a.node.member("b").unwrap().epoch, later, "the later life");
+    a.sent.clear();
+    let deadline = a.now + Duration::from_secs(10);
+    let first_ping = loop {
+        let ping = a.sent.iter().find_map(|(to, p)| {
+            if *to != addr(2) {
+                return None;
+            }
+            match opened(p, PacketKind::Datagram) {
+                Ok(msgs) => msgs.iter().any(|m| is_ping(&parse(m))).then_some(2),
+                Err(msgs) => msgs.iter().any(|m| m.starts_with("Ping")).then_some(1),
+            }
+        });
+        if let Some(version) = ping {
+            break version;
+        }
+        let t = a.node.poll_timeout().unwrap();
+        assert!(t <= deadline, "b was not probed");
+        a.now = a.now.max(t);
+        a.node.handle_timeout(a.now);
+        a.drain();
+    };
+    assert_eq!(first_ping, 1, "a version 1 round");
+    // The later life's own signed Alive, under its new key and certificate, brings version 2
+    // rounds back.
+    let key = SigningKey::from_bytes(drawn(seed_of("b") ^ 0x6c69_6665));
+    let c = Certificate::issue(
+        &ca(),
+        LABEL,
+        id("b"),
+        key.public_key(),
+        NOW - DAY,
+        NOW + DAY,
+    )
+    .unwrap()
+    .encode();
+    let unsigned = v2::Message::Alive(SignedAlive {
+        alive: Alive {
+            epoch: later,
+            ..alive("b", 2)
+        },
+        certificate_id: CertificateId::default(),
+        signature: [0; 64],
+    });
+    a.v2(&[certificate(&c), sign(unsigned, &c, &key, None)]);
+    assert_eq!(a.metrics().unsigned_members, 0);
+    a.until_sent(2, is_ping);
+    let m = a.metrics();
+    assert_eq!(
+        (m.signatures_invalid, m.certificates_refused),
+        (0, 0),
+        "{m:?}"
+    );
+}
+
+/// Found by the 1,000-seed sweeps in mode `sign`: a member back from the dead is new again to
+/// the nodes that reaped its tombstone, and they can check its Alive only behind its
+/// certificate, so the node that revives it relays the Alive behind the certificate.
+#[test]
+fn a_revived_members_alive_is_relayed_behind_its_certificate() {
+    let mut a = Lone::new(&["b", "c"], &[]);
+    a.run(secs(10));
+    a.v1(&[Message::Dead(kinship_proto::Dead {
+        inc: 0,
+        node: id("b"),
+        from: id("c"),
+        epoch: EPOCH + 2,
+    })]);
+    assert_eq!(a.state("b"), Some(State::Dead));
+    let refuted = v2::Message::Alive(SignedAlive {
+        alive: Alive {
+            inc: 1,
+            ..alive("b", 2)
+        },
+        certificate_id: CertificateId::default(),
+        signature: [0; 64],
+    });
+    // The refutation comes without the certificate, which a still holds with the tombstone.
+    a.sent.clear();
+    a.v2(&[sign(refuted, &cert("b"), &member_key("b"), None)]);
+    assert_eq!(a.state("b"), Some(State::Alive));
+    let deadline = a.now + Duration::from_secs(10);
+    let packet = loop {
+        let found = v2_to(&a, 3).into_iter().find(|p| {
+            p.iter()
+                .any(|m| matches!(m, v2::Message::Alive(sa) if sa.alive.node.as_str() == "b"))
+        });
+        if let Some(p) = found {
+            break p;
+        }
+        let t = a.node.poll_timeout().unwrap();
+        assert!(t <= deadline, "the Alive was not relayed to c");
+        a.now = a.now.max(t);
+        a.node.handle_timeout(a.now);
+        a.drain();
+    };
+    let at = packet
+        .iter()
+        .position(|m| matches!(m, v2::Message::Alive(sa) if sa.alive.node.as_str() == "b"))
+        .unwrap();
+    let theirs = cert_id(&cert("b"));
+    assert!(
+        at > 0 && matches!(packet[at - 1], v2::Message::Certificate(c) if c.id() == theirs),
+        "behind b's certificate"
+    );
 }
 
 #[test]

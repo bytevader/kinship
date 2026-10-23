@@ -317,7 +317,10 @@ impl Node {
                 }
             }
         }
-        let gossip = self.alive_gossip(a, signed.as_ref(), false);
+        // A member back from the dead is new again to the nodes that reaped its tombstone, which
+        // can check its Alive only behind its certificate.
+        let revived = matches!(was, State::Dead | State::Left);
+        let gossip = self.alive_gossip(a, signed.as_ref(), revived);
         self.broadcast(gossip);
         if !spoke_v2 && announces(signed.as_ref()) {
             self.announce_to(name);
@@ -342,6 +345,13 @@ impl Node {
         entry.vmax = a.vmax;
         entry.proof = signed.as_ref().map(|s| s.proof);
         let member = entry.member.clone();
+        if signed.is_none() {
+            // The certificate held is the earlier life's, and this life may sign under another
+            // key: rounds to it stay version 1 until its proof arrives.
+            if let Some(keys) = &mut self.keys {
+                keys.certs.remove(name);
+            }
+        }
         self.suspicions.remove(name);
         self.metrics.restarts += 1;
         if old.state.is_live() {

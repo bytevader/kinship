@@ -17,7 +17,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use kinship_proto::identity::CertificateId;
+use kinship_proto::identity::{Certificate, CertificateId};
 use kinship_proto::v2::{self, ProbeChallenge};
 use kinship_proto::{Dead, Message, Ping, PingReq, Suspect, WireVersion};
 
@@ -370,18 +370,34 @@ impl Node {
         self.signed(ack, None)
     }
 
-    /// Answers a version 2 Ping to this node with its signed Ack, with gossip.
+    /// Answers a version 2 Ping to this node with its signed Ack, with gossip. The Ack to a
+    /// relay's Ping goes behind this node's certificate: the relay checks the Ack before it
+    /// forwards it, and the prober that chose it could check the relay, not whether the relay
+    /// holds this node's certificate.
     pub(crate) fn on_signed_ping(&mut self, msg: &v2::Message<'_>) {
-        let v2::Message::Ping { ping, .. } = *msg else {
+        let v2::Message::Ping {
+            ping, requester, ..
+        } = *msg
+        else {
             return;
         };
         let me = self.local.member.name.clone();
         let Some(ack) = self.signed_ack(msg, &me) else {
             return;
         };
+        let cert = requester
+            .and(self.keys.as_ref())
+            .map(|k| k.own.bytes.clone());
+        let mut head: Vec<v2::Message<'_>> = cert
+            .as_deref()
+            .and_then(|c| Certificate::decode(c).ok())
+            .map(v2::Message::Certificate)
+            .into_iter()
+            .collect();
+        head.push(ack);
         let limit = self.retransmit_limit();
         let live = self.holds_live(ping.source.as_str());
-        self.send_to_v2(ping.source_addr, live, &[ack], Some(limit));
+        self.send_to_v2(ping.source_addr, live, &head, Some(limit));
     }
 
     /// Pings the target on the requester's behalf, unless this node knows the target left. In

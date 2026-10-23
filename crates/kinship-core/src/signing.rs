@@ -326,21 +326,23 @@ impl Node {
         self.keys.as_ref().map(|k| k.own.id)
     }
 
-    fn sign(&self, msg: &v2::Message<'_>) -> Option<Signature> {
+    fn sign(&mut self, msg: &v2::Message<'_>) -> Option<Signature> {
         self.sign_bound(msg, None)
     }
 
     /// Signs `msg`, a direct user message over the `nonce` of the packet that carries it.
-    fn sign_bound(&self, msg: &v2::Message<'_>, nonce: Option<&[u8; 24]>) -> Option<Signature> {
+    fn sign_bound(&mut self, msg: &v2::Message<'_>, nonce: Option<&[u8; 24]>) -> Option<Signature> {
         let bytes = msg.signed_bytes(self.cfg.cluster.as_bytes(), nonce).ok()?;
-        Some(self.signing_key()?.sign(&bytes))
+        let sig = self.signing_key()?.sign(&bytes);
+        self.metrics.signatures_made += 1;
+        Some(sig)
     }
 
     /// `msg`, an Ack, Nack, UserMessage or UserBroadcast this node authors, under its own
     /// certificate and signed; a direct message over the `nonce` of its packet. `None` in mode
     /// `off`.
     pub(crate) fn signed<'a>(
-        &self,
+        &mut self,
         mut msg: v2::Message<'a>,
         nonce: Option<&[u8; 24]>,
     ) -> Option<v2::Message<'a>> {
@@ -364,7 +366,7 @@ impl Node {
     }
 
     /// The signature of this node's own Alive `a`, when it signs.
-    pub(crate) fn sign_alive(&self, a: &Alive<'_>) -> Option<AliveProof> {
+    pub(crate) fn sign_alive(&mut self, a: &Alive<'_>) -> Option<AliveProof> {
         let mut proof = AliveProof {
             inc: a.inc,
             cert: self.own_cert()?,
@@ -375,7 +377,7 @@ impl Node {
     }
 
     /// The signature of a Suspect this node authors, stamped with its cluster time.
-    pub(crate) fn sign_suspect(&self, s: &Suspect<'_>) -> Option<AccusationProof> {
+    pub(crate) fn sign_suspect(&mut self, s: &Suspect<'_>) -> Option<AccusationProof> {
         let mut proof = AccusationProof {
             at: self.out.stamp,
             cert: self.own_cert()?,
@@ -386,7 +388,7 @@ impl Node {
     }
 
     /// The signature of a Dead this node authors, its own Left included.
-    pub(crate) fn sign_dead(&self, d: &Dead<'_>) -> Option<AccusationProof> {
+    pub(crate) fn sign_dead(&mut self, d: &Dead<'_>) -> Option<AccusationProof> {
         let mut proof = AccusationProof {
             at: self.out.stamp,
             cert: self.own_cert()?,
@@ -401,12 +403,16 @@ impl Node {
         if self.keys.is_none() {
             return;
         }
+        let (name, meta) = (
+            self.local.member.name.clone(),
+            self.local.member.meta.clone(),
+        );
         let me = &self.local;
         let a = Alive {
             inc: me.member.incarnation,
-            node: id(&me.member.name),
+            node: id(&name),
             addr: me.member.addr,
-            meta: &me.member.meta,
+            meta: &meta,
             vmin: me.vmin,
             vmax: me.vmax,
             epoch: me.member.epoch,
@@ -459,6 +465,7 @@ impl Node {
             None => {
                 let (_, c) = packet.iter().find(|(id, _)| *id == cert)?;
                 keys.checks_left = keys.checks_left.saturating_sub(1);
+                self.metrics.signatures_checked += 1;
                 if c.name().as_str() != signer
                     || c.verify(anchors, label, now, CERTIFICATE_SKEW_SECS)
                         .is_err()
@@ -471,6 +478,7 @@ impl Node {
         };
         keys.checks_left = keys.checks_left.saturating_sub(1);
         let signature = msg.signature()?;
+        self.metrics.signatures_checked += 1;
         let good = msg
             .signed_bytes(label, nonce)
             .is_ok_and(|bytes| key.verify(&bytes, signature).is_ok());
