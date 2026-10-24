@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG KINSHIP_INSTALL=pypi
-FROM rust:1.85.1-slim-bookworm AS rust
+FROM rust:1.87.0-slim-bookworm AS rust
 
 FROM python:3.13-slim AS builder
 COPY --from=rust /usr/local/cargo /usr/local/cargo

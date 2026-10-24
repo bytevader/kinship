@@ -47,7 +47,7 @@ uv run ruff check . && uv run ruff format --check .
 
 ## Working rules
 
-- Rust 1.85+, edition 2024. Python 3.11+, abi3 wheels plus free-threaded 3.14t.
+- Rust 1.87+, edition 2024. Python 3.11+, abi3 wheels plus free-threaded 3.14t.
 - Keep clippy (`-D warnings`), `cargo fmt` and `ruff format` clean.
 - Commits are authored as `bytevader` only, one-line message, no AI or Co-Authored-By trailers.
 - Branches use `feature/`, `fix/`, `chore/`, `docs/` or `test/` prefixes. Never push to `main`; Nikola opens PRs himself.

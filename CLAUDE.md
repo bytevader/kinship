@@ -36,6 +36,6 @@ target/release/chaos run --nodes 5            # Linux only, root through sudo -n
 
 ## Rules
 
-- Rust 1.85+, edition 2024. Python 3.11+, abi3 wheels plus free-threaded 3.14t (no abi3 there).
+- Rust 1.87+, edition 2024. Python 3.11+, abi3 wheels plus free-threaded 3.14t (no abi3 there).
 - Clippy runs with `-D warnings`; keep `cargo fmt` and `ruff format` clean.
 - Commit messages: one line, no body.
