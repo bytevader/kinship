@@ -496,7 +496,13 @@ fn stale(seed: u64, mode: Mode) -> Result<(Duration, u64), String> {
     })
     .is_none()
     {
-        return fail("the new life was not declared dead everywhere".into());
+        let views: Vec<String> = others()
+            .map(|o| format!("{} {:?}", name_of(o), held(&sim, o, VICTIM)))
+            .collect();
+        return fail(format!(
+            "the new life {new_epoch} was not declared dead everywhere: {}",
+            views.join(", ")
+        ));
     }
     let forged = sim.now();
     sim.apply(Action::Command {

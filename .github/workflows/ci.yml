@@ -177,8 +177,7 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test swim -- --ignored --nocapture
-
+      - run: cargo test --release -p kinship-sim --test swim -- --ignored --nocapture --skip _signed
   sim-sync:
     name: push-pull, join, leave and metadata, 1,000 seeds each
     runs-on: ubuntu-latest
@@ -195,7 +194,7 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test sync -- --ignored --nocapture
+      - run: cargo test --release -p kinship-sim --test sync -- --ignored --nocapture --skip _signed
 
   sim-keyring:
     name: key rotation, 1,000 seeds each
@@ -213,7 +212,7 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test keyring -- --ignored --nocapture
+      - run: cargo test --release -p kinship-sim --test keyring -- --ignored --nocapture --skip _signed
 
   sim-failure:
     name: restart, name conflict, clock jump and long partition, 1,000 seeds each
@@ -231,7 +230,7 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test failure -- --ignored --nocapture
+      - run: cargo test --release -p kinship-sim --test failure -- --ignored --nocapture --skip _signed
 
   sim-epoch:
     name: stale epochs and mixed versions, 1,000 seeds each
@@ -249,7 +248,7 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test epoch -- --ignored --nocapture
+      - run: cargo test --release -p kinship-sim --test epoch -- --ignored --nocapture --skip _signed
 
   sim-usermsg:
     name: user messages and broadcasts beside 0.3.0, 1,000 seeds
@@ -267,7 +266,34 @@ jobs:
           # Only main writes the cache, so a pull request cannot poison it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
-      - run: cargo test --release -p kinship-sim --test usermsg -- --ignored --nocapture
+      - run: cargo test --release -p kinship-sim --test usermsg -- --ignored --nocapture --skip _signed
+
+  # The same sweeps with every node in mode sign (KI-01 Stage 2c). Signing makes them about ten
+  # times slower than in mode off, so pull requests run a quarter of the seeds; the full 1,000
+  # run with KINSHIP_SEEDS unset, as docs/results/signed.md describes.
+  sim-signed:
+    name: ${{ matrix.test }} sweeps in mode sign, 250 seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [swim, sync, epoch, usermsg, failure, keyring]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
+      - run: cargo test --release -p kinship-sim --test ${{ matrix.test }} -- --ignored --nocapture _signed
+        env:
+          KINSHIP_SEEDS: "250"
 
   chaos:
     name: chaos, 5 nodes under tc netem and nftables
