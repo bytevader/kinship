@@ -361,6 +361,8 @@ Each stage is one or more pull requests that leave main releasable. Nothing chan
 - Identity in `Config` and `Identity`; the member table, the gossip queue and push-pull keep signatures and certificates; every authored statement is signed; every received signature is checked after precedence; certificates spread as in [Distribution](#recommendation-a-cluster-ca); per-recipient versions; the Ack and Nack bindings; the new counters `signatures_invalid`, `unsigned_members` and `certificates_refused`.
 - Tests: unit tests per message for a good signature, a bad one, a missing one in `sign`, the wrong signer and a revoked or expired certificate; the 1,000-seed sweeps (`swim`, `sync`, `epoch`, `usermsg`, `failure`, `keyring`) with every node in `sign`; a mixed cluster of the released 0.4 core and version 2 nodes in `sign`, in the simulator as `usermsg` runs 0.3 beside 0.4 today, converging and detecting crashes as an all-0.4 cluster does; the pinned SWIM trace unchanged in `off`, and a second pinned trace in `sign`, which deterministic signatures allow; a `signed` variant of the tuning sweep at 50, 200 and 1,000 nodes, reporting bandwidth, detection latency and false deaths against `lan()`.
 
+**Paused after Stage 2** (accepted on 2026-10-24, [Stage 2c decisions](ki01-stage2.md#decisions-stage-2c)). Stages 3 to 5 follow 1.0; first, push-pull is made cheaper in mode `off`, by scaling its interval with the cluster, and digest push-pull is designed.
+
 **Stage 3: mode `require`, and the accusation rules.**
 
 - Refusing unsigned statements and version 1 packets; third-party Deads as confirmations with the K + 1 shortcut; `at` on accusations; the first bad signature drops the rest of its packet.
@@ -385,7 +387,7 @@ Each stage is one or more pull requests that leave main releasable. Nothing chan
 1. Use a cluster CA to bind member names to signing keys.
 2. Treat a third party's Dead as a confirmation, with the proposed K + 1 signed-reporter shortcut. Validate it against the partition-heal fix during implementation.
 3. Sign Acks and preserve the target's signature through indirect probes.
-4. Accept the estimated 71% to 90% bandwidth increase for the opt-in mode; digest push-pull is not a prerequisite. Stage 2c measured 89% to 135% in settled clusters ([results](results/signed.md#recommendations)).
+4. Accept the estimated 71% to 90% bandwidth increase for the opt-in mode; digest push-pull is not a prerequisite. Stage 2c measured 89% to 135% in settled clusters, accepted on 2026-10-24 ([Stage 2c decisions](ki01-stage2.md#decisions-stage-2c)).
 5. Use wire version 2 with per-recipient negotiation.
 6. Accept replay of a departed member's last Alive until its certificate expires; periodic re-signing is not required by this plan.
 7. Ship as an opt-in feature in a 1.x minor release after 1.0.

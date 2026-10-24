@@ -121,6 +121,16 @@ Stage 2c measures mode `sign` and fixes what the measurements found. The numbers
 - **CI.** The sweeps in mode `sign` are about ten times slower than in `off` and do not fit the existing jobs: those skip them (`--skip _signed`), and a `sim-signed` job runs them, one job per file, at 250 seeds.
 - **Pinned traces.** The SWIM trace in `off` is unchanged. The trace in `sign` changed, to `0xd425_7421_477d_9eeb`: Acks to relays' Pings carry the target's certificate, version 1 Pings between signing nodes draw announcements, and announcements go four per gossip interval.
 
+### Decisions (Stage 2c)
+
+Accepted by Nikola on 2026-10-24, from [the results](results/signed.md#recommendations):
+
+1. The measured bandwidth, 89% to 135% more bytes per node in a settled cluster, is accepted for the opt-in mode, in place of the estimate of 71% to 90%.
+2. Push-pull is made cheaper for every cluster, in mode `off` first: its interval scales with the cluster as memberlist's does. Digest push-pull is designed next and built later; the second exchange of a mixed view does not call for it alone.
+3. The certificate ahead of every broadcast copy stays for now and is revisited later, by measuring broadcast reach without it now that a version 1 Ping draws an announcement.
+4. KI-01 pauses after Stage 2. Stages 3 to 5 follow 1.0, and the feature stays opt-in; KI-01 stays Accepted.
+5. RUSTSEC-2026-0385 in `ctutils` 0.4.2, which kinship-proto uses directly, is fixed by updating to 0.4.4, which raises the minimum Rust version to 1.87, in a change of its own.
+
 ### What remains
 
 - Stage 3: mode `require`, third-party Deads as confirmations with the K + 1 shortcut, `at` checked against the replay floor, and dropping the rest of a packet at its first bad signature.
