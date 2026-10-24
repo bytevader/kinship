@@ -28,7 +28,7 @@ The default image installs `kinship[fastapi]>=0.4` from PyPI on
 `python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
 `Ring.fence()`, new in 0.3, and user messages and the metrics endpoint, new in 0.4. To try
 changes in this checkout, build a release wheel from source, with maturin and
-Rust 1.85.1 in a separate build stage:
+Rust 1.87.0 in a separate build stage:
 
 ```sh
 KINSHIP_INSTALL=source docker compose up --build -d

@@ -48,7 +48,7 @@ cargo add kinship        # tokio runtime and Cluster handle
 cargo add kinship-core   # the sans-IO protocol state machine only
 ```
 
-The Rust crates need Rust 1.85 or later.
+The Rust crates need Rust 1.87 or later.
 
 ## Quickstart
 

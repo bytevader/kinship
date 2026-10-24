@@ -13,6 +13,14 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - **Experimental KI-01 Stage 2c: mode `sign` measured.** Every 1,000-seed simulator sweep has a twin with every node in mode `sign`, and all pass; CI runs them at 250 seeds in a `sim-signed` job. The sweeps found three bugs, now fixed in kinship-core: an Ack to a relay's Ping now goes behind the target's certificate, so a relay that lacks it can check and forward it; a later life heard of unsigned no longer keeps the earlier life's certificate, whose rounds it could not answer; and a member back from the dead is relayed behind its certificate. A node that lacked a member's certificate after a start from a static member list dropped that member's signed statements: a version 1 Ping from a member that speaks version 2 now draws an announcement, and announcements go at most four per gossip interval, the rest queued. New core counters `signatures_made` and `signatures_checked`. A signed variant of the tuning sweep and a cost harness, `crates/kinship-sim/tests/costs.rs`, measure what signing costs: detection latency and false deaths as in `off`, and the bytes in `docs/results/signed.md`. Mode `off` keeps the pinned SWIM trace; the pinned trace in `sign` changes. **KI-01 remains Accepted.**
 - **Compose demo messages.** Cache nodes hand moved keys to their new owner with `cluster.send` on Drain, Undrain and joins, so those keys stay warm, and a Flush action clears every reachable cache with `cluster.broadcast`. A handoff carries the time the sender's cache was last emptied and is refused by a node that applied a later flush, so a late batch cannot bring flushed values back while a restarted node still exchanges warm keys. See `deploy/compose/README.md`.
 
+### Changed
+
+- **Minimum Rust version 1.87**, from 1.85, for `ctutils` 0.4.5, which kinship-proto uses for constant-time comparisons. The Compose demo builds with Rust 1.87.0.
+
+### Security
+
+- **RUSTSEC-2026-0385.** `ctutils` 0.4.2 generated masks and compared `u128` values in time that could depend on the data; updated to 0.4.5.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added

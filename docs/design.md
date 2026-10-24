@@ -699,7 +699,7 @@ The open questions were settled on 2026-10-04 by the [README and API review](htt
 - AEAD: XChaCha20-Poly1305 only; the version byte leaves room for another.
 - `tcp_fallback_ping`: on in `lan()` and `wan()`, off in `local()`.
 - User broadcasts and compression: a future release; message types 0x09 to 0x7F stay reserved. User messages and broadcasts arrived in 0.4 as types 0x09 and 0x0A (User messages); compression is still to come, and 0x0B to 0x7F stay reserved.
-- MSRV: Rust 1.85 (edition 2024). Free-threaded wheels for CPython 3.14t only, no 3.13t.
+- MSRV: Rust 1.87 (edition 2024). Free-threaded wheels for CPython 3.14t only, no 3.13t.
 - Windows: supported in 0.1, wheels and CI included.
 
 **API changes agreed**
