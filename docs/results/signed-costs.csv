@@ -1,0 +1,313 @@
+cluster,mode,window,carrier,bytes_per_node_s
+100,off,burst,headers v1,105.3
+100,off,burst,probes v1,55.0
+100,off,burst,push-pull v1,596.0
+100,off,burst,rumours v1,222.9
+100,off,burst,total,979.2
+100,off,burst,signatures made,0.00
+100,off,burst,signatures checked,0.00
+100,off,burst,members held unsigned at the end,0
+100,off,steady,headers v1,115.9
+100,off,steady,probes v1,54.8
+100,off,steady,push-pull v1,598.2
+100,off,steady,rumours v1,20.5
+100,off,steady,total,789.4
+100,off,steady,signatures made,0.00
+100,off,steady,signatures checked,0.00
+100,off,steady,members held unsigned at the end,0
+100,sign,burst,announcements,9.8
+100,sign,burst,certificates ahead of Alives,462.1
+100,sign,burst,headers v1,0.6
+100,sign,burst,headers v2,137.5
+100,sign,burst,probes v1,0.0
+100,sign,burst,probes v2,221.0
+100,sign,burst,push-pull v1 between signing nodes,31.2
+100,sign,burst,push-pull v2,1107.1
+100,sign,burst,rumours v1,1.6
+100,sign,burst,rumours v2,676.6
+100,sign,burst,v1 datagrams beside a v2 one,1.7
+100,sign,burst,v1 datagrams to signing members,2.2
+100,sign,burst,total,2647.5
+100,sign,burst,signatures made,1.00
+100,sign,burst,signatures checked,1.09
+100,sign,burst,members held unsigned at the end,0
+100,sign,steady,headers v2,118.5
+100,sign,steady,probes v2,220.2
+100,sign,steady,push-pull v2,1113.8
+100,sign,steady,rumours v2,61.0
+100,sign,steady,total,1513.5
+100,sign,steady,signatures made,0.99
+100,sign,steady,signatures checked,1.01
+100,sign,steady,members held unsigned at the end,0
+100-mixed,off,burst,headers v1,105.3
+100-mixed,off,burst,probes v1,55.0
+100-mixed,off,burst,push-pull v1,596.0
+100-mixed,off,burst,rumours v1,222.9
+100-mixed,off,burst,total,979.2
+100-mixed,off,burst,signatures made,0.00
+100-mixed,off,burst,signatures checked,0.00
+100-mixed,off,burst,members held unsigned at the end,0
+100-mixed,off,steady,headers v1,120.5
+100-mixed,off,steady,probes v1,54.9
+100-mixed,off,steady,push-pull v1,598.2
+100-mixed,off,steady,rumours v1,25.7
+100-mixed,off,steady,total,799.3
+100-mixed,off,steady,signatures made,0.00
+100-mixed,off,steady,signatures checked,0.00
+100-mixed,off,steady,members held unsigned at the end,0
+100-mixed,sign,burst,announcements,1.8
+100-mixed,sign,burst,certificates ahead of Alives,249.8
+100-mixed,sign,burst,headers v1,24.3
+100-mixed,sign,burst,headers v2,100.7
+100-mixed,sign,burst,probes v1,10.5
+100-mixed,sign,burst,probes v2,178.7
+100-mixed,sign,burst,push-pull v1,126.2
+100-mixed,sign,burst,push-pull v1 between signing nodes,469.8
+100-mixed,sign,burst,push-pull v2,786.0
+100-mixed,sign,burst,rumours v1,104.3
+100-mixed,sign,burst,rumours v2,365.6
+100-mixed,sign,burst,v1 datagrams beside a v2 one,11.2
+100-mixed,sign,burst,v1 datagrams to signing members,11.3
+100-mixed,sign,burst,total,2417.7
+100-mixed,sign,burst,signatures made,0.81
+100-mixed,sign,burst,signatures checked,0.87
+100-mixed,sign,burst,members held unsigned at the end,900
+100-mixed,sign,steady,headers v1,31.2
+100-mixed,sign,steady,headers v2,91.4
+100-mixed,sign,steady,probes v1,10.5
+100-mixed,sign,steady,probes v2,178.5
+100-mixed,sign,steady,push-pull v1,109.4
+100-mixed,sign,steady,push-pull v1 between signing nodes,489.8
+100-mixed,sign,steady,push-pull v2,819.8
+100-mixed,sign,steady,rumours v1,13.3
+100-mixed,sign,steady,rumours v2,36.3
+100-mixed,sign,steady,v1 datagrams beside a v2 one,1.4
+100-mixed,sign,steady,v1 datagrams to signing members,15.9
+100-mixed,sign,steady,total,1780.2
+100-mixed,sign,steady,signatures made,0.80
+100-mixed,sign,steady,signatures checked,0.82
+100-mixed,sign,steady,members held unsigned at the end,890
+100-seed1,off,burst,headers v1,105.1
+100-seed1,off,burst,probes v1,55.0
+100-seed1,off,burst,push-pull v1,605.9
+100-seed1,off,burst,rumours v1,213.3
+100-seed1,off,burst,total,979.3
+100-seed1,off,burst,signatures made,0.00
+100-seed1,off,burst,signatures checked,0.00
+100-seed1,off,burst,members held unsigned at the end,0
+100-seed1,off,steady,headers v1,112.7
+100-seed1,off,steady,probes v1,54.8
+100-seed1,off,steady,push-pull v1,599.2
+100-seed1,off,steady,rumours v1,17.0
+100-seed1,off,steady,total,783.8
+100-seed1,off,steady,signatures made,0.00
+100-seed1,off,steady,signatures checked,0.00
+100-seed1,off,steady,members held unsigned at the end,0
+100-seed1,sign,burst,announcements,14.2
+100-seed1,sign,burst,certificates ahead of Alives,459.1
+100-seed1,sign,burst,headers v1,1.0
+100-seed1,sign,burst,headers v2,137.0
+100-seed1,sign,burst,probes v2,221.0
+100-seed1,sign,burst,push-pull v1 between signing nodes,43.7
+100-seed1,sign,burst,push-pull v2,1125.3
+100-seed1,sign,burst,rumours v1,2.9
+100-seed1,sign,burst,rumours v2,663.2
+100-seed1,sign,burst,v1 datagrams beside a v2 one,3.2
+100-seed1,sign,burst,v1 datagrams to signing members,3.8
+100-seed1,sign,burst,total,2667.4
+100-seed1,sign,burst,signatures made,1.00
+100-seed1,sign,burst,signatures checked,1.13
+100-seed1,sign,burst,members held unsigned at the end,0
+100-seed1,sign,steady,headers v2,121.1
+100-seed1,sign,steady,probes v2,220.3
+100-seed1,sign,steady,push-pull v2,1113.6
+100-seed1,sign,steady,rumours v2,68.8
+100-seed1,sign,steady,total,1523.9
+100-seed1,sign,steady,signatures made,0.99
+100-seed1,sign,steady,signatures checked,1.02
+100-seed1,sign,steady,members held unsigned at the end,0
+100-stress,off,burst,TCP probes,3.4
+100-stress,off,burst,headers v1,496.4
+100-stress,off,burst,probes v1,63.6
+100-stress,off,burst,push-pull v1,596.0
+100-stress,off,burst,rumours v1,762.9
+100-stress,off,burst,total,1922.2
+100-stress,off,burst,signatures made,0.00
+100-stress,off,burst,signatures checked,0.00
+100-stress,off,burst,members held unsigned at the end,0
+100-stress,off,steady,TCP probes,3.0
+100-stress,off,steady,headers v1,475.8
+100-stress,off,steady,probes v1,62.9
+100-stress,off,steady,push-pull v1,599.2
+100-stress,off,steady,rumours v1,524.8
+100-stress,off,steady,total,1665.8
+100-stress,off,steady,signatures made,0.00
+100-stress,off,steady,signatures checked,0.00
+100-stress,off,steady,members held unsigned at the end,0
+100-stress,sign,burst,TCP probes,6.2
+100-stress,sign,burst,announcements,11.3
+100-stress,sign,burst,certificates ahead of Acks,12.8
+100-stress,sign,burst,certificates ahead of Alives,521.7
+100-stress,sign,burst,headers v1,1.9
+100-stress,sign,burst,headers v2,525.6
+100-stress,sign,burst,probes v1,0.0
+100-stress,sign,burst,probes v2,259.5
+100-stress,sign,burst,push-pull v1 between signing nodes,26.2
+100-stress,sign,burst,push-pull v2,1107.2
+100-stress,sign,burst,rumours v1,5.1
+100-stress,sign,burst,rumours v2,1933.9
+100-stress,sign,burst,v1 datagrams beside a v2 one,6.6
+100-stress,sign,burst,v1 datagrams to signing members,7.0
+100-stress,sign,burst,total,4411.5
+100-stress,sign,burst,signatures made,1.14
+100-stress,sign,burst,signatures checked,2.13
+100-stress,sign,burst,members held unsigned at the end,0
+100-stress,sign,steady,TCP probes,5.6
+100-stress,sign,steady,certificates ahead of Acks,11.8
+100-stress,sign,steady,certificates ahead of Alives,3.1
+100-stress,sign,steady,headers v1,0.0
+100-stress,sign,steady,headers v2,499.5
+100-stress,sign,steady,probes v2,255.4
+100-stress,sign,steady,push-pull v2,1113.9
+100-stress,sign,steady,rumours v1,0.0
+100-stress,sign,steady,rumours v2,1256.6
+100-stress,sign,steady,v1 datagrams to signing members,0.0
+100-stress,sign,steady,total,3145.9
+100-stress,sign,steady,signatures made,1.12
+100-stress,sign,steady,signatures checked,2.04
+100-stress,sign,steady,members held unsigned at the end,0
+100-users,off,burst,headers v1,105.3
+100-users,off,burst,probes v1,55.0
+100-users,off,burst,push-pull v1,596.0
+100-users,off,burst,rumours v1,222.9
+100-users,off,burst,total,979.2
+100-users,off,burst,signatures made,0.00
+100-users,off,burst,signatures checked,0.00
+100-users,off,burst,members held unsigned at the end,0
+100-users,off,steady,headers v1,810.9
+100-users,off,steady,probes v1,54.9
+100-users,off,steady,push-pull v1,599.2
+100-users,off,steady,rumours v1,24.6
+100-users,off,steady,user messages v1,6473.2
+100-users,off,steady,total,7962.8
+100-users,off,steady,signatures made,0.00
+100-users,off,steady,signatures checked,0.00
+100-users,off,steady,members held unsigned at the end,0
+100-users,sign,burst,announcements,9.8
+100-users,sign,burst,certificates ahead of Alives,462.1
+100-users,sign,burst,headers v1,0.6
+100-users,sign,burst,headers v2,137.5
+100-users,sign,burst,probes v1,0.0
+100-users,sign,burst,probes v2,221.0
+100-users,sign,burst,push-pull v1 between signing nodes,31.2
+100-users,sign,burst,push-pull v2,1107.1
+100-users,sign,burst,rumours v1,1.6
+100-users,sign,burst,rumours v2,676.6
+100-users,sign,burst,v1 datagrams beside a v2 one,1.7
+100-users,sign,burst,v1 datagrams to signing members,2.2
+100-users,sign,burst,total,2647.5
+100-users,sign,burst,signatures made,1.00
+100-users,sign,burst,signatures checked,1.09
+100-users,sign,burst,members held unsigned at the end,0
+100-users,sign,steady,certificates ahead of user messages,10088.0
+100-users,sign,steady,headers v2,830.8
+100-users,sign,steady,probes v2,220.2
+100-users,sign,steady,push-pull v2,1111.9
+100-users,sign,steady,rumours v2,49.0
+100-users,sign,steady,user messages v2,9330.9
+100-users,sign,steady,total,21630.7
+100-users,sign,steady,signatures made,1.18
+100-users,sign,steady,signatures checked,10.54
+100-users,sign,steady,members held unsigned at the end,0
+1000,off,burst,headers v1,399.6
+1000,off,burst,probes v1,55.0
+1000,off,burst,push-pull v1,6001.9
+1000,off,burst,rumours v1,9337.8
+1000,off,burst,total,15794.3
+1000,off,burst,signatures made,0.00
+1000,off,burst,signatures checked,0.00
+1000,off,burst,members held unsigned at the end,0
+1000,off,steady,headers v1,135.2
+1000,off,steady,probes v1,55.0
+1000,off,steady,push-pull v1,5999.4
+1000,off,steady,rumours v1,42.7
+1000,off,steady,total,6232.4
+1000,off,steady,signatures made,0.00
+1000,off,steady,signatures checked,0.00
+1000,off,steady,members held unsigned at the end,0
+1000,sign,burst,announcements,2236.0
+1000,sign,burst,certificates ahead of Alives,9846.4
+1000,sign,burst,headers v1,99.2
+1000,sign,burst,headers v2,819.8
+1000,sign,burst,probes v1,3.0
+1000,sign,burst,probes v2,208.8
+1000,sign,burst,push-pull v1 between signing nodes,1771.2
+1000,sign,burst,push-pull v2,10633.5
+1000,sign,burst,rumours v1,2688.4
+1000,sign,burst,rumours v2,10883.6
+1000,sign,burst,v1 datagrams beside a v2 one,2648.5
+1000,sign,burst,v1 datagrams to signing members,2790.6
+1000,sign,burst,total,39189.9
+1000,sign,burst,signatures made,0.94
+1000,sign,burst,signatures checked,12.93
+1000,sign,burst,members held unsigned at the end,0
+1000,sign,steady,certificates ahead of Alives,806.2
+1000,sign,steady,headers v2,194.7
+1000,sign,steady,probes v2,221.0
+1000,sign,steady,push-pull v2,11130.3
+1000,sign,steady,rumours v2,1000.9
+1000,sign,steady,total,13353.1
+1000,sign,steady,signatures made,1.00
+1000,sign,steady,signatures checked,1.07
+1000,sign,steady,members held unsigned at the end,0
+1000-stress,off,burst,TCP probes,3.1
+1000-stress,off,burst,headers v1,849.0
+1000-stress,off,burst,probes v1,63.2
+1000-stress,off,burst,push-pull v1,5999.1
+1000-stress,off,burst,rumours v1,14499.1
+1000-stress,off,burst,total,21413.5
+1000-stress,off,burst,signatures made,0.00
+1000-stress,off,burst,signatures checked,0.00
+1000-stress,off,burst,members held unsigned at the end,0
+1000-stress,off,steady,TCP probes,3.2
+1000-stress,off,steady,headers v1,848.7
+1000-stress,off,steady,probes v1,63.4
+1000-stress,off,steady,push-pull v1,5998.5
+1000-stress,off,steady,rumours v1,5768.7
+1000-stress,off,steady,total,12682.5
+1000-stress,off,steady,signatures made,0.00
+1000-stress,off,steady,signatures checked,0.00
+1000-stress,off,steady,members held unsigned at the end,0
+1000-stress,sign,burst,TCP probes,6.2
+1000-stress,sign,burst,announcements,2237.4
+1000-stress,sign,burst,certificates ahead of Acks,12.2
+1000-stress,sign,burst,certificates ahead of Alives,6339.4
+1000-stress,sign,burst,headers v1,114.4
+1000-stress,sign,burst,headers v2,843.7
+1000-stress,sign,burst,probes v1,3.8
+1000-stress,sign,burst,probes v2,244.3
+1000-stress,sign,burst,push-pull v1 between signing nodes,1964.8
+1000-stress,sign,burst,push-pull v2,10570.4
+1000-stress,sign,burst,rumours v1,2881.2
+1000-stress,sign,burst,rumours v2,15596.7
+1000-stress,sign,burst,v1 datagrams beside a v2 one,2842.5
+1000-stress,sign,burst,v1 datagrams to signing members,2999.4
+1000-stress,sign,burst,total,40814.7
+1000-stress,sign,burst,signatures made,1.08
+1000-stress,sign,burst,signatures checked,21.07
+1000-stress,sign,burst,members held unsigned at the end,0
+1000-stress,sign,steady,TCP probes,6.3
+1000-stress,sign,steady,certificates ahead of Acks,12.9
+1000-stress,sign,steady,certificates ahead of Alives,2664.7
+1000-stress,sign,steady,headers v1,0.4
+1000-stress,sign,steady,headers v2,848.2
+1000-stress,sign,steady,probes v2,259.4
+1000-stress,sign,steady,push-pull v2,11134.6
+1000-stress,sign,steady,rumours v1,0.4
+1000-stress,sign,steady,rumours v2,14937.3
+1000-stress,sign,steady,v1 datagrams beside a v2 one,0.8
+1000-stress,sign,steady,v1 datagrams to signing members,0.8
+1000-stress,sign,steady,total,29864.0
+1000-stress,sign,steady,signatures made,1.14
+1000-stress,sign,steady,signatures checked,9.79
+1000-stress,sign,steady,members held unsigned at the end,0
