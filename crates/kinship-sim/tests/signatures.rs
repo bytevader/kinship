@@ -661,6 +661,10 @@ fn sign_trace_is_pinned_across_platforms() {
     // when the protocol, the codec, signing or the simulator changes on purpose. Stage 2b
     // changed it: rounds to members held signed are version 2, with challenges and signed Acks
     // and Nacks, and their packets carry the signed rumours that went in a second datagram.
+    // Stage 2c changed it again: an Ack to a relay's Ping goes behind the target's certificate,
+    // a version 1 Ping from a member that speaks version 2 draws an announcement, and
+    // announcements go at most four per gossip interval, so the static list's members, which
+    // every node learns at once, are announced to over the first few intervals.
     let seed = 1;
     let scenario = Scenario::new(10)
         .link(LinkConfig::lan().with_loss(0.02))
@@ -693,5 +697,5 @@ fn sign_trace_is_pinned_across_platforms() {
             "n{i}: {m:?}"
         );
     }
-    assert_eq!(digest, 0x5a25_2ea5_b273_8cd7, "trace digest changed");
+    assert_eq!(digest, 0xd425_7421_477d_9eeb, "trace digest changed");
 }

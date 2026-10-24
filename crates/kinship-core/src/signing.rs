@@ -10,7 +10,7 @@
 //! check. Push-pull records spend at most [`CHECKS_PER_INPUT`] checks per input, and what is
 //! left of a large frame waits, copied out of it, for the inputs that follow.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 
 use kinship_proto::identity::{Certificate, CertificateId, PublicKey, Signature, SigningKey};
@@ -30,6 +30,12 @@ pub const CERTIFICATE_SKEW_SECS: u64 = 300;
 /// Signature checks one input may spend on push-pull records, about 5 ms at the 82 µs a check
 /// took on the laptop of the plan's measurements.
 pub(crate) const CHECKS_PER_INPUT: usize = 64;
+
+/// Announcements a node sends per gossip interval; the rest wait in a queue for the next
+/// intervals (`docs/ki01-stage2.md`, Implementation (Stage 2c)). A node that learns many
+/// members at once, such as one that joins through a version 1 exchange, would otherwise send
+/// one datagram to each of them in the same instant.
+pub(crate) const ANNOUNCEMENTS_PER_TICK: usize = 4;
 
 /// Whether this node has a member identity (KI-01), and what it does with it. Experimental:
 /// the feature is planned for an opt-in release after 1.0.
@@ -200,6 +206,11 @@ pub(crate) struct Keys {
     pub checks_left: usize,
     /// Where the challenges of version 2 probe rounds come from.
     challenges: Nonces,
+    /// Announcements this gossip interval may still send, and the members waiting for one, in
+    /// order and as a set.
+    pub announce_budget: usize,
+    pub announce_queue: VecDeque<String>,
+    pub announce_waiting: BTreeSet<String>,
 }
 
 impl Keys {
@@ -213,6 +224,9 @@ impl Keys {
             deferred_len: 0,
             checks_left: CHECKS_PER_INPUT,
             challenges,
+            announce_budget: ANNOUNCEMENTS_PER_TICK,
+            announce_queue: VecDeque::new(),
+            announce_waiting: BTreeSet::new(),
         }
     }
 
@@ -326,21 +340,23 @@ impl Node {
         self.keys.as_ref().map(|k| k.own.id)
     }
 
-    fn sign(&self, msg: &v2::Message<'_>) -> Option<Signature> {
+    fn sign(&mut self, msg: &v2::Message<'_>) -> Option<Signature> {
         self.sign_bound(msg, None)
     }
 
     /// Signs `msg`, a direct user message over the `nonce` of the packet that carries it.
-    fn sign_bound(&self, msg: &v2::Message<'_>, nonce: Option<&[u8; 24]>) -> Option<Signature> {
+    fn sign_bound(&mut self, msg: &v2::Message<'_>, nonce: Option<&[u8; 24]>) -> Option<Signature> {
         let bytes = msg.signed_bytes(self.cfg.cluster.as_bytes(), nonce).ok()?;
-        Some(self.signing_key()?.sign(&bytes))
+        let sig = self.signing_key()?.sign(&bytes);
+        self.metrics.signatures_made += 1;
+        Some(sig)
     }
 
     /// `msg`, an Ack, Nack, UserMessage or UserBroadcast this node authors, under its own
     /// certificate and signed; a direct message over the `nonce` of its packet. `None` in mode
     /// `off`.
     pub(crate) fn signed<'a>(
-        &self,
+        &mut self,
         mut msg: v2::Message<'a>,
         nonce: Option<&[u8; 24]>,
     ) -> Option<v2::Message<'a>> {
@@ -364,7 +380,7 @@ impl Node {
     }
 
     /// The signature of this node's own Alive `a`, when it signs.
-    pub(crate) fn sign_alive(&self, a: &Alive<'_>) -> Option<AliveProof> {
+    pub(crate) fn sign_alive(&mut self, a: &Alive<'_>) -> Option<AliveProof> {
         let mut proof = AliveProof {
             inc: a.inc,
             cert: self.own_cert()?,
@@ -375,7 +391,7 @@ impl Node {
     }
 
     /// The signature of a Suspect this node authors, stamped with its cluster time.
-    pub(crate) fn sign_suspect(&self, s: &Suspect<'_>) -> Option<AccusationProof> {
+    pub(crate) fn sign_suspect(&mut self, s: &Suspect<'_>) -> Option<AccusationProof> {
         let mut proof = AccusationProof {
             at: self.out.stamp,
             cert: self.own_cert()?,
@@ -386,7 +402,7 @@ impl Node {
     }
 
     /// The signature of a Dead this node authors, its own Left included.
-    pub(crate) fn sign_dead(&self, d: &Dead<'_>) -> Option<AccusationProof> {
+    pub(crate) fn sign_dead(&mut self, d: &Dead<'_>) -> Option<AccusationProof> {
         let mut proof = AccusationProof {
             at: self.out.stamp,
             cert: self.own_cert()?,
@@ -401,12 +417,16 @@ impl Node {
         if self.keys.is_none() {
             return;
         }
+        let (name, meta) = (
+            self.local.member.name.clone(),
+            self.local.member.meta.clone(),
+        );
         let me = &self.local;
         let a = Alive {
             inc: me.member.incarnation,
-            node: id(&me.member.name),
+            node: id(&name),
             addr: me.member.addr,
-            meta: &me.member.meta,
+            meta: &meta,
             vmin: me.vmin,
             vmax: me.vmax,
             epoch: me.member.epoch,
@@ -459,6 +479,7 @@ impl Node {
             None => {
                 let (_, c) = packet.iter().find(|(id, _)| *id == cert)?;
                 keys.checks_left = keys.checks_left.saturating_sub(1);
+                self.metrics.signatures_checked += 1;
                 if c.name().as_str() != signer
                     || c.verify(anchors, label, now, CERTIFICATE_SKEW_SECS)
                         .is_err()
@@ -471,6 +492,7 @@ impl Node {
         };
         keys.checks_left = keys.checks_left.saturating_sub(1);
         let signature = msg.signature()?;
+        self.metrics.signatures_checked += 1;
         let good = msg
             .signed_bytes(label, nonce)
             .is_ok_and(|bytes| key.verify(&bytes, signature).is_ok());
@@ -943,23 +965,80 @@ impl Node {
     /// node learns that it speaks version 2: when it is new, starts a new life, or advertises
     /// version 2 where it did not. A member that heard of this node first in a version 1
     /// packet, a static member list or a 0.4 relay holds it unsigned until then.
+    ///
+    /// At most [`ANNOUNCEMENTS_PER_TICK`] go per gossip interval; the rest wait, one per member,
+    /// for the next intervals, and are sent if the member still speaks version 2 then.
     pub(crate) fn announce_to(&mut self, name: &str) {
-        if self.keys.is_none() || self.has_left() {
+        if self.has_left() {
             return;
         }
-        let Some(to) = self.table.get(name).map(|e| e.member.addr) else {
+        let Some(keys) = self.keys.as_mut() else {
             return;
         };
-        if self.version_for(Some(name), to) != kinship_proto::WireVersion::V2 {
+        if keys.announce_waiting.contains(name) {
             return;
+        }
+        if keys.announce_budget == 0 {
+            keys.announce_waiting.insert(name.to_owned());
+            keys.announce_queue.push_back(name.to_owned());
+            return;
+        }
+        if self.announce_now(name) {
+            if let Some(keys) = self.keys.as_mut() {
+                keys.announce_budget -= 1;
+            }
+        }
+    }
+
+    /// Starts a gossip interval's budget of announcements, and sends those waiting that fit it.
+    pub(crate) fn announcement_tick(&mut self) {
+        let Some(keys) = self.keys.as_mut() else {
+            return;
+        };
+        keys.announce_budget = ANNOUNCEMENTS_PER_TICK;
+        while self.keys.as_ref().is_some_and(|k| k.announce_budget > 0) {
+            let Some(keys) = self.keys.as_mut() else {
+                return;
+            };
+            let Some(name) = keys.announce_queue.pop_front() else {
+                return;
+            };
+            keys.announce_waiting.remove(&name);
+            if self.announce_now(&name) {
+                if let Some(keys) = self.keys.as_mut() {
+                    keys.announce_budget -= 1;
+                }
+            }
+        }
+    }
+
+    /// Whether announcements wait for the next gossip interval.
+    pub(crate) fn announcements_wait(&self) -> bool {
+        self.keys
+            .as_ref()
+            .is_some_and(|k| !k.announce_queue.is_empty())
+    }
+
+    /// Sends the announcement to `name` now, if this node still holds it as a member that speaks
+    /// version 2. Returns whether it went.
+    fn announce_now(&mut self, name: &str) -> bool {
+        if self.has_left() {
+            return false;
+        }
+        let Some(to) = self.table.get(name).map(|e| e.member.addr) else {
+            return false;
+        };
+        if self.version_for(Some(name), to) != kinship_proto::WireVersion::V2 {
+            return false;
         }
         let gossip = self.local_alive_announced();
         let Some((cert, alive)) = gossip.signed() else {
-            return;
+            return false;
         };
         let mut msgs: Vec<v2::Message<'_>> =
             cert.map(v2::Message::Certificate).into_iter().collect();
         msgs.push(alive);
         self.out.send_signed(to, &msgs);
+        true
     }
 }

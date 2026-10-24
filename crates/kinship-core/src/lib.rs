@@ -411,6 +411,7 @@ impl Node {
         self.suspicion_timers(now);
         self.sync_timers(now);
         if now >= self.next_gossip {
+            self.announcement_tick();
             self.gossip(now);
             let interval = self.cfg.gossip_interval;
             let missed = (now - self.next_gossip).as_nanos() / interval.as_nanos();
@@ -524,7 +525,8 @@ impl Node {
         if let Some(s) = self.sync_deadline() {
             t = t.min(s);
         }
-        if !self.out.broadcasts.is_empty() || !self.out.user.is_empty() {
+        if !self.out.broadcasts.is_empty() || !self.out.user.is_empty() || self.announcements_wait()
+        {
             t = t.min(self.next_gossip);
         }
         if self.has_deferred() {
