@@ -330,6 +330,13 @@ impl Node {
         let live = self.holds_live(ping.source.as_str());
         let source = Some(ping.source.as_str());
         self.send_to(ping.source_addr, live, source, &[ack], Some(limit));
+        // A version 1 round from a member that speaks version 2 says it holds this node without
+        // a current certificate: as a static member list or a 0.4 relay left it, or past a lost
+        // announcement. The announcement brings it the certificate, and with it the statements
+        // this node signs.
+        if self.version_for(source, ping.source_addr) == WireVersion::V2 {
+            self.announce_to(ping.source.as_str());
+        }
     }
 
     /// The signed Ack that answers the version 2 Ping `msg` to this node: over the original

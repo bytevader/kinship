@@ -1441,6 +1441,79 @@ fn a_revived_members_alive_is_relayed_behind_its_certificate() {
     );
 }
 
+/// The announcements in `a`'s datagrams, as the ports they went to: version 2 datagrams of
+/// a's certificate and a's own Alive alone.
+fn announcements(a: &Lone) -> Vec<u16> {
+    let own = cert_id(&cert("a"));
+    a.sent
+        .iter()
+        .filter(|(_, p)| {
+            opened(p, PacketKind::Datagram).is_ok_and(|msgs| {
+                let msgs: Vec<v2::Message<'_>> = msgs.iter().map(|m| parse(m)).collect();
+                matches!(&msgs[..], [v2::Message::Certificate(c), v2::Message::Alive(sa)]
+                    if c.id() == own && sa.alive.node.as_str() == "a")
+            })
+        })
+        .map(|(to, _)| to.port())
+        .collect()
+}
+
+/// A node that learns many members that speak version 2 at once, as from a join's version 1
+/// exchange, announces itself to a few of them per gossip interval and to the rest in the
+/// intervals that follow, each once.
+#[test]
+fn announcements_go_a_few_per_gossip_interval() {
+    // By then a's own first Alive, behind its certificate, has been spread to b, and no gossip
+    // looks like an announcement.
+    let mut a = Lone::new(&["b"], &[]);
+    a.run(secs(10));
+    a.sent.clear();
+    let names: Vec<String> = (0..10).map(|i| format!("x{i}")).collect();
+    let alives: Vec<Message<'_>> = names
+        .iter()
+        .zip(20u16..)
+        .map(|(name, port)| Message::Alive(alive(name, port)))
+        .collect();
+    a.v1(&alives);
+    let first = announcements(&a).len();
+    assert!(first <= 4, "{first} at once");
+    let gossip = a.node.config().gossip_interval;
+    a.run(a.now + gossip * 4);
+    let mut ports = announcements(&a);
+    ports.sort_unstable();
+    assert_eq!(ports, (20u16..30).collect::<Vec<_>>(), "each once");
+}
+
+/// A member that speaks version 2 and probes this node in version 1 holds it without a current
+/// certificate: this node announces itself to it.
+#[test]
+fn a_version_1_ping_from_a_signing_member_is_answered_with_an_announcement() {
+    let mut a = Lone::new(&["b"], &[]);
+    a.run(secs(1));
+    a.sent.clear();
+    a.v1(&[Message::Ping(kinship_proto::Ping {
+        seq: 3,
+        target: id("a"),
+        source: id("b"),
+        source_addr: addr(2),
+    })]);
+    assert_eq!(announcements(&a), [2]);
+    // A version 2 Ping, under the certificate b holds, is answered with the Ack alone.
+    a.sent.clear();
+    a.v2(&[v2::Message::Ping {
+        ping: kinship_proto::Ping {
+            seq: 4,
+            target: id("a"),
+            source: id("b"),
+            source_addr: addr(2),
+        },
+        source_epoch: EPOCH + 2,
+        challenge: drawn(0x7069_6e67),
+        requester: None,
+    }]);
+    assert!(announcements(&a).is_empty());
+}
+
 #[test]
 fn a_signed_broadcast_must_fit_beside_the_largest_version_2_probe() {
     let mut cfg = signing_config("a");
