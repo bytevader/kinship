@@ -12,6 +12,14 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - **Experimental KI-01 Stage 2b: signed probe answers and user messages in mode `sign`.** A signing node probes members it holds signed with version 2 rounds: each round's Ping carries a 128-bit challenge drawn from a ChaCha20 stream of the node's nonce key, its PingReqs name the requester, relays and the TCP fallback carry the same challenge, and only an Ack signed by the target over that exact round (requester, epoch, sequence number, challenge) answers it, whichever path it took; a relay checks the target's Ack and forwards it unchanged. Relays sign their Nacks over the same binding, and each counts once. Version 1 Acks and Nacks answer no version 2 round; members held unsigned keep version 1 rounds. Signed rumours and broadcasts ride the version 2 probe packets, with a version 1 datagram beside them only for unsigned content. Direct messages to members that speak version 2 are signed over the nonce of their packet, a proof repeated in one packet is delivered once, and broadcasts are signed, travel behind their sender's certificate, and are checked before they are delivered or relayed. Unsigned messages from 0.4 senders are still taken. Each Ack, Nack, broadcast copy and message costs at most one check. In mode `sign`, `Config::validate` also checks signed limits beside the largest version 2 probe message. Mode `off` sends the bytes 0.4 sends and keeps the pinned SWIM trace; the pinned trace in `sign` changes. The announcement cap and the remeasured costs are Stage 2c. See `docs/ki01-stage2.md`. **KI-01 remains Accepted.**
 - **Compose demo messages.** Cache nodes hand moved keys to their new owner with `cluster.send` on Drain, Undrain and joins, so those keys stay warm, and a Flush action clears every reachable cache with `cluster.broadcast`. A handoff carries the time the sender's cache was last emptied and is refused by a node that applied a later flush, so a late batch cannot bring flushed values back while a restarted node still exchanges warm keys. See `deploy/compose/README.md`.
 
+### Changed
+
+- **Minimum Rust version 1.87**, from 1.85, for `ctutils` 0.4.5, which kinship-proto uses for constant-time comparisons. The Compose demo builds with Rust 1.87.0.
+
+### Security
+
+- **RUSTSEC-2026-0385.** `ctutils` 0.4.2 generated masks and compared `u128` values in time that could depend on the data; updated to 0.4.5.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added
