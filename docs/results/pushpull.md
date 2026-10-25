@@ -9,12 +9,15 @@ Anti-entropy push-pull sends the whole member table both ways, and every node st
 
 **Result.** In mode `off` a settled node sends 50% fewer bytes at 100 nodes (789 to 392 B/s) and 80% fewer at 1,000 (6,232 to 1,234 B/s); push-pull falls by the multiplier, to a third and a sixth. Detection is untouched: the 50-node SWIM sweep finds the same 197,363 detections at the same p50. What it costs is repair time where only push-pull repairs: at 50 nodes a healed partition's p99 goes from 21.8 s to 45.8 s and a rumour that gossip missed waits up to 59.7 s instead of 29.7 s, twice as long, as the doubled period predicts. Nothing changes up to 32 members: the pinned 10-node SWIM trace is the same, and so is every sweep of 20 nodes or fewer.
 
+**Mode `sign` keeps the fixed period.** With the period scaled there too, the 1,000-seed sweeps in `sign` failed in ways `off` cannot, because signing nodes repair more through push-pull ([below](#mode-sign)). So the scaling applies in mode `off`, the default, as the brief's "in mode `off` first" asked, and signing nodes push-pull every `push_pull_interval` as before; their costs are those of [signed.md](signed.md#cost).
+
 ## The change
 
 - `Config::push_pull_interval_for(members)` in kinship-core gives the period for a cluster size; `push_pull_interval` keeps its meaning as the base, and 0 still disables periodic push-pull.
 - The node keeps when its last push-pull was due, and the next is due one period, for the live members it holds at that moment, after it. The deadline is derived again whenever the driver asks for the next timeout, so it follows the cluster as it grows or shrinks; a cluster that shrinks has its next push-pull pulled in, at once if it is already due. Missed ticks are skipped, as before.
 - The first push-pull is still staggered within `push_pull_interval` of the start, so a node that starts with a 1,000-member static list still makes its first exchange within 30 s, as memberlist does.
 - Reconnects to dead members stay on `reconnect_interval`, rejoins with seeds on `rejoin_interval`, and joins are unchanged.
+- A node in mode `sign` keeps `push_pull_interval` at every size.
 - The simulator's bounds that counted one push-pull period (`dissemination_bound` in the sync, failure and keyring tests, `settle_bound` in swim, the restart in epoch, the long partition in failure) now take the scaled period for the cluster they run.
 
 ## Sweeps
@@ -41,7 +44,16 @@ Every 1,000-seed sweep, in `off` on a 4-core Ryzen 5 3550H laptop, on this branc
 
 The failure sweeps run longer because their scenarios last as long as their bounds, which grew with the period.
 
-The `_signed` twins, every node in mode `sign`, run separately; their results are added here when they finish.
+### Mode `sign`
+
+Every `_signed` twin passes on all 1,000 seeds with mode `sign` on the fixed period, on the laptop: `swim` 665 s, `sync` join 531 s, leave 356 s, heal 294 s, metadata 153 s, `epoch` 10 s and 17 s, `usermsg` 26 s, `failure` clock jump 370 s, long partition 772 s, restart 502 s, name conflict 254 s, `keyring` 86 s and 193 s. Their bounds grew with the scaled period, which signing nodes do not use, so they hold `sign` to looser bounds than `off`, never tighter.
+
+With the period scaled in `sign` as well, three seeds failed, each a false death that `off` cannot have:
+
+- **A member that left reported dead** (`sync` leave, seed 116 of 1,000). A node that started from a static list still held the leaver without its certificate, so it dropped the signed Left, kept probing the member, and declared it dead 64 s later. Signing nodes learn most certificates from version 2 push-pull records; with 30 s it had one before its suspicion ran out, with 60 s it did not. On the same seed origin/main ends with no member held unsigned.
+- **A restart reported dead** (`failure` restart, seeds 554 and 209). Gossip missed the new life at one node, which learned of the restart only from its next push-pull, 51 s after it. Meanwhile it suspected the old life, and in mode `sign` the new life's Acks, signed under a key it did not hold yet, could not refute that suspicion, so the old life was declared dead 41 s after the restart. In `off` the new process answers the old life's Pings and nothing is suspected.
+
+Keeping the base period only while a node held members unsigned fixed seeds 116 and 554, but not seed 209, whose node held every member signed. So mode `sign` keeps the fixed period at every size, and both failure modes are left to the KI-01 work that would remove them (Decisions).
 
 ### Repair
 
@@ -97,11 +109,11 @@ Metadata spread, every update to every node that holds it (p50, p99, max), and t
 
 At 1,000 nodes every member's update in the same four seconds fills the gossip queues, so a tenth of the deliveries take longer than the gossip bound, before and after alike (repair p50 9 s); they arrive by gossip, slowly, not by push-pull, which is why the p99 does not move. Only the last stragglers, which waited for a push-pull, wait longer: 54.5 s against 37.1 s under stress.
 
-Mode `sign`, on the same clusters, takes about 24 minutes on an M5 Pro and hours on the laptop, so it runs on the Mac (`KINSHIP_MODES=sign`); its rows and the comparison with [signed.md](signed.md#cost) are added here when they arrive.
+Mode `sign` keeps the fixed period, so its costs are those of [signed.md](signed.md#cost). The harness confirms it: its `100` and `100, stress` clusters in `sign` on this branch give the 56 byte rows signed-costs.csv has for them, unchanged.
 
 ## Detection and false deaths
 
-The tuning sweep's stage `pushpull` reruns `lan`, `epochs` and `signed` on the screen's cells and seeds at 200 and 1,000 nodes ([tuning.md](tuning.md#setup)), where the period is 120 s and 180 s, and `pushpull_verdict` compares each row with the same cell and variant in stages `screen` and `signed` of [tuning.csv](tuning.csv). It runs on the Mac; the result is added here when it arrives.
+The tuning sweep's stage `pushpull` reruns `lan` and `epochs` on the screen's cells and seeds at 200 and 1,000 nodes ([tuning.md](tuning.md#setup)), where the period is 120 s and 180 s, and `pushpull_verdict` compares each row with the same cell and variant in stages `screen` and `signed` of [tuning.csv](tuning.csv). The `signed` variant would repeat its rows, since mode `sign` keeps the fixed period. It runs on the Mac; the result is added here when it arrives.
 
 ```bash
 KINSHIP_NODES=200 cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact pushpull
@@ -114,4 +126,5 @@ These runs last 120 s and start from static lists, so each node makes its one st
 ## Decisions
 
 - **The stability rule.** [stability.md](../stability.md#configuration) lets a timing default change only with lower detection latency at every size, no more false deaths and at most 10% more bandwidth. This change moves no detection timer and cuts bandwidth; what it gives up is the repair tail above 32 members, which that rule does not measure. It is recorded in the CHANGELOG under Changed, and stability.md now says the scaling is part of `push_pull_interval`'s meaning.
+- **Mode `sign` on the fixed period.** Scaling it too needs signing nodes to stop leaning on push-pull: certificates that spread by other means, and a way for a member's later life to refute a suspicion of its earlier one under a key the suspecting node does not hold yet. Both belong with KI-01, paused after Stage 2, and with a version 2 digest push-pull.
 - **Next.** [Digest push-pull](../pushpull-digest.md) would take a settled 1,000-node node from 1,234 to about 410 B/s, by inference from record sizes.

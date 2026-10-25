@@ -29,7 +29,7 @@ Joins (`join = 1`) stay full exchanges: a joiner holds only itself, and the repl
 
 - **0.4 and older nodes** never see a digest: they advertise no flag, so every exchange with them is today's full PushPull, both ways. A mixed cluster saves the bytes of exchanges between upgraded nodes only.
 - **Mode `off`** nodes that speak it use it with each other, which is where it saves most: every byte of push-pull in `off` is version 1 records.
-- **Mode `sign`** keeps its version 2 exchange of signed records unchanged at first. A version 2 digest would add the certificate id to each entry and send the signed record, with its proof, only where the sides differ; that is a later change, after Stage 2 resumes, and needs its own sweep. The version 1 exchange a signing node runs with unsigned members, the second exchange of a mixed view, can use the digest from the start.
+- **Mode `sign`** keeps its version 2 exchange of signed records unchanged at first, still every `push_pull_interval`, since signing nodes do not scale the period ([results](results/pushpull.md#mode-sign)). A version 2 digest would add the certificate id to each entry and send the signed record, with its proof, only where the sides differ; that is a later change, after Stage 2 resumes, and needs its own sweep. The version 1 exchange a signing node runs with unsigned members, the second exchange of a mixed view, can use the digest from the start.
 - The pinned SWIM trace changes once nodes advertise the flag, since every Alive grows by one byte; mode `off` without the feature, or with it disabled for comparison, would keep the 0.4 bytes.
 
 ## What it would save
