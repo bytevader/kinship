@@ -18,9 +18,9 @@
 //! - `signed`: `lan()` with every node in mode `sign` (KI-01 Stage 2c) against `lan()` in mode
 //!   `off`, both with epochs, on the screen's cells and seeds; `signed_verdict` compares them,
 //!   and `docs/results/signed.md` has the result.
-//! - `pushpull`: `lan`, `epochs` and `signed` again at 200 and 1,000 nodes with the push-pull
-//!   interval scaled with the cluster; `pushpull_verdict` compares them with the rows above,
-//!   and `docs/results/pushpull.md` has the result.
+//! - `pushpull`: `lan` and `epochs` again at 200 and 1,000 nodes with the push-pull interval
+//!   scaled with the cluster; `pushpull_verdict` compares them with the rows above, and
+//!   `docs/results/pushpull.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -779,18 +779,19 @@ fn signed_verdict() {
     print!("{}", signed_table(&csv));
 }
 
-/// The push-pull interval scaled with the cluster (`docs/results/pushpull.md`): `lan()`, with
-/// epochs, and signed, on the screen's cells and seeds at 200 and 1,000 nodes, where the
-/// interval is four and six times `push_pull_interval`. `pushpull_verdict` compares them with
-/// the rows the fixed interval left in stages `screen` and `signed`.
+/// The push-pull interval scaled with the cluster (`docs/results/pushpull.md`): `lan()`, and
+/// with epochs, on the screen's cells and seeds at 200 and 1,000 nodes, where the interval is
+/// four and six times `push_pull_interval`. `pushpull_verdict` compares them with the rows the
+/// fixed interval left in stages `screen` and `signed`. Mode `sign` keeps the fixed interval,
+/// so `signed` would repeat its stage `signed` rows; `KINSHIP_VARIANTS` can add it.
 #[test]
-#[ignore = "several hours in release mode"]
+#[ignore = "a few hours in release mode"]
 fn pushpull() {
     let sizes: Vec<Size> = screen_sizes()
         .into_iter()
         .filter(|s| s.nodes >= 200)
         .collect();
-    sweep("pushpull", &sizes, &variants(&["lan", EPOCHS, SIGNED]));
+    sweep("pushpull", &sizes, &variants(&["lan", EPOCHS]));
 }
 
 /// Every `pushpull` row against the same cell and variant with the fixed interval: `lan` in
