@@ -123,6 +123,19 @@ cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exa
 
 These runs last 120 s and start from static lists, so each node makes its one staggered first push-pull and, at 200 and 1,000 nodes, no second; their bandwidth shows the start of a cluster, and [Cost](#cost) the steady state.
 
+Rows from an M5 Pro on 2658060, in [tuning.csv](tuning.csv) stage `pushpull`; `epochs` gives the same detection and deaths as `lan` in every cell, and 1% to 3% more bytes. Per size (mean and worst bandwidth ratio, change in detection p50 and p99, false deaths per run summed over the cells):
+
+| Nodes | Cells | Bandwidth, mean | Bandwidth, worst | p50 change (s) | p99 change, mean (s) | p99 change, worst (s) | False deaths, before | After | Undetected |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 200 | 16 | 0.825 | 0.947 | +0.00 | -0.26 | +0.88 | 0.00 | 0.08 | 0 |
+| 1000 | 8 | 0.551 | 0.741 | +0.02 | +0.00 | +0.04 | 0.00 | 0.00 | 0 |
+
+Detection does not move: the median within 0.02 s in every cell and p99 within the noise tuning.md measured for neutral changes. Bandwidth falls in every cell, by 45% at 1,000 nodes and 18% at 200, where the false suspicions of starved nodes are most of the bytes.
+
+**False deaths at 200 nodes.** The scaled period adds 4 false deaths in the 800 runs at 200 nodes, where `lan()` had none in any cell: one each in the cells with 5% loss and 5% starved (a healthy node), 1% loss and 10% starved (a healthy node), and two with 3% loss and 10% starved (one healthy, one starved). None at 1,000 nodes. Replayed on the laptop with the period forced back to 30 s, the first of these cells has no false death on the same seeds, so the scaling causes them; most likely a refutation that gossip missed, which the 30 s push-pull used to deliver before the suspicion ran out. By [the rule](tuning.md#the-rule), a false death in a cell where `lan()` has none fails.
+
+A cap tried on the laptop, the period never longer than the longest suspicion (`suspicion_max_mult` times the minimum timeout: 55 s at 200 nodes, 72 s at 1,000), removed the two healthy deaths of the first two cells but left a starved node's in the third (seed 31), so it does not pass either, and it would give up more than half the saving at 1,000 nodes.
+
 ## Decisions
 
 - **The stability rule.** [stability.md](../stability.md#configuration) lets a timing default change only with lower detection latency at every size, no more false deaths and at most 10% more bandwidth. This change moves no detection timer and cuts bandwidth; what it gives up is the repair tail above 32 members, which that rule does not measure. It is recorded in the CHANGELOG under Changed, and stability.md now says the scaling is part of `push_pull_interval`'s meaning.
