@@ -139,12 +139,15 @@ fn next_tick(prev: Instant, now: Instant, interval: Duration) -> Instant {
     prev + interval * u32::try_from(missed + 1).unwrap_or(u32::MAX)
 }
 
-/// The anti-entropy period with `live` live members. A signing node that holds some of them
-/// unsigned keeps `push_pull_interval`: version 2 push-pull records are how it learns their
-/// certificates, and until it has them it drops their signed rumours, a Left or a refutation
-/// included. With every member signed, or in mode `off`, the period scales.
-fn push_pull_period(cfg: &Config, live: usize, holds_unsigned: bool) -> Duration {
-    if holds_unsigned {
+/// The anti-entropy period with `live` live members: scaled in mode `off`, and
+/// `push_pull_interval` in mode `sign`, whose repairs lean on push-pull more. A signing node
+/// learns certificates from version 2 records and drops the signed rumours of members it holds
+/// without one, a Left included; and the Acks of a member's later life, under a key it does not
+/// hold yet, cannot refute its suspicion of the earlier one, so a node that gossip missed
+/// learns of the restart only from push-pull. The 1,000-seed sweeps in mode `sign` found both
+/// with a scaled period (`docs/results/pushpull.md`).
+fn push_pull_period(cfg: &Config, live: usize, signing: bool) -> Duration {
+    if signing {
         cfg.push_pull_interval
     } else {
         cfg.push_pull_interval_for(live)
@@ -956,11 +959,7 @@ impl Node {
     /// The period of anti-entropy push-pull at the current number of live members, this node
     /// included; see [`Config::push_pull_interval_for`].
     pub(crate) fn push_pull_interval(&self) -> Duration {
-        push_pull_period(
-            &self.cfg,
-            self.table.live() + 1,
-            self.metrics.unsigned_members > 0,
-        )
+        push_pull_period(&self.cfg, self.table.live() + 1, self.keys.is_some())
     }
 
     /// When the next periodic push-pull is due, `None` if they are off.
@@ -1065,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn a_signing_node_holding_members_unsigned_keeps_the_base_period() {
+    fn a_signing_node_keeps_the_base_period() {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let base = cfg.push_pull_interval;
         assert_eq!(push_pull_period(&cfg, 1000, false), base * 6);
