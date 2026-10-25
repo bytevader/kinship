@@ -235,7 +235,7 @@ Pick a preset and override fields by name. Presets differ only in timing.
 | Preset | Use it for | Changes from `lan()` |
 | --- | --- | --- |
 | `Config.lan()` | One datacenter or VPC | none |
-| `Config.wan()` | Regions, edge sites, flaky links | probes every 5 s with a 3 s timeout, slower suspicion, push-pull every 60 s |
+| `Config.wan()` | Regions, edge sites, flaky links | probes every 5 s with a 3 s timeout, slower suspicion, push-pull every 60 s (longer above 32 members) |
 | `Config.local()` | Tests and demos | probes every 200 ms, loopback only, plaintext allowed, no TCP fallback ping |
 
 ```python
@@ -246,6 +246,8 @@ cfg2 = cfg.replace(name="edge-12")    # configs are frozen
 Durations are seconds as `float`, or a `datetime.timedelta`. Every field is validated when the config is built, so `kinship.ConfigError` (a `ValueError` that names the field) fires before any socket opens. The full field list lives in the [configuration reference](https://github.com/bytevader/kinship/blob/main/docs/design.md#configuration-surface); the ones you are most likely to set are `name`, `bind`, `advertise`, `cluster`, `seeds`, `meta`, `keys` and `event_buffer`. Use `bind="0.0.0.0:0"` to let the OS pick a port when several processes share a host, and read it back from `cluster.local.addr`.
 
 A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
+
+Each node exchanges its whole member table with a random member every `push_pull_interval` (30 s in `lan()`) while the cluster has at most 32 live members, and less often in larger clusters, as memberlist does: every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000 with the default. This anti-entropy repairs what gossip missed, so a larger cluster sends fewer bytes per node but takes longer to repair a missed update; see [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
 
 ## Encryption and keys
 

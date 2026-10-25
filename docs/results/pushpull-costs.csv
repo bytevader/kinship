@@ -1,0 +1,160 @@
+cluster,mode,window,carrier,bytes_per_node_s
+100,off,burst,headers v1,105.3
+100,off,burst,probes v1,55.0
+100,off,burst,push-pull v1,221.1
+100,off,burst,rumours v1,222.9
+100,off,burst,total,604.4
+100,off,burst,signatures made,0.00
+100,off,burst,signatures checked,0.00
+100,off,burst,members held unsigned at the end,0
+100,off,steady,headers v1,116.5
+100,off,steady,probes v1,54.8
+100,off,steady,push-pull v1,199.7
+100,off,steady,rumours v1,21.4
+100,off,steady,total,392.4
+100,off,steady,signatures made,0.00
+100,off,steady,signatures checked,0.00
+100,off,steady,members held unsigned at the end,0
+100,off,all,metadata spread p50 s,0.40
+100,off,all,metadata spread p99 s,0.76
+100,off,all,metadata spread max s,1.05
+100,off,all,metadata deliveries after gossip,0.00
+100,off,all,metadata repair p50 s,0.00
+100,off,all,metadata never delivered,0.00
+100-mixed,off,burst,headers v1,105.3
+100-mixed,off,burst,probes v1,55.0
+100-mixed,off,burst,push-pull v1,258.6
+100-mixed,off,burst,rumours v1,222.9
+100-mixed,off,burst,total,641.8
+100-mixed,off,burst,signatures made,0.00
+100-mixed,off,burst,signatures checked,0.00
+100-mixed,off,burst,members held unsigned at the end,0
+100-mixed,off,steady,headers v1,116.9
+100-mixed,off,steady,probes v1,54.8
+100-mixed,off,steady,push-pull v1,239.9
+100-mixed,off,steady,rumours v1,21.7
+100-mixed,off,steady,total,433.2
+100-mixed,off,steady,signatures made,0.00
+100-mixed,off,steady,signatures checked,0.00
+100-mixed,off,steady,members held unsigned at the end,0
+100-mixed,off,all,metadata spread p50 s,0.40
+100-mixed,off,all,metadata spread p99 s,0.75
+100-mixed,off,all,metadata spread max s,1.05
+100-mixed,off,all,metadata deliveries after gossip,0.00
+100-mixed,off,all,metadata repair p50 s,0.00
+100-mixed,off,all,metadata never delivered,0.00
+100-seed1,off,burst,headers v1,105.1
+100-seed1,off,burst,probes v1,55.0
+100-seed1,off,burst,push-pull v1,231.1
+100-seed1,off,burst,rumours v1,213.3
+100-seed1,off,burst,total,604.5
+100-seed1,off,burst,signatures made,0.00
+100-seed1,off,burst,signatures checked,0.00
+100-seed1,off,burst,members held unsigned at the end,0
+100-seed1,off,steady,headers v1,125.7
+100-seed1,off,steady,probes v1,54.9
+100-seed1,off,steady,push-pull v1,199.6
+100-seed1,off,steady,rumours v1,31.9
+100-seed1,off,steady,total,412.0
+100-seed1,off,steady,signatures made,0.00
+100-seed1,off,steady,signatures checked,0.00
+100-seed1,off,steady,members held unsigned at the end,0
+100-seed1,off,all,metadata spread p50 s,0.40
+100-seed1,off,all,metadata spread p99 s,0.78
+100-seed1,off,all,metadata spread max s,1.08
+100-seed1,off,all,metadata deliveries after gossip,0.00
+100-seed1,off,all,metadata repair p50 s,0.00
+100-seed1,off,all,metadata never delivered,0.00
+100-stress,off,burst,TCP probes,3.2
+100-stress,off,burst,headers v1,490.3
+100-stress,off,burst,probes v1,63.2
+100-stress,off,burst,push-pull v1,221.1
+100-stress,off,burst,rumours v1,753.3
+100-stress,off,burst,total,1531.1
+100-stress,off,burst,signatures made,0.00
+100-stress,off,burst,signatures checked,0.00
+100-stress,off,burst,members held unsigned at the end,0
+100-stress,off,steady,TCP probes,3.2
+100-stress,off,steady,headers v1,476.2
+100-stress,off,steady,probes v1,63.0
+100-stress,off,steady,push-pull v1,199.8
+100-stress,off,steady,rumours v1,520.9
+100-stress,off,steady,total,1263.1
+100-stress,off,steady,signatures made,0.00
+100-stress,off,steady,signatures checked,0.00
+100-stress,off,steady,members held unsigned at the end,0
+100-stress,off,all,metadata spread p50 s,0.42
+100-stress,off,all,metadata spread p99 s,0.75
+100-stress,off,all,metadata spread max s,1.23
+100-stress,off,all,metadata deliveries after gossip,0.00
+100-stress,off,all,metadata repair p50 s,0.00
+100-stress,off,all,metadata never delivered,0.00
+100-users,off,burst,headers v1,105.3
+100-users,off,burst,probes v1,55.0
+100-users,off,burst,push-pull v1,221.1
+100-users,off,burst,rumours v1,222.9
+100-users,off,burst,total,604.4
+100-users,off,burst,signatures made,0.00
+100-users,off,burst,signatures checked,0.00
+100-users,off,burst,members held unsigned at the end,0
+100-users,off,steady,headers v1,810.7
+100-users,off,steady,probes v1,54.9
+100-users,off,steady,push-pull v1,199.7
+100-users,off,steady,rumours v1,32.8
+100-users,off,steady,user messages v1,6484.7
+100-users,off,steady,total,7582.8
+100-users,off,steady,signatures made,0.00
+100-users,off,steady,signatures checked,0.00
+100-users,off,steady,members held unsigned at the end,0
+100-users,off,all,metadata spread p50 s,0.40
+100-users,off,all,metadata spread p99 s,0.76
+100-users,off,all,metadata spread max s,1.05
+100-users,off,all,metadata deliveries after gossip,0.00
+100-users,off,all,metadata repair p50 s,0.00
+100-users,off,all,metadata never delivered,0.00
+1000,off,burst,headers v1,399.6
+1000,off,burst,probes v1,55.0
+1000,off,burst,push-pull v1,1033.1
+1000,off,burst,rumours v1,9337.8
+1000,off,burst,total,10825.5
+1000,off,burst,signatures made,0.00
+1000,off,burst,signatures checked,0.00
+1000,off,burst,members held unsigned at the end,0
+1000,off,steady,headers v1,135.3
+1000,off,steady,probes v1,55.0
+1000,off,steady,push-pull v1,1000.7
+1000,off,steady,rumours v1,42.9
+1000,off,steady,total,1233.9
+1000,off,steady,signatures made,0.00
+1000,off,steady,signatures checked,0.00
+1000,off,steady,members held unsigned at the end,0
+1000,off,all,metadata spread p50 s,1.41
+1000,off,all,metadata spread p99 s,13.86
+1000,off,all,metadata spread max s,47.72
+1000,off,all,metadata deliveries after gossip,101665.00
+1000,off,all,metadata repair p50 s,8.97
+1000,off,all,metadata never delivered,0.00
+1000-stress,off,burst,TCP probes,3.1
+1000-stress,off,burst,headers v1,848.5
+1000-stress,off,burst,probes v1,63.2
+1000-stress,off,burst,push-pull v1,1030.3
+1000-stress,off,burst,rumours v1,14513.5
+1000-stress,off,burst,total,16458.5
+1000-stress,off,burst,signatures made,0.00
+1000-stress,off,burst,signatures checked,0.00
+1000-stress,off,burst,members held unsigned at the end,0
+1000-stress,off,steady,TCP probes,3.2
+1000-stress,off,steady,headers v1,848.0
+1000-stress,off,steady,probes v1,63.3
+1000-stress,off,steady,push-pull v1,1000.7
+1000-stress,off,steady,rumours v1,5751.0
+1000-stress,off,steady,total,7666.1
+1000-stress,off,steady,signatures made,0.00
+1000-stress,off,steady,signatures checked,0.00
+1000-stress,off,steady,members held unsigned at the end,0
+1000-stress,off,all,metadata spread p50 s,1.50
+1000-stress,off,all,metadata spread p99 s,14.64
+1000-stress,off,all,metadata spread max s,54.51
+1000-stress,off,all,metadata deliveries after gossip,107011.00
+1000-stress,off,all,metadata repair p50 s,9.08
+1000-stress,off,all,metadata never delivered,0.00

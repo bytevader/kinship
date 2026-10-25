@@ -51,6 +51,7 @@ The `kinship` crate follows Semantic Versioning as Rust reads it. The promise co
 
 - Every field keeps its name in Python and Rust, its unit (seconds as `float` or `timedelta` in Python, `Duration` in Rust, bytes for sizes) and its meaning.
 - The presets `lan()`, `wan()` and `local()` keep the values in `docs/design.md`, Configuration surface, and so does every default. A default changes only in a minor release, with a CHANGELOG entry under Changed that says why, and a timing default only with the evidence `docs/results/tuning.md` asks for: lower detection latency at every cluster size, with no more false deaths and at most 10% more bandwidth.
+- `push_pull_interval` is the anti-entropy period up to 32 live members; beyond that the period grows with the cluster as `docs/design.md` (Join and push-pull) specifies, after memberlist's pushPullScale. The scaling is part of the field's meaning, and a change to it is a change of a timing default.
 - Validation may refuse a combination it accepted before only when that combination could not work, as the fix for KP-03 refused limits under which a member's own Alive never fits a datagram. The error names the field.
 
 ### Events
