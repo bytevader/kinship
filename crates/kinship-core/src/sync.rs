@@ -21,6 +21,7 @@ use kinship_proto::{
 };
 
 use crate::broadcast::{Gossip, id};
+use crate::config::Config;
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
 use crate::io::{StreamEvent, StreamId, Transmit};
 use crate::member::{Admission, State};
@@ -136,6 +137,18 @@ fn wire_state(state: State) -> kinship_proto::State {
 fn next_tick(prev: Instant, now: Instant, interval: Duration) -> Instant {
     let missed = (now - prev).as_nanos() / interval.as_nanos();
     prev + interval * u32::try_from(missed + 1).unwrap_or(u32::MAX)
+}
+
+/// The anti-entropy period with `live` live members. A signing node that holds some of them
+/// unsigned keeps `push_pull_interval`: version 2 push-pull records are how it learns their
+/// certificates, and until it has them it drops their signed rumours, a Left or a refutation
+/// included. With every member signed, or in mode `off`, the period scales.
+fn push_pull_period(cfg: &Config, live: usize, holds_unsigned: bool) -> Duration {
+    if holds_unsigned {
+        cfg.push_pull_interval
+    } else {
+        cfg.push_pull_interval_for(live)
+    }
 }
 
 /// The last tick of `interval` at or before `now`, counting from `due`, skipping missed ones.
@@ -943,7 +956,11 @@ impl Node {
     /// The period of anti-entropy push-pull at the current number of live members, this node
     /// included; see [`Config::push_pull_interval_for`].
     pub(crate) fn push_pull_interval(&self) -> Duration {
-        self.cfg.push_pull_interval_for(self.table.live() + 1)
+        push_pull_period(
+            &self.cfg,
+            self.table.live() + 1,
+            self.metrics.unsigned_members > 0,
+        )
     }
 
     /// When the next periodic push-pull is due, `None` if they are off.
@@ -1045,6 +1062,15 @@ mod tests {
                 left: None,
             });
         }
+    }
+
+    #[test]
+    fn a_signing_node_holding_members_unsigned_keeps_the_base_period() {
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let base = cfg.push_pull_interval;
+        assert_eq!(push_pull_period(&cfg, 1000, false), base * 6);
+        assert_eq!(push_pull_period(&cfg, 1000, true), base);
+        assert_eq!(push_pull_period(&cfg, 10, true), base);
     }
 
     #[test]
