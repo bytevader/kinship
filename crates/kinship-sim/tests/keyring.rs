@@ -72,13 +72,13 @@ fn dissemination_bound(cfg: &Config, n: usize) -> Duration {
     let digits = (n as f64 + 1.0).log10().ceil() as u32;
     let gossip =
         cfg.gossip_interval * (cfg.retransmit_mult * digits) + cfg.probe_interval * 2 + secs(1);
-    gossip + cfg.push_pull_interval
+    gossip + cfg.push_pull_interval_for(n)
 }
 
 /// How long a healed partition, or a node that caught up, takes to reconverge; see the sync
 /// tests for the derivation.
 fn heal_bound(cfg: &Config, n: usize) -> Duration {
-    let gossip = dissemination_bound(cfg, n) - cfg.push_pull_interval;
+    let gossip = dissemination_bound(cfg, n) - cfg.push_pull_interval_for(n);
     cfg.reconnect_interval + cfg.probe_interval + gossip + dissemination_bound(cfg, n)
 }
 

@@ -82,7 +82,7 @@ fn dissemination_bound(cfg: &Config, n: usize) -> Duration {
     cfg.gossip_interval * retransmit_limit(cfg, n)
         + cfg.probe_interval * 2
         + secs(1)
-        + cfg.push_pull_interval
+        + cfg.push_pull_interval_for(n)
 }
 
 /// `suspicion_mult x max(1, log10 n) x probe_interval`, rounded up to the millisecond.
@@ -841,12 +841,15 @@ fn long_partition(seed: u64, nodes: usize, mode: Mode) -> Result<Measured, Strin
     let forget_bound = partition_bound(&cfg, nodes)
         + cfg.dead_reclaim
         + cfg.probe_interval * (cfg.awareness_max + 1);
-    let apart = cfg.reconnect_interval.max(cfg.push_pull_interval) * 2;
+    let apart = cfg
+        .reconnect_interval
+        .max(cfg.push_pull_interval_for(nodes))
+        * 2;
     // The join's two ends gossip what they learned, but the members their side already knew
     // are news only to the far side, which hears of them from the seed's own gossip and
     // otherwise from push-pull with a member that has. That can take a few rounds of
     // anti-entropy.
-    let bound = dissemination_bound(&cfg, nodes) + cfg.push_pull_interval * 3;
+    let bound = dissemination_bound(&cfg, nodes) + cfg.push_pull_interval_for(nodes) * 3;
     let scenario = Scenario::new(nodes)
         .duration(start + forget_bound + apart + bound + secs(1))
         .link(link)

@@ -84,10 +84,10 @@ fn gossip_bound(cfg: &Config, n: usize) -> Duration {
 }
 
 /// How long a rumour takes to reach every node: gossip, then for any node it missed, that
-/// node's next push-pull, which it starts every `push_pull_interval` with a random member that
-/// almost surely has the rumour.
+/// node's next push-pull, which it starts every `push_pull_interval_for(n)` with a random
+/// member that almost surely has the rumour.
 fn dissemination_bound(cfg: &Config, n: usize) -> Duration {
-    gossip_bound(cfg, n) + cfg.push_pull_interval
+    gossip_bound(cfg, n) + cfg.push_pull_interval_for(n)
 }
 
 /// How long a healed partition takes to reconverge. Every node with a dead member push-pulls
@@ -514,15 +514,24 @@ fn metadata_sweep(mode: Mode) {
     let seeds = seeds(1000);
     let runs = check_all(seeds.clone(), |seed| metadata(seed, 50, mode));
     let share = mostly_by_gossip(&runs, 50);
+    let took: Vec<Duration> = runs.iter().flat_map(|r| r.took.clone()).collect();
+    // The deliveries gossip missed, which waited for a push-pull.
+    let missed: Vec<Duration> = took
+        .iter()
+        .copied()
+        .filter(|&d| d > gossip_bound(&config(), 50))
+        .collect();
     println!(
         "metadata: {} seeds x 50 nodes{}, every update reached every node within {:?}, {:.3}% \
-         by gossip within {:?}: {}{}",
+         by gossip within {:?}: {}; the {} missed by gossip: {}{}",
         seeds.end - seeds.start,
         mode.label(),
         dissemination_bound(&config(), 50),
         share * 100.0,
         gossip_bound(&config(), 50),
-        percentiles(runs.iter().flat_map(|r| r.took.clone()).collect()),
+        percentiles(took),
+        missed.len(),
+        percentiles(missed),
         unsigned(&runs, mode)
     );
 }
