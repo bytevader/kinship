@@ -92,7 +92,7 @@ pub(crate) struct Sync {
     pub streams: BTreeMap<StreamId, Outbound>,
     next_stream: u64,
     pub joins: BTreeMap<CommandId, Join>,
-    next_push_pull: Option<Instant>,
+    push_pull: Option<SyncTimer>,
     next_reconnect: Option<Instant>,
     /// The Leave command waiting for this node's Left rumour to finish spreading.
     pub leaving: Option<CommandId>,
@@ -105,11 +105,21 @@ impl Sync {
             streams: BTreeMap::new(),
             next_stream: 0,
             joins: BTreeMap::new(),
-            next_push_pull: first_push_pull,
+            push_pull: first_push_pull.map(SyncTimer::First),
             next_reconnect: first_reconnect,
             leaving: None,
         }
     }
+}
+
+/// The periodic push-pull timer.
+#[derive(Clone, Copy, Debug)]
+enum SyncTimer {
+    /// The first one, staggered within `push_pull_interval` of the start.
+    First(Instant),
+    /// The instant the last one was due. The next is due one interval for the current number
+    /// of live members later, so it moves as the cluster grows or shrinks.
+    Last(Instant),
 }
 
 /// The state a push-pull record carries for `state`.
@@ -126,6 +136,12 @@ fn wire_state(state: State) -> kinship_proto::State {
 fn next_tick(prev: Instant, now: Instant, interval: Duration) -> Instant {
     let missed = (now - prev).as_nanos() / interval.as_nanos();
     prev + interval * u32::try_from(missed + 1).unwrap_or(u32::MAX)
+}
+
+/// The last tick of `interval` at or before `now`, counting from `due`, skipping missed ones.
+fn last_tick(due: Instant, now: Instant, interval: Duration) -> Instant {
+    let missed = (now - due).as_nanos() / interval.as_nanos();
+    due + interval.saturating_mul(u32::try_from(missed).unwrap_or(u32::MAX))
 }
 
 impl Node {
@@ -890,8 +906,9 @@ impl Node {
             self.exchange(addr, purpose, version);
         }
 
-        if let Some(t) = self.sync.next_push_pull.filter(|&t| t <= now) {
-            self.sync.next_push_pull = Some(next_tick(t, now, self.cfg.push_pull_interval));
+        if let Some(t) = self.next_push_pull().filter(|&t| t <= now) {
+            let last = last_tick(t, now, self.push_pull_interval());
+            self.sync.push_pull = Some(SyncTimer::Last(last));
             if !self.has_left() {
                 let to = self
                     .table
@@ -923,6 +940,20 @@ impl Node {
         }
     }
 
+    /// The period of anti-entropy push-pull at the current number of live members, this node
+    /// included; see [`Config::push_pull_interval_for`].
+    pub(crate) fn push_pull_interval(&self) -> Duration {
+        self.cfg.push_pull_interval_for(self.table.live() + 1)
+    }
+
+    /// When the next periodic push-pull is due, `None` if they are off.
+    fn next_push_pull(&self) -> Option<Instant> {
+        match self.sync.push_pull? {
+            SyncTimer::First(t) => Some(t),
+            SyncTimer::Last(t) => Some(t + self.push_pull_interval()),
+        }
+    }
+
     pub(crate) fn sync_deadline(&self) -> Option<Instant> {
         let streams = self.sync.streams.values().map(|o| o.deadline);
         let retries = self.sync.joins.values().flat_map(|j| {
@@ -933,7 +964,7 @@ impl Node {
         });
         streams
             .chain(retries)
-            .chain(self.sync.next_push_pull)
+            .chain(self.next_push_pull())
             .chain(self.sync.next_reconnect)
             .min()
     }
@@ -993,6 +1024,60 @@ mod tests {
         let cfg = Config::lan(Security::InsecurePlaintext);
         let me = Identity::new(name, addr(port)).unwrap();
         Node::new(cfg, me, Instant::ZERO, u64::from(port), &[port as u8; 32]).unwrap()
+    }
+
+    /// Adds `count` live members to `n`'s table, as a static list would.
+    fn hold_members(n: &mut Node, count: u16) {
+        for i in 0..count {
+            n.table.insert(Entry {
+                member: Member {
+                    name: format!("m{i}"),
+                    addr: addr(20_000 + i),
+                    meta: Vec::new(),
+                    state: State::Alive,
+                    incarnation: 0,
+                    epoch: 0,
+                },
+                since: Instant::ZERO,
+                vmin: 1,
+                vmax: 1,
+                proof: None,
+                left: None,
+            });
+        }
+    }
+
+    #[test]
+    fn push_pull_stretches_and_shrinks_with_the_live_members() {
+        let mut n = node("a", 1);
+        let base = n.cfg.push_pull_interval;
+        // The first is staggered within the base interval, whatever the size.
+        hold_members(&mut n, 199);
+        let first = n.next_push_pull().unwrap();
+        assert!(first < Instant::ZERO + base);
+        n.handle_timeout(first);
+        assert_eq!(n.sync.streams.len(), 1, "the first push-pull started");
+        // 200 live members, this node included: four times the base after the last one.
+        assert_eq!(n.next_push_pull(), Some(first + base * 4));
+        // The cluster shrinks to 33: the same push-pull is due earlier.
+        for i in 32..199 {
+            n.table.update(
+                &format!("m{i}"),
+                State::Dead,
+                0,
+                first + Duration::from_secs(1),
+            );
+        }
+        assert_eq!(n.push_pull_interval(), base * 2);
+        assert_eq!(n.next_push_pull(), Some(first + base * 2));
+        // To 32: the base interval, as with no scaling.
+        n.table
+            .update("m31", State::Dead, 0, first + Duration::from_secs(1));
+        assert_eq!(n.next_push_pull(), Some(first + base));
+        // A node that missed ticks runs the next one and stays on its grid.
+        let late = first + base * 3 + Duration::from_secs(1);
+        n.handle_timeout(late);
+        assert_eq!(n.next_push_pull(), Some(first + base * 4));
     }
 
     fn key() -> crate::Key {

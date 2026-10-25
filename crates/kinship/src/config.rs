@@ -289,7 +289,8 @@ impl Config {
         with_gossip_to_the_dead => gossip_to_the_dead: Duration;
         /// Broadcast copies per log10(n + 1).
         with_retransmit_mult => retransmit_mult: u32;
-        /// Anti-entropy period; zero disables it.
+        /// Anti-entropy period up to 32 live members, stretched beyond as memberlist's is (180 s
+        /// at 1,000 members with the default 30 s); zero disables it.
         with_push_pull_interval => push_pull_interval: Duration;
         /// Period of push-pulls with recently dead members; zero disables them.
         with_reconnect_interval => reconnect_interval: Duration;
