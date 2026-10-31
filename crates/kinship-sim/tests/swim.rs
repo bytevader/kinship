@@ -300,7 +300,7 @@ fn check(seed: u64, nodes: usize, mode: Mode) -> Result<Outcome, String> {
     // Run the scenario, then let it settle: loss stops, the partition stays, and every live
     // node must reach the true live set within settle_bound. Meanwhile sample every node's
     // view once a simulated second for incarnations that go down.
-    let settle_end = end + settle_bound(&config());
+    let settle_end = end + settle_bound(&config(), nodes);
     let mut settled = None;
     let mut seen: Vec<Vec<u32>> = vec![vec![0; nodes]; nodes];
     let mut t = Instant::ZERO;
@@ -444,7 +444,7 @@ fn check(seed: u64, nodes: usize, mode: Mode) -> Result<Outcome, String> {
             let why = diverged(&sim).unwrap_or_default();
             return fail(format!(
                 "not converged {:?} after the scenario: {why}",
-                settle_bound(&config())
+                settle_bound(&config(), nodes)
             ));
         }
     }
@@ -453,11 +453,12 @@ fn check(seed: u64, nodes: usize, mode: Mode) -> Result<Outcome, String> {
 
 /// How long a run takes to converge once loss stops. A node that wrongly holds a live member
 /// as dead, or the member itself, starts a push-pull with some live member within
-/// `push_pull_interval`; the merge turns the stale death into a suspicion, which reaches the
-/// member within a probe round and gossip, and its refutation spreads. Ten seconds cover those
-/// gossip rounds and a suspicion that was already running.
-fn settle_bound(cfg: &Config) -> Duration {
-    cfg.push_pull_interval + cfg.probe_interval + secs(10)
+/// `push_pull_interval_for(nodes)`, the interval of a cluster of that size; the merge turns the
+/// stale death into a suspicion, which reaches the member within a probe round and gossip, and
+/// its refutation spreads. Ten seconds cover those gossip rounds and a suspicion that was
+/// already running.
+fn settle_bound(cfg: &Config, nodes: usize) -> Duration {
+    cfg.push_pull_interval_for(nodes) + cfg.probe_interval + secs(10)
 }
 
 fn summarize(outcomes: &[Outcome]) -> String {

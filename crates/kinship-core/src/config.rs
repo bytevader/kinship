@@ -61,8 +61,14 @@ pub struct Config {
     pub gossip_nodes: usize,
     pub gossip_to_the_dead: Duration,
     pub retransmit_mult: u32,
-    /// Zero disables periodic push-pull.
+    /// Period of anti-entropy push-pull. Zero disables periodic push-pull.
     pub push_pull_interval: Duration,
+    /// Stretch the push-pull period beyond 32 live members as memberlist does
+    /// ([`Config::push_pull_interval_for`]): fewer bytes per node in large clusters, slower
+    /// repair of what gossip missed, and in the simulator's tuning sweep a few false deaths at
+    /// 200 nodes that the fixed period does not have (`docs/results/pushpull.md`). Off by
+    /// default; nodes in mode `sign` ignore it.
+    pub push_pull_scale: bool,
     /// Zero disables reconnect attempts to recently dead members.
     pub reconnect_interval: Duration,
     pub rejoin_interval: Duration,
@@ -122,6 +128,7 @@ impl Config {
             gossip_to_the_dead: Duration::from_secs(30),
             retransmit_mult: 4,
             push_pull_interval: Duration::from_secs(30),
+            push_pull_scale: false,
             reconnect_interval: Duration::from_secs(30),
             rejoin_interval: Duration::from_secs(60),
             tcp_timeout: Duration::from_secs(10),
@@ -170,6 +177,20 @@ impl Config {
             buddy_system: false,
             ..self
         }
+    }
+
+    /// The period of anti-entropy push-pull with `members` live members, this node included:
+    /// `push_pull_interval`, and with `push_pull_scale` beyond [`PUSH_PULL_SCALE_THRESHOLD`]
+    /// members memberlist's pushPullScale, `ceil(log2(members) - log2(32)) + 1` times it:
+    /// twice at 33 to 64 members, four times at 200 and six at 1,000. Each push-pull sends the
+    /// whole table, so a fixed period makes every node's share of the bytes grow with the
+    /// cluster.
+    pub fn push_pull_interval_for(&self, members: usize) -> Duration {
+        if !self.push_pull_scale {
+            return self.push_pull_interval;
+        }
+        self.push_pull_interval
+            .saturating_mul(push_pull_scale(members))
     }
 
     /// Checks fields that must hold together. Errors name the offending field.
@@ -367,6 +388,20 @@ impl Config {
     }
 }
 
+/// Live members, this node included, up to which push-pull keeps `push_pull_interval`, as
+/// memberlist's pushPullScaleThreshold.
+pub const PUSH_PULL_SCALE_THRESHOLD: usize = 32;
+
+/// memberlist's pushPullScale multiplier: 1 up to 32 members, then
+/// `ceil(log2(members) - 5) + 1`, which is `ceil(log2(members)) - 4`.
+fn push_pull_scale(members: usize) -> u32 {
+    if members <= PUSH_PULL_SCALE_THRESHOLD {
+        return 1;
+    }
+    // ceil(log2 n) for n > 1 is the bit length of n - 1.
+    usize::BITS - (members - 1).leading_zeros() - 4
+}
+
 /// Encoded size of the largest Ping and the largest Alive a node can hold: 64-byte names, an
 /// IPv6 address, an epoch and `max_meta` bytes of metadata, counted up to `cap` bytes of it.
 fn largest_probe_and_alive(max_meta: usize, cap: usize) -> usize {
@@ -551,6 +586,56 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_pull_stretches_with_the_cluster_as_memberlist_does() {
+        let cfg = Config {
+            push_pull_scale: true,
+            ..Config::lan(Security::InsecurePlaintext)
+        };
+        let secs = |s| Duration::from_secs(s);
+        for (members, interval) in [
+            (0, 30),
+            (1, 30),
+            (10, 30),
+            (32, 30),
+            (33, 60),
+            (64, 60),
+            (65, 90),
+            (100, 90),
+            (128, 90),
+            (200, 120),
+            (512, 150),
+            (1000, 180),
+            (8192, 270),
+        ] {
+            assert_eq!(
+                cfg.push_pull_interval_for(members),
+                secs(interval),
+                "{members}"
+            );
+        }
+        // memberlist's float formula agrees everywhere it is exact.
+        for members in 33..20_000usize {
+            let m = ((members as f64).log2() - 32f64.log2()).ceil() + 1.0;
+            assert_eq!(push_pull_scale(members), m as u32, "{members}");
+        }
+        assert_eq!(push_pull_scale(usize::MAX), 60);
+        let off = Config {
+            push_pull_interval: Duration::ZERO,
+            ..cfg
+        };
+        assert_eq!(off.push_pull_interval_for(1000), Duration::ZERO);
+        // Off by default, in every preset.
+        for c in [
+            Config::lan(Security::InsecurePlaintext),
+            Config::wan(Security::InsecurePlaintext),
+            Config::local(Security::InsecurePlaintext),
+        ] {
+            assert!(!c.push_pull_scale);
+            assert_eq!(c.push_pull_interval_for(1000), c.push_pull_interval);
+        }
+    }
 
     #[test]
     fn presets_are_valid() {

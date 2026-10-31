@@ -18,6 +18,9 @@
 //! - `signed`: `lan()` with every node in mode `sign` (KI-01 Stage 2c) against `lan()` in mode
 //!   `off`, both with epochs, on the screen's cells and seeds; `signed_verdict` compares them,
 //!   and `docs/results/signed.md` has the result.
+//! - `pushpull`: `lan` and `epochs` again at 200 and 1,000 nodes with `push_pull_scale=1`, the
+//!   push-pull interval scaled with the cluster; `pushpull_verdict` compares them with the rows
+//!   above, and `docs/results/pushpull.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -127,6 +130,7 @@ fn config(variant: &str) -> Config {
             "expected_confirmations" => cfg.expected_confirmations = int(),
             "retransmit_mult" => cfg.retransmit_mult = int(),
             "gossip_nodes" => cfg.gossip_nodes = int() as usize,
+            "push_pull_scale" => cfg.push_pull_scale = int() == 1,
             _ => panic!("{variant}: unknown field {field}"),
         }
     }
@@ -774,6 +778,133 @@ fn signed_table(csv: &str) -> String {
 fn signed_verdict() {
     let csv = std::fs::read_to_string(csv_path()).expect("run the signed sweep first");
     print!("{}", signed_table(&csv));
+}
+
+/// The push-pull interval scaled with the cluster (`docs/results/pushpull.md`): `lan()`, and
+/// with epochs, on the screen's cells and seeds at 200 and 1,000 nodes, where the interval is
+/// four and six times `push_pull_interval`. `pushpull_verdict` compares them with the rows the
+/// fixed interval left in stages `screen` and `signed`. Mode `sign` keeps the fixed interval,
+/// so `signed` would repeat its stage `signed` rows; `KINSHIP_VARIANTS` can add it.
+#[test]
+#[ignore = "a few hours in release mode"]
+fn pushpull() {
+    let sizes: Vec<Size> = screen_sizes()
+        .into_iter()
+        .filter(|s| s.nodes >= 200)
+        .collect();
+    sweep(
+        "pushpull",
+        &sizes,
+        &variants(&[SCALED, "epochs push_pull_scale=1"]),
+    );
+}
+
+/// `lan()` with the push-pull interval scaled, which the `pushpull` stage compares with `lan`.
+const SCALED: &str = "push_pull_scale=1";
+
+/// The variant a `pushpull` row is compared with: the same without `push_pull_scale=1`.
+fn unscaled(variant: &str) -> String {
+    let rest: Vec<&str> = variant.split(' ').filter(|&c| c != SCALED).collect();
+    if rest.is_empty() {
+        "lan".to_owned()
+    } else {
+        rest.join(" ")
+    }
+}
+
+/// Every `pushpull` row against the same cell and variant with the fixed interval: `lan` in
+/// stage `screen`, `epochs` and `signed` in stage `signed`. Per cluster size and variant, the
+/// bandwidth ratio, the change in detection p50 and p99, and false deaths and undetected
+/// crashes per run summed over the cells; then every cell.
+fn pushpull_table(csv: &str) -> String {
+    let rows: Vec<Row> = csv.lines().skip(1).map(Row::parse).collect();
+    let before: BTreeMap<(&str, &str), &Row> = rows
+        .iter()
+        .filter(|r| {
+            (r.stage == "screen" && r.variant == "lan")
+                || (r.stage == "signed" && (r.variant == EPOCHS || r.variant == SIGNED))
+        })
+        .map(|r| ((r.cell.as_str(), r.variant.as_str()), r))
+        .collect();
+    let pairs: Vec<(&Row, &Row)> = rows
+        .iter()
+        .filter(|r| r.stage == "pushpull")
+        .filter_map(|r| {
+            Some((
+                r,
+                *before.get(&(r.cell.as_str(), unscaled(&r.variant).as_str()))?,
+            ))
+        })
+        .collect();
+    let nodes = |r: &Row| -> usize { r.cell.split(',').next().unwrap().parse().unwrap() };
+    let mut out = String::from(concat!(
+        "| Nodes | Variant | Cells | Bandwidth, mean | Bandwidth, worst | p50 change (s) | ",
+        "p99 change, mean (s) | p99 change, worst (s) | False deaths per run, before | ",
+        "False deaths per run, after | Undetected |\n",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
+    let groups: BTreeSet<(usize, &str)> = pairs
+        .iter()
+        .map(|(a, _)| (nodes(a), a.variant.as_str()))
+        .collect();
+    for (size, variant) in groups {
+        let cells: Vec<&(&Row, &Row)> = pairs
+            .iter()
+            .filter(|(a, _)| nodes(a) == size && a.variant == variant)
+            .collect();
+        let ratios: Vec<f64> = cells.iter().map(|(a, b)| a.bytes / b.bytes).collect();
+        let dp50: Vec<f64> = cells.iter().map(|(a, b)| a.p50 - b.p50).collect();
+        let dp99: Vec<f64> = cells.iter().map(|(a, b)| a.p99 - b.p99).collect();
+        writeln!(
+            out,
+            "| {size} | {variant} | {} | {:.3} | {:.3} | {:+.2} | {:+.2} | {:+.2} | {:.2} | \
+             {:.2} | {} before, {} after |",
+            cells.len(),
+            mean_sd(&ratios).0,
+            ratios.iter().copied().fold(0.0, f64::max),
+            mean_sd(&dp50).0,
+            mean_sd(&dp99).0,
+            dp99.iter().copied().fold(f64::MIN, f64::max),
+            cells.iter().map(|(_, b)| b.deaths).sum::<f64>(),
+            cells.iter().map(|(a, _)| a.deaths).sum::<f64>(),
+            cells.iter().map(|(_, b)| b.undetected).sum::<u64>(),
+            cells.iter().map(|(a, _)| a.undetected).sum::<u64>(),
+        )
+        .unwrap();
+    }
+    out.push_str(concat!(
+        "\n| Cell (nodes, loss, starved) | Variant | Bytes per node per second, before | After | ",
+        "Ratio | p50 before (s) | p50 after (s) | p99 before (s) | p99 after (s) | ",
+        "False deaths before | False deaths after |\n",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
+    for (a, b) in &pairs {
+        writeln!(
+            out,
+            "| {} | {} | {:.0} | {:.0} | {:.3} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+            a.cell,
+            a.variant,
+            b.bytes,
+            a.bytes,
+            a.bytes / b.bytes,
+            b.p50,
+            a.p50,
+            b.p99,
+            a.p99,
+            b.deaths,
+            a.deaths
+        )
+        .unwrap();
+    }
+    out
+}
+
+/// Prints [`pushpull_table`] from `docs/results/tuning.csv`.
+#[test]
+#[ignore = "reads the CSV the sweeps write"]
+fn pushpull_verdict() {
+    let csv = std::fs::read_to_string(csv_path()).expect("run the pushpull sweep first");
+    print!("{}", pushpull_table(&csv));
 }
 
 /// `lan()` and the candidates, every cell at 50, 200 and 1,000 nodes.

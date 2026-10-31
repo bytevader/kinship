@@ -13,7 +13,11 @@
 //!
 //! `cargo test --release -p kinship-sim --test costs -- --ignored --nocapture --exact costs`
 //! runs every cluster, each in a worker process, and writes `docs/results/signed-costs.csv`;
-//! `KINSHIP_CLUSTERS` (names separated by `,`) runs some of them. `announcements` measures what
+//! `KINSHIP_CLUSTERS` (names separated by `,`) runs some of them, `KINSHIP_MODES` (`off`,
+//! `sign`) one mode, and `KINSHIP_COSTS_CSV` writes another file under `docs/results`, as
+//! `pushpull-costs.csv` for the push-pull interval (`docs/results/pushpull.md`). Each cluster
+//! also reports how long the members' metadata took to reach every node, and how long the
+//! deliveries gossip missed waited for their repair. `announcements` measures what
 //! members send a node that joins a large signing cluster, and the largest burst one node sends.
 
 mod common;
@@ -597,6 +601,23 @@ struct Measured {
     unsigned: Vec<u64>,
     /// The simulator's own count of datagram and frame bytes, for every window together.
     sim_bytes: u64,
+    /// For every node of this version and every other member, from the member's metadata
+    /// update to the node holding it, sorted; and how many never arrived.
+    spread: Vec<Duration>,
+    unspread: usize,
+}
+
+/// How often [`run`] looks for members' new metadata on every node.
+const SPREAD_SAMPLE: Duration = Duration::from_millis(250);
+
+/// How long gossip takes to spread a rumour to every node with high probability, as the sync
+/// tests derive it: `retransmit_mult x ceil(log10(n + 1))` gossip rounds, two probe intervals
+/// and a second. An update that arrives later was missed by gossip and repaired, almost always
+/// by a push-pull.
+fn gossip_bound(n: usize) -> Duration {
+    let cfg = common::config();
+    let digits = (n as f64 + 1.0).log10().ceil() as u32;
+    cfg.gossip_interval * (cfg.retransmit_mult * digits) + cfg.probe_interval * 2 + secs(1)
 }
 
 fn run(c: Cluster, mode: Mode, windows: &[Window]) -> Measured {
@@ -615,11 +636,13 @@ fn run(c: Cluster, mode: Mode, windows: &[Window]) -> Measured {
         .link(LinkConfig::lan().with_loss(c.loss))
         .trace(TraceConfig::OFF)
         .duration(end);
+    let mut updates = Vec::with_capacity(n);
     for i in 0..n {
         let meta = format!("zone=eu-west-1a;rack={i:04};tier=cache;v=2026.10;").into_bytes();
         let mut meta = meta;
         meta.resize(48, b'.');
         let at = ms(1_000 + rng.below(4_000));
+        updates.push((Instant::ZERO + at, meta.clone()));
         scenario = scenario.at(
             at,
             Action::Command {
@@ -696,15 +719,57 @@ fn run(c: Cluster, mode: Mode, windows: &[Window]) -> Measured {
         out.checked.push(checked);
         out.unsigned.push(unsigned);
     };
+    // Every (node of this version, member) pair still waiting for the member's new metadata.
+    // The victim and the starved nodes are left out, as members and as holders: the victim
+    // stops, and a starved node reads its gossip seconds late.
+    let counted = |i: usize| i != victim && !starved.contains(&i);
+    let mut waiting: Vec<(usize, usize)> = (0..n - c.on_0_4)
+        .filter(|&o| counted(o))
+        .flat_map(|o| {
+            (0..n)
+                .filter(move |&s| s != o && counted(s))
+                .map(move |s| (o, s))
+        })
+        .collect();
+    let names: Vec<String> = (0..n).map(long_name).collect();
+    let mut spread = Vec::with_capacity(waiting.len());
+    let mut step = |sim: &mut Sim<Meter>, to: Instant| {
+        while sim.now() < to {
+            if waiting.is_empty() {
+                sim.run_until(to);
+                break;
+            }
+            sim.run_until((sim.now() + SPREAD_SAMPLE).min(to));
+            let now = sim.now();
+            waiting.retain(|&(o, s)| {
+                let (at, meta) = &updates[s];
+                if now < *at {
+                    return true;
+                }
+                let held = sim
+                    .node(o)
+                    .and_then(Meter::node)
+                    .and_then(|node| node.member(&names[s]))
+                    .is_some_and(|m| m.meta == *meta);
+                if held {
+                    spread.push(now - *at);
+                }
+                !held
+            });
+        }
+    };
     let mut sim_bytes = 0;
     for &w in windows {
-        sim.run_until(Instant::ZERO + w.from);
+        step(&mut sim, Instant::ZERO + w.from);
         let before = sim.stats().sent_bytes + sim.stats().stream_bytes;
         sample(&sim, &mut out);
-        sim.run_until(Instant::ZERO + w.to);
+        step(&mut sim, Instant::ZERO + w.to);
         sim_bytes += sim.stats().sent_bytes + sim.stats().stream_bytes - before;
         sample(&sim, &mut out);
     }
+    out.unspread = waiting.len();
+    spread.sort_unstable();
+    out.spread = spread;
     out.sim_bytes = sim_bytes;
     out.bytes = std::mem::take(&mut shared.ledger.borrow_mut().bytes);
     out
@@ -779,6 +844,24 @@ fn rows(c: Cluster, mode: Mode, windows: &[Window], m: &Measured) -> String {
         )
         .unwrap();
     }
+    // Metadata set between 1 and 5 s: when it reached the nodes, and the deliveries gossip
+    // missed, which waited for a repair.
+    let at = |s: &[Duration], p: usize| {
+        s.get((s.len() * p / 100).min(s.len().saturating_sub(1)))
+            .map_or(0.0, Duration::as_secs_f64)
+    };
+    let bound = gossip_bound(c.nodes);
+    let late: Vec<Duration> = m.spread.iter().copied().filter(|&d| d > bound).collect();
+    for (what, v) in [
+        ("metadata spread p50 s", at(&m.spread, 50)),
+        ("metadata spread p99 s", at(&m.spread, 99)),
+        ("metadata spread max s", at(&m.spread, 100)),
+        ("metadata deliveries after gossip", late.len() as f64),
+        ("metadata repair p50 s", at(&late, 50)),
+        ("metadata never delivered", m.unspread as f64),
+    ] {
+        writeln!(out, "{},{mode_name},all,{what},{v:.2}", c.name).unwrap();
+    }
     // A frame on a connection that failed after it opened, to a node that crashed in the middle
     // of an exchange, is counted by the simulator and not filed; nothing else is missing.
     let missing = m.sim_bytes.abs_diff(ours) as f64 / m.sim_bytes as f64;
@@ -851,7 +934,7 @@ fn costs_worker() {
         return;
     };
     let c = *CLUSTERS.iter().find(|c| c.name == name).expect("a cluster");
-    for mode in [Mode::Off, Mode::Sign] {
+    for mode in modes() {
         let m = run(c, mode, &WINDOWS);
         print!("{}", rows(c, mode, &WINDOWS, &m));
     }
@@ -941,8 +1024,25 @@ fn announcements() {
     }
 }
 
+/// The modes `KINSHIP_MODES` names (`off` and `sign`, separated by `,`), both by default.
+fn modes() -> Vec<Mode> {
+    let only = std::env::var("KINSHIP_MODES").ok();
+    [(Mode::Off, "off"), (Mode::Sign, "sign")]
+        .into_iter()
+        .filter(|(_, name)| {
+            only.as_ref()
+                .is_none_or(|o| o.split(',').any(|m| m == *name))
+        })
+        .map(|(mode, _)| mode)
+        .collect()
+}
+
+/// The CSV under `docs/results` that `KINSHIP_COSTS_CSV` names, `signed-costs.csv` by default.
 fn csv_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/results/signed-costs.csv")
+    let name = std::env::var("KINSHIP_COSTS_CSV").unwrap_or_else(|_| "signed-costs.csv".into());
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/results")
+        .join(name)
 }
 
 /// Runs every cluster in both modes, each cluster in a worker process, and writes the rows.
@@ -989,10 +1089,14 @@ fn costs() {
     let mut csv = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| "cluster,mode,window,carrier,bytes_per_node_s\n".to_owned());
     for (name, lines) in rows {
-        // A cluster run again replaces its rows.
+        // A cluster run again replaces its rows in the modes it ran.
+        let ran: BTreeSet<&str> = lines.lines().filter_map(|l| l.split(',').nth(1)).collect();
         let kept: String = csv
             .lines()
-            .filter(|l| l.split(',').next() != Some(name))
+            .filter(|l| {
+                let mut f = l.split(',');
+                f.next() != Some(name) || !f.next().is_some_and(|m| ran.contains(m))
+            })
             .map(|l| format!("{l}\n"))
             .collect();
         csv = kept + &lines;

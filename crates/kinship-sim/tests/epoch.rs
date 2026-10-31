@@ -426,7 +426,7 @@ fn stale(seed: u64, mode: Mode) -> Result<(Duration, u64), String> {
     };
     // Gossip reaches nearly every node in a second; one that it misses, and that only sees the
     // new life answer its Pings, learns at its next push-pull.
-    let until = restarted + config().push_pull_interval * 2;
+    let until = restarted + config().push_pull_interval_for(NODES) * 2;
     let Some(took) = run_until_true(&mut sim, ms(100), until, |sim| new_life(sim, State::Alive))
     else {
         let views: Vec<String> = others()

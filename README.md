@@ -247,6 +247,8 @@ Durations are seconds as `float`, or a `datetime.timedelta`. Every field is vali
 
 A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
 
+Each node exchanges its whole member table with a random member every `push_pull_interval` (30 s in `lan()`), which repairs what gossip missed. In a large cluster that is most of the bytes a node sends. `push_pull_scale=True` stretches the period beyond 32 live members as memberlist does, every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000, for fewer bytes per node but a slower repair of a missed update; it is off by default because in the simulator that slower repair let a few suspected members be declared dead at 200 nodes. See [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
+
 ## Encryption and keys
 
 Every packet and stream is sealed with XChaCha20-Poly1305 and bound to your cluster label. A node without the key cannot read, join or inject anything, and packets it recorded are refused when it plays them back. Keys are 32 bytes, given as `bytes` or base64 text, and never logged. The threat model and what kinship does not protect against are in [SECURITY.md](https://github.com/bytevader/kinship/blob/main/SECURITY.md).

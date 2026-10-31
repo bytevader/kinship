@@ -59,7 +59,7 @@ use crate::sync::Sync;
 use crate::table::{Entry, Table};
 use crate::user::Users;
 
-pub use config::{Config, ConfigError, Security};
+pub use config::{Config, ConfigError, PUSH_PULL_SCALE_THRESHOLD, Security};
 pub use event::{Command, CommandError, CommandId, CommandOutput, Event};
 pub use io::{StreamEvent, StreamId, Transmit};
 pub use kinship_proto::identity::{PublicKey, SigningKey};

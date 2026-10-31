@@ -291,6 +291,9 @@ impl Config {
         with_retransmit_mult => retransmit_mult: u32;
         /// Anti-entropy period; zero disables it.
         with_push_pull_interval => push_pull_interval: Duration;
+        /// Stretch the anti-entropy period beyond 32 live members as memberlist does (180 s at
+        /// 1,000 members with the default 30 s): fewer bytes, slower repair. Off by default.
+        with_push_pull_scale => push_pull_scale: bool;
         /// Period of push-pulls with recently dead members; zero disables them.
         with_reconnect_interval => reconnect_interval: Duration;
         /// Period of push-pulls with each seed that is not a live member, which finds the
@@ -450,9 +453,12 @@ mod tests {
             .with_nacks(false)
             .with_buddy_system(false)
             .with_max_meta_bytes(256)
-            .with_rejoin_interval(Duration::ZERO);
+            .with_rejoin_interval(Duration::ZERO)
+            .with_push_pull_scale(true);
         let core = cfg.core();
         assert_eq!(core.cluster, "edge");
+        assert!(core.push_pull_scale);
+        assert!(!Config::lan().core().push_pull_scale);
         assert!(!core.nacks && !core.buddy_system);
         assert!(core.local_health && core.dynamic_suspicion);
         assert_eq!(core.limits.max_meta_bytes, 256);

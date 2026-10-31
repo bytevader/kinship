@@ -24,9 +24,12 @@ pub fn ms(m: u64) -> Duration {
     Duration::from_millis(m)
 }
 
-/// `lan()` with encryption, as production runs.
+/// `lan()` with encryption, as production runs. `KINSHIP_PUSH_PULL_SCALE=1` turns on
+/// `push_pull_scale`, so that the sweeps and the cost harness run with the period scaled.
 pub fn config() -> Config {
-    Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]))
+    let mut cfg = Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]));
+    cfg.push_pull_scale = env("KINSHIP_PUSH_PULL_SCALE") == Some(1);
+    cfg
 }
 
 /// What the nodes of a sweep run: mode `off`, the default, which sends the bytes 0.4 sends, or
