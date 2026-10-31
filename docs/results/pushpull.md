@@ -1,19 +1,19 @@
 # Push-pull scaled with the cluster
 
-Anti-entropy push-pull sends the whole member table both ways, and every node started one every 30 s at any cluster size, so in a settled 1,000-node cluster it was 96% of the bytes in mode `off` (6.0 of 6.2 KB/s per node) and 83% in `sign` ([signed.md](signed.md#cost)). The period now stretches with the cluster as memberlist's pushPullScale does: `push_pull_interval` up to 32 live members, this node included, then `ceil(log2(n) - log2(32)) + 1` times it ([design](../design.md#join-and-push-pull)).
+Anti-entropy push-pull sends the whole member table both ways, and every node started one every 30 s at any cluster size, so in a settled 1,000-node cluster it was 96% of the bytes in mode `off` (6.0 of 6.2 KB/s per node) and 83% in `sign` ([signed.md](signed.md#cost)). With `push_pull_scale`, a new setting, the period stretches with the cluster as memberlist's pushPullScale does: `push_pull_interval` up to 32 live members, this node included, then `ceil(log2(n) - log2(32)) + 1` times it ([design](../design.md#join-and-push-pull)). **It is off by default**, because of the false deaths below; every measurement here with the period scaled ran with it on.
 
 | Live members | Up to 32 | 33 to 64 | 65 to 128 | 129 to 256 | 257 to 512 | 513 to 1,024 | 8,192 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Multiplier | 1 | 2 | 3 | 4 | 5 | 6 | 9 |
 | Period with `lan()` | 30 s | 60 s | 90 s | 120 s | 150 s | 180 s | 270 s |
 
-**Result.** In mode `off` a settled node sends 50% fewer bytes at 100 nodes (789 to 392 B/s) and 80% fewer at 1,000 (6,232 to 1,234 B/s); push-pull falls by the multiplier, to a third and a sixth. Detection is untouched: the 50-node SWIM sweep finds the same 197,363 detections at the same p50. What it costs is repair time where only push-pull repairs: at 50 nodes a healed partition's p99 goes from 21.8 s to 45.8 s and a rumour that gossip missed waits up to 59.7 s instead of 29.7 s, twice as long, as the doubled period predicts. Nothing changes up to 32 members: the pinned 10-node SWIM trace is the same, and so is every sweep of 20 nodes or fewer.
+**Result.** With the period scaled, in mode `off` a settled node sends 50% fewer bytes at 100 nodes (789 to 392 B/s) and 80% fewer at 1,000 (6,232 to 1,234 B/s); push-pull falls by the multiplier, to a third and a sixth. Detection is untouched: the 50-node SWIM sweep finds the same 197,363 detections at the same p50. What it costs is repair time where only push-pull repairs: at 50 nodes a healed partition's p99 goes from 21.8 s to 45.8 s and a rumour that gossip missed waits up to 59.7 s instead of 29.7 s, twice as long, as the doubled period predicts. Nothing changes up to 32 members: the pinned 10-node SWIM trace is the same, and so is every sweep of 20 nodes or fewer. In the tuning sweep the scaled period adds 4 false deaths in 800 runs at 200 nodes where the fixed period had none, which fails the tuning rule, so the scaling is an opt-in (Decisions) and the defaults are those of origin/main.
 
 **Mode `sign` keeps the fixed period.** With the period scaled there too, the 1,000-seed sweeps in `sign` failed in ways `off` cannot, because signing nodes repair more through push-pull ([below](#mode-sign)). So the scaling applies in mode `off`, the default, as the brief's "in mode `off` first" asked, and signing nodes push-pull every `push_pull_interval` as before; their costs are those of [signed.md](signed.md#cost).
 
 ## The change
 
-- `Config::push_pull_interval_for(members)` in kinship-core gives the period for a cluster size; `push_pull_interval` keeps its meaning as the base, and 0 still disables periodic push-pull.
+- `push_pull_scale` turns the scaling on: `Config::push_pull_scale` in kinship-core, `with_push_pull_scale` in the Rust facade and `push_pull_scale=True` in Python, false by default. `Config::push_pull_interval_for(members)` gives the period for a cluster size, `push_pull_interval` when the setting is off; `push_pull_interval` keeps its meaning as the base, and 0 still disables periodic push-pull.
 - The node keeps when its last push-pull was due, and the next is due one period, for the live members it holds at that moment, after it. The deadline is derived again whenever the driver asks for the next timeout, so it follows the cluster as it grows or shrinks; a cluster that shrinks has its next push-pull pulled in, at once if it is already due. Missed ticks are skipped, as before.
 - The first push-pull is still staggered within `push_pull_interval` of the start, so a node that starts with a 1,000-member static list still makes its first exchange within 30 s, as memberlist does.
 - Reconnects to dead members stay on `reconnect_interval`, rejoins with seeds on `rejoin_interval`, and joins are unchanged.
@@ -22,7 +22,7 @@ Anti-entropy push-pull sends the whole member table both ways, and every node st
 
 ## Sweeps
 
-Every 1,000-seed sweep, in `off` on a 4-core Ryzen 5 3550H laptop, on this branch and on origin/main (1cdb6ec) for comparison, release build. Every one passes in both. The `_signed` twins are below.
+Every 1,000-seed sweep, in `off` on a 4-core Ryzen 5 3550H laptop, with the period scaled (`KINSHIP_PUSH_PULL_SCALE=1`, which turns `push_pull_scale` on for the sweeps and the cost harness) and on origin/main (1cdb6ec) for comparison, release build. Every one passes in both. With the setting off, the default, the core and the bounds are those of origin/main, and the sweeps pass as well (all 15 on 2026-10-31, with the numbers origin/main gives: a healed partition reconverges at p99 21.75 s and the last metadata arrives after 29.7 s). The `_signed` twins are below.
 
 | Sweep | Seeds x nodes | Period after | Passes | origin/main, s | This branch, s |
 | --- | --- | ---: | --- | ---: | ---: |
@@ -77,7 +77,7 @@ By the same bounds, a rumour gossip missed in a 200-node cluster waits up to 120
 `crates/kinship-sim/tests/costs.rs` on its seven clusters ([signed.md](signed.md#cost) for the setup: `lan()`, sealed, 17-byte names, 48 bytes of metadata set by every member between 1 and 5 s, a crash at 240 s, every node starting from a static list of every other; burst 5 to 150 s, steady 150 to 330 s). It also records, for every node and member, when the member's new metadata reached the node. The rows are in [pushpull-costs.csv](pushpull-costs.csv); origin/main's `off` rows, rerun with the same harness, match [signed-costs.csv](signed-costs.csv) to the byte.
 
 ```bash
-KINSHIP_COSTS_CSV=pushpull-costs.csv cargo test --release -p kinship-sim --test costs -- --ignored --nocapture --exact costs
+KINSHIP_PUSH_PULL_SCALE=1 KINSHIP_COSTS_CSV=pushpull-costs.csv cargo test --release -p kinship-sim --test costs -- --ignored --nocapture --exact costs
 ```
 
 Bytes per node per second, mode `off`, before (origin/main) and after:
@@ -113,7 +113,7 @@ Mode `sign` keeps the fixed period, so its costs are those of [signed.md](signed
 
 ## Detection and false deaths
 
-The tuning sweep's stage `pushpull` reruns `lan` and `epochs` on the screen's cells and seeds at 200 and 1,000 nodes ([tuning.md](tuning.md#setup)), where the period is 120 s and 180 s, and `pushpull_verdict` compares each row with the same cell and variant in stages `screen` and `signed` of [tuning.csv](tuning.csv). The `signed` variant would repeat its rows, since mode `sign` keeps the fixed period. It runs on the Mac; the result is added here when it arrives.
+The tuning sweep's stage `pushpull` reruns `lan` and `epochs` with `push_pull_scale=1` (variants `push_pull_scale=1` and `epochs push_pull_scale=1`) on the screen's cells and seeds at 200 and 1,000 nodes ([tuning.md](tuning.md#setup)), where the period is 120 s and 180 s, and `pushpull_verdict` compares each row with the same cell and variant in stages `screen` and `signed` of [tuning.csv](tuning.csv). The `signed` variant would repeat its rows, since mode `sign` keeps the fixed period. It runs on the Mac; the result is added here when it arrives.
 
 ```bash
 KINSHIP_NODES=200 cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact pushpull
@@ -138,6 +138,6 @@ A cap tried on the laptop, the period never longer than the longest suspicion (`
 
 ## Decisions
 
-- **The stability rule.** [stability.md](../stability.md#configuration) lets a timing default change only with lower detection latency at every size, no more false deaths and at most 10% more bandwidth. This change moves no detection timer and cuts bandwidth; what it gives up is the repair tail above 32 members, which that rule does not measure. It is recorded in the CHANGELOG under Changed, and stability.md now says the scaling is part of `push_pull_interval`'s meaning.
+- **Opt-in, decided by Nikola on 2026-10-31.** [The tuning rule](tuning.md#the-rule) lets a timing default change only with no more false deaths in any cell, and the scaled period adds them at 200 nodes; a cap at the longest suspicion did not remove them. So the scaling ships as `push_pull_scale`, off by default, for large clusters that choose memberlist's trade: a fifth of the bytes at 1,000 nodes for a slower repair. Every default, preset and pinned trace is unchanged.
 - **Mode `sign` on the fixed period.** Scaling it too needs signing nodes to stop leaning on push-pull: certificates that spread by other means, and a way for a member's later life to refute a suspicion of its earlier one under a key the suspecting node does not hold yet. Both belong with KI-01, paused after Stage 2, and with a version 2 digest push-pull.
 - **Next.** [Digest push-pull](../pushpull-digest.md) would take a settled 1,000-node node from 1,234 to about 410 B/s, by inference from record sizes.

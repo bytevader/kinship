@@ -235,7 +235,7 @@ Pick a preset and override fields by name. Presets differ only in timing.
 | Preset | Use it for | Changes from `lan()` |
 | --- | --- | --- |
 | `Config.lan()` | One datacenter or VPC | none |
-| `Config.wan()` | Regions, edge sites, flaky links | probes every 5 s with a 3 s timeout, slower suspicion, push-pull every 60 s (longer above 32 members) |
+| `Config.wan()` | Regions, edge sites, flaky links | probes every 5 s with a 3 s timeout, slower suspicion, push-pull every 60 s |
 | `Config.local()` | Tests and demos | probes every 200 ms, loopback only, plaintext allowed, no TCP fallback ping |
 
 ```python
@@ -247,7 +247,7 @@ Durations are seconds as `float`, or a `datetime.timedelta`. Every field is vali
 
 A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
 
-Each node exchanges its whole member table with a random member every `push_pull_interval` (30 s in `lan()`) while the cluster has at most 32 live members, and less often in larger clusters, as memberlist does: every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000 with the default. This anti-entropy repairs what gossip missed, so a larger cluster sends fewer bytes per node but takes longer to repair a missed update; see [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
+Each node exchanges its whole member table with a random member every `push_pull_interval` (30 s in `lan()`), which repairs what gossip missed. In a large cluster that is most of the bytes a node sends. `push_pull_scale=True` stretches the period beyond 32 live members as memberlist does, every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000, for fewer bytes per node but a slower repair of a missed update; it is off by default because in the simulator that slower repair let a few suspected members be declared dead at 200 nodes. See [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
 
 ## Encryption and keys
 
