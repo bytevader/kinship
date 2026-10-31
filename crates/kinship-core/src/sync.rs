@@ -1065,7 +1065,10 @@ mod tests {
 
     #[test]
     fn push_pull_keeps_its_period_by_default() {
-        let mut n = node("a", 1);
+        let me = Identity::new("a", addr(1)).unwrap();
+        let nonce_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let mut n = Node::new(cfg, me, Instant::ZERO, 1, &nonce_key).unwrap();
         hold_members(&mut n, 999);
         assert_eq!(n.push_pull_interval(), n.cfg.push_pull_interval);
     }
