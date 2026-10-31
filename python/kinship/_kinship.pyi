@@ -66,6 +66,7 @@ class Config:
     gossip_to_the_dead: float
     retransmit_mult: int
     push_pull_interval: float
+    push_pull_scale: bool
     reconnect_interval: float
     rejoin_interval: float
     # Limits and runtime

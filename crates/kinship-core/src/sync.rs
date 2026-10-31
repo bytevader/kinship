@@ -139,8 +139,8 @@ fn next_tick(prev: Instant, now: Instant, interval: Duration) -> Instant {
     prev + interval * u32::try_from(missed + 1).unwrap_or(u32::MAX)
 }
 
-/// The anti-entropy period with `live` live members: scaled in mode `off`, and
-/// `push_pull_interval` in mode `sign`, whose repairs lean on push-pull more. A signing node
+/// The anti-entropy period with `live` live members: scaled in mode `off` if `push_pull_scale`
+/// is set, and `push_pull_interval` in mode `sign`, whose repairs lean on push-pull more. A signing node
 /// learns certificates from version 2 records and drops the signed rumours of members it holds
 /// without one, a Left included; and the Acks of a member's later life, under a key it does not
 /// hold yet, cannot refute its suspicion of the earlier one, so a node that gossip missed
@@ -1064,8 +1064,18 @@ mod tests {
     }
 
     #[test]
+    fn push_pull_keeps_its_period_by_default() {
+        let mut n = node("a", 1);
+        hold_members(&mut n, 999);
+        assert_eq!(n.push_pull_interval(), n.cfg.push_pull_interval);
+    }
+
+    #[test]
     fn a_signing_node_keeps_the_base_period() {
-        let cfg = Config::lan(Security::InsecurePlaintext);
+        let cfg = Config {
+            push_pull_scale: true,
+            ..Config::lan(Security::InsecurePlaintext)
+        };
         let base = cfg.push_pull_interval;
         assert_eq!(push_pull_period(&cfg, 1000, false), base * 6);
         assert_eq!(push_pull_period(&cfg, 1000, true), base);
@@ -1074,7 +1084,13 @@ mod tests {
 
     #[test]
     fn push_pull_stretches_and_shrinks_with_the_live_members() {
-        let mut n = node("a", 1);
+        let cfg = Config {
+            push_pull_scale: true,
+            ..Config::lan(Security::InsecurePlaintext)
+        };
+        let me = Identity::new("a", addr(1)).unwrap();
+        let nonce_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let mut n = Node::new(cfg, me, Instant::ZERO, 1, &nonce_key).unwrap();
         let base = n.cfg.push_pull_interval;
         // The first is staggered within the base interval, whatever the size.
         hold_members(&mut n, 199);

@@ -18,9 +18,9 @@
 //! - `signed`: `lan()` with every node in mode `sign` (KI-01 Stage 2c) against `lan()` in mode
 //!   `off`, both with epochs, on the screen's cells and seeds; `signed_verdict` compares them,
 //!   and `docs/results/signed.md` has the result.
-//! - `pushpull`: `lan` and `epochs` again at 200 and 1,000 nodes with the push-pull interval
-//!   scaled with the cluster; `pushpull_verdict` compares them with the rows above, and
-//!   `docs/results/pushpull.md` has the result.
+//! - `pushpull`: `lan` and `epochs` again at 200 and 1,000 nodes with `push_pull_scale=1`, the
+//!   push-pull interval scaled with the cluster; `pushpull_verdict` compares them with the rows
+//!   above, and `docs/results/pushpull.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -130,6 +130,7 @@ fn config(variant: &str) -> Config {
             "expected_confirmations" => cfg.expected_confirmations = int(),
             "retransmit_mult" => cfg.retransmit_mult = int(),
             "gossip_nodes" => cfg.gossip_nodes = int() as usize,
+            "push_pull_scale" => cfg.push_pull_scale = int() == 1,
             _ => panic!("{variant}: unknown field {field}"),
         }
     }
@@ -791,7 +792,24 @@ fn pushpull() {
         .into_iter()
         .filter(|s| s.nodes >= 200)
         .collect();
-    sweep("pushpull", &sizes, &variants(&["lan", EPOCHS]));
+    sweep(
+        "pushpull",
+        &sizes,
+        &variants(&[SCALED, "epochs push_pull_scale=1"]),
+    );
+}
+
+/// `lan()` with the push-pull interval scaled, which the `pushpull` stage compares with `lan`.
+const SCALED: &str = "push_pull_scale=1";
+
+/// The variant a `pushpull` row is compared with: the same without `push_pull_scale=1`.
+fn unscaled(variant: &str) -> String {
+    let rest: Vec<&str> = variant.split(' ').filter(|&c| c != SCALED).collect();
+    if rest.is_empty() {
+        "lan".to_owned()
+    } else {
+        rest.join(" ")
+    }
 }
 
 /// Every `pushpull` row against the same cell and variant with the fixed interval: `lan` in
@@ -811,7 +829,12 @@ fn pushpull_table(csv: &str) -> String {
     let pairs: Vec<(&Row, &Row)> = rows
         .iter()
         .filter(|r| r.stage == "pushpull")
-        .filter_map(|r| Some((r, *before.get(&(r.cell.as_str(), r.variant.as_str()))?)))
+        .filter_map(|r| {
+            Some((
+                r,
+                *before.get(&(r.cell.as_str(), unscaled(&r.variant).as_str()))?,
+            ))
+        })
         .collect();
     let nodes = |r: &Row| -> usize { r.cell.split(',').next().unwrap().parse().unwrap() };
     let mut out = String::from(concat!(
