@@ -24,6 +24,9 @@
 //! - `digest`: `lan`, `epochs` and `epochs push_pull_scale=1` at 200 and 1,000 nodes with digest
 //!   push-pull, which `push_pull_digest` turns on by default; `digest_verdict` compares them
 //!   with the rows above, and `docs/results/digest.md` has the result.
+//! - `heal`: `lan` again at 50 and 200 nodes, since a node that doubts its own view keeps the
+//!   deaths it declares to itself; `heal_verdict` compares it with stage `screen`, and
+//!   `docs/results/heal-flap.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -1002,6 +1005,46 @@ With the digest, the scaled interval against the fixed one:
 fn digest_verdict() {
     let csv = std::fs::read_to_string(csv_path()).expect("run the digest sweep first");
     print!("{}", digest_table(&csv));
+}
+
+/// The heal-flap fix (`docs/results/heal-flap.md`): `lan` on the screen's cells and seeds at
+/// 50 and 200 nodes, where a node whose local health rose, or that held most members it knows
+/// as Suspect or Dead, while it suspected a member keeps that member's death to itself.
+/// `heal_verdict` compares the rows with the same cells in stage `screen`.
+#[test]
+#[ignore = "about half an hour in release mode"]
+fn heal() {
+    let sizes: Vec<Size> = screen_sizes()
+        .into_iter()
+        .filter(|s| s.nodes <= 200)
+        .collect();
+    sweep("heal", &sizes, &variants(&["lan"]));
+}
+
+/// Every `heal` row against the same cell and variant in stage `screen`.
+fn heal_table(csv: &str) -> String {
+    let rows: Vec<Row> = csv.lines().skip(1).map(Row::parse).collect();
+    let by_key: BTreeMap<(&str, &str, &str), &Row> = rows
+        .iter()
+        .map(|r| ((r.stage.as_str(), r.cell.as_str(), r.variant.as_str()), r))
+        .collect();
+    let pairs: Vec<(&Row, &Row)> = rows
+        .iter()
+        .filter(|r| r.stage == "heal")
+        .filter_map(|r| {
+            let before = by_key.get(&("screen", r.cell.as_str(), r.variant.as_str()))?;
+            Some((r, *before))
+        })
+        .collect();
+    pairs_table(&pairs)
+}
+
+/// Prints [`heal_table`] from `docs/results/tuning.csv`.
+#[test]
+#[ignore = "reads the CSV the sweeps write"]
+fn heal_verdict() {
+    let csv = std::fs::read_to_string(csv_path()).expect("run the heal sweep first");
+    print!("{}", heal_table(&csv));
 }
 
 /// `lan()` and the candidates, every cell at 50, 200 and 1,000 nodes.

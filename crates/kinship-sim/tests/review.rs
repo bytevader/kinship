@@ -897,3 +897,52 @@ fn ki06_honest(seed: u64) -> Result<(), String> {
 fn ki06_an_honest_node_far_ahead_stretches_the_window_by_at_most_the_lag_limit() {
     check_all(seeds(8), ki06_honest);
 }
+
+// ---------------------------------------------------------------------------------------------
+// KP-06: after a partition heals, the node that was cut off gossips the deaths it declared
+// while it heard from nobody, and the members it names, which never stopped, flap dead.
+
+/// The node the Compose demo's Partition fault disconnects.
+const KP06_CUT: usize = 3;
+
+fn kp06(seed: u64) -> Result<(), String> {
+    const NODES: usize = 6;
+    let start = secs(20);
+    // 20 to 40 s, as the demo saw it.
+    let length = secs(20 + seed % 21);
+    let others: Vec<usize> = (0..NODES).filter(|&o| o != KP06_CUT).collect();
+    let scenario = Scenario::new(NODES)
+        .duration(start + length + secs(60))
+        .link(LinkConfig::lan())
+        .trace(TraceConfig::OFF)
+        .at(
+            start,
+            Action::Partition {
+                a: KP06_CUT.into(),
+                b: others.into(),
+            },
+        )
+        .at(start + length, Action::Heal);
+    let (mut sim, log) = sim(seed, scenario, |spec, log| {
+        Observed::new(spec, log, |_| true)
+    });
+    sim.run();
+    let false_deaths: Vec<String> = deaths(&log)
+        .into_iter()
+        .filter(|(o, m, _)| *o != KP06_CUT && index_of(m) != KP06_CUT)
+        .map(|(o, m, t)| format!("{} declared {m} dead at {t:?}", name_of(o)))
+        .collect();
+    if !false_deaths.is_empty() {
+        return Err(format!(
+            "seed {seed}: {} cut off from {start:?} for {length:?}; {}",
+            name_of(KP06_CUT),
+            false_deaths.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn kp06_a_healed_partition_declares_no_running_member_dead() {
+    check_all(seeds(32), kp06);
+}

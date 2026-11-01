@@ -185,7 +185,7 @@ the optional profile below.
 | **Pause** | Docker freezes the entire process, including kinship's thread. Watch SUSPECT outlines, then DEAD and changed owners. | **Unpause**; wait for recovery/rejoin. |
 | **Kill** | SIGKILL models a process crash. Watch failure detection and lost values. Docker counts a kill as a manual stop, so `restart: on-failure` leaves it down. | **Start**. |
 | **Restart** | Docker stops and starts the process. A normal stop sends LEFT; values are lost and the node rejoins after the startup delay. | Automatic. |
-| **Partition** | Disconnects only that cache node from the membership network. HTTP becomes unreachable; peers suspect and mark it DEAD, while it marks all of them DEAD. Keys move and errors/misses rise. | **Reconnect** restores its Docker DNS alias; it rejoins within seconds. Its own stale rumours can briefly flip a healthy member to SUSPECT or DEAD until that member refutes, so watch for a second, short RingChanged. |
+| **Partition** | Disconnects only that cache node from the membership network. HTTP becomes unreachable; peers suspect and mark it DEAD, while it marks all of them DEAD. Keys move and errors/misses rise. | **Reconnect** restores its Docker DNS alias; it rejoins within seconds. It keeps the deaths it declared while cut off to itself, so no healthy member goes DEAD; its push-pull can still show one as SUSPECT for a moment until it refutes, a short RingChanged that moves no keys. |
 
 A crash on `node-3`, seven seconds in: it is DEAD, its card shows its HTTP API
 is gone, and its keys now belong to the other four nodes. The hint bar says

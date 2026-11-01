@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use common::{Log, Mode, Observed, check_all, config, index_of, ms, percentiles, secs, seeds};
 use kinship_core::{Command, CommandOutput, Config, Event, Instant, Rng, State};
-use kinship_sim::{Action, Delay, LinkConfig, NodeSet, Scenario, Sim, TraceConfig, name_of};
+use kinship_sim::{
+    Action, Delay, LinkConfig, NodeSet, Scenario, Sim, TraceConfig, addr_of, name_of,
+};
 
 /// Loss core SWIM tolerates without a false death; runs that must have none stay within it.
 const LOSS_TOLERANCE: f64 = 0.01;
@@ -672,4 +674,210 @@ fn a_new_node_joins_a_200_node_cluster_thousand_seeds() {
 #[ignore = "slow in debug builds; CI runs it with --release"]
 fn a_new_node_joins_a_200_node_cluster_thousand_seeds_signed() {
     join_sweep(Mode::Sign);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. A healed partition declares no running member dead.
+
+/// `suspicion_mult x max(1, log10 n) x probe_interval`, rounded up to the millisecond.
+fn suspicion_timeout(cfg: &Config, n: usize) -> Duration {
+    let scale = (n as f64).log10().max(1.0);
+    let s = cfg.probe_interval.as_secs_f64() * f64::from(cfg.suspicion_mult) * scale;
+    Duration::from_millis((s * 1000.0).ceil() as u64)
+}
+
+/// What one run of [`flap`] saw.
+#[derive(Debug, Default)]
+struct Flaps {
+    nodes: usize,
+    /// How many nodes were cut off.
+    cut: usize,
+    /// MemberDead events on nodes that were not cut off, about members that were not either:
+    /// deaths of members that never stopped running, which nothing but a rumour formed behind
+    /// the partition can cause.
+    false_deaths: u64,
+    /// MemberSuspect events of the same kind after the heal.
+    false_suspicions: u64,
+    /// Members the cut-off side declared dead while it was cut off.
+    split_deaths: u64,
+    /// From the heal to every node holding every member live.
+    took: Duration,
+    /// Whether the cut-off side had to join, since no reconnect crossed in time.
+    rejoined: bool,
+}
+
+/// One node or a minority side is cut off for longer than the suspicion timeout, long enough
+/// that it declares members on the other side dead, then healed. Half the runs use 6 nodes, as
+/// the Compose demo does, half 50. A reconnect heals it, or, where both sides reaped the
+/// tombstones it would have used first, a join from the cut-off side to a seed on the other,
+/// as kinship-net's rejoin of its seeds would.
+fn flap(seed: u64, mode: Mode) -> Result<Flaps, String> {
+    let cfg = config();
+    let mut rng = Rng::new(seed ^ 0x464c_4150);
+    let nodes = if rng.chance(0.5) { 6 } else { 50 };
+    let (link, loss) = random_link(&mut rng, LOSS_TOLERANCE);
+    let size = if rng.chance(0.5) {
+        1
+    } else {
+        2 + rng.index((nodes - 1) / 2 - 1)
+    };
+    let side: BTreeSet<usize> = pick(&mut rng, nodes, size).into_iter().collect();
+    let other: Vec<usize> = (0..nodes).filter(|n| !side.contains(n)).collect();
+    let other_side = other.clone();
+    let start = ms(5_000 + rng.below(10_000));
+    // From half the longest suspicion, after which a minority side has confirmed some of its
+    // suspicions long enough to declare members dead, to half dead_reclaim past the longest,
+    // by which a lone node, too, has declared some dead and the other side may have reaped it.
+    let shortest = suspicion_timeout(&cfg, nodes);
+    let longest = shortest * cfg.suspicion_max_mult;
+    let low = longest / 2;
+    let high = longest + cfg.dead_reclaim / 2;
+    let length = low + ms(rng.below((high - low).as_millis() as u64));
+    let healed = Instant::ZERO + start + length;
+    let bound = heal_bound(&cfg, nodes);
+    // Room for a rejoin, and long enough after the reconvergence for every suspicion the
+    // cut-off side still ran at the heal to end.
+    let end = start + length + bound * 2 + longest + secs(5);
+    let scenario = Scenario::new(nodes)
+        .duration(end)
+        .link(link)
+        .trace(TraceConfig::OFF)
+        .at(
+            start,
+            Action::Partition {
+                a: NodeSet::new(side.iter().copied()),
+                b: other.into(),
+            },
+        )
+        .at(start + length, Action::Heal);
+    let (mut sim, log) = sim(seed, mode, scenario, |_, _| true);
+    let fail = |msg: String| {
+        Err(format!(
+            "seed {seed}: {msg}\n{nodes} nodes, loss {loss:.4}, partition {start:?} for \
+             {length:?}, side {side:?}"
+        ))
+    };
+
+    sim.run_until(healed);
+    let everyone: BTreeSet<usize> = (0..nodes).collect();
+    let all_live = |sim: &Sim<Observed>| (0..nodes).all(|o| live_set(sim, o) == everyone);
+    let mut converged = run_until_true(&mut sim, ms(250), healed + bound, all_live);
+    let rejoined = converged.is_none();
+    if rejoined {
+        let seeds = vec![addr_of(*other_side.first().expect("a majority"))];
+        for &node in &side {
+            let seeds = seeds.clone();
+            sim.apply(Action::Command {
+                node,
+                cmd: Command::Join { seeds },
+            });
+        }
+        converged = run_until_true(&mut sim, ms(250), healed + bound * 2, all_live);
+    }
+    let Some(at) = converged else {
+        return fail(format!(
+            "not reconverged {bound:?} after the heal and a rejoin"
+        ));
+    };
+    sim.run();
+    for o in 0..nodes {
+        if live_set(&sim, o) != everyone {
+            return fail(format!("{} misses members at the end", name_of(o)));
+        }
+    }
+    if let Err(e) = signing(&sim, mode, nodes) {
+        return fail(e);
+    }
+    let healthy = |o: usize, m: &str| !side.contains(&o) && !side.contains(&index_of(m));
+    let log = log.borrow();
+    let count = |f: &dyn Fn(&common::Seen) -> bool| log.iter().filter(|s| f(s)).count() as u64;
+    Ok(Flaps {
+        nodes,
+        cut: size,
+        false_deaths: count(
+            &|s| matches!(&s.event, Event::MemberDead(m) if healthy(s.observer, &m.name)),
+        ),
+        false_suspicions: count(&|s| {
+            s.t >= healed
+                && matches!(&s.event, Event::MemberSuspect(m) if healthy(s.observer, &m.name))
+        }),
+        split_deaths: count(&|s| {
+            s.t < healed
+                && side.contains(&s.observer)
+                && matches!(&s.event, Event::MemberDead(m) if !side.contains(&index_of(&m.name)))
+        }),
+        took: at - healed,
+        rejoined,
+    })
+}
+
+#[test]
+fn a_healed_partition_declares_no_running_member_dead() {
+    let runs = check_all(0..8, |seed| flap(seed, Mode::Off));
+    let deaths: u64 = runs.iter().map(|r| r.false_deaths).sum();
+    assert_eq!(deaths, 0, "{runs:?}");
+}
+
+fn flap_sweep(mode: Mode) {
+    let seeds = seeds(1000);
+    let runs: Vec<(u64, Flaps)> =
+        check_all(seeds.clone(), |seed| flap(seed, mode).map(|r| (seed, r)));
+    for (nodes, single) in [(6, true), (6, false), (50, true), (50, false)] {
+        let class: Vec<&Flaps> = runs
+            .iter()
+            .map(|(_, r)| r)
+            .filter(|r| r.nodes == nodes && (r.cut == 1) == single)
+            .collect();
+        let with = class.iter().filter(|r| r.false_deaths > 0).count();
+        println!(
+            "heal flap: {nodes} nodes, {}: {} runs ({} with split deaths), {} false deaths in {} \
+             runs, {} false suspicions after the heal",
+            if single {
+                "one node cut off"
+            } else {
+                "a minority cut off"
+            },
+            class.len(),
+            class.iter().filter(|r| r.split_deaths > 0).count(),
+            class.iter().map(|r| r.false_deaths).sum::<u64>(),
+            with,
+            class.iter().map(|r| r.false_suspicions).sum::<u64>(),
+        );
+    }
+    println!(
+        "heal flap: {} seeds{}, reconverged after the heal ({} needed a rejoin): {}",
+        seeds.end - seeds.start,
+        mode.label(),
+        runs.iter().filter(|(_, r)| r.rejoined).count(),
+        percentiles(runs.iter().map(|(_, r)| r.took).collect()),
+    );
+    let flapped: Vec<String> = runs
+        .iter()
+        .filter(|(_, r)| r.false_deaths > 0)
+        .map(|(seed, r)| format!("{seed} ({})", r.false_deaths))
+        .collect();
+    assert!(
+        flapped.is_empty(),
+        "{} of {} seeds declared running members dead after the heal, first: {}",
+        flapped.len(),
+        runs.len(),
+        flapped
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_healed_partition_declares_no_running_member_dead_thousand_seeds() {
+    flap_sweep(Mode::Off);
+}
+
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn a_healed_partition_declares_no_running_member_dead_thousand_seeds_signed() {
+    flap_sweep(Mode::Sign);
 }

@@ -144,6 +144,7 @@ impl Node {
                 let proof = self.sign_suspect(&suspect);
                 self.on_suspect(now, &suspect, proof);
             }
+            self.doubt();
         }
         // A tombstone outlives the replay window, so no recording can bring its member back.
         let keep = self.cfg.dead_reclaim.max(self.replay.window());

@@ -538,13 +538,19 @@ fn same_seed_gives_identical_swim_traces() {
 fn swim_trace_is_pinned_across_platforms() {
     // CI runs this on Linux, macOS and Windows, so a SWIM seed that fails anywhere replays
     // everywhere, encrypted bytes included. Update the value only when the protocol, the codec
-    // or the simulator changes on purpose. It last changed with digest push-pull: every Alive
+    // or the simulator changes on purpose. It last changed when a node that doubts its own view
+    // began to keep the deaths it declares to itself (the heal flap): n3, whose local health
+    // the run's 3.7% loss had raised while it suspected n9, no longer gossips n9's death, so
+    // n8, n0, n5, n1, n6 and n7 each declare it when their own suspicion runs out, at most
+    // 0.5 ms later than n3's Dead reached them. The run has the same 34 events; only those six
+    // moved. With `KINSHIP_PUSH_PULL_DIGEST=0` it changed from 0x3dfb_cb2f_34fe_aa03 too.
+    // Before that it changed with digest push-pull: every Alive
     // carries its member's features, one byte, so the 80 of the first 362 datagrams that hold
     // one grew by a byte and the rest stayed the same, until the first push-pull at 8.5 s,
     // which became a digest exchange of 228, 166 and 169 bytes in place of 304 and 320. Its
     // third frame draws one more latency from the simulator's RNG, so every later record
     // moved; the run has the same 34 events, but for which of n0 and n3 learned n9's epoch
-    // before n9 died. With `KINSHIP_PUSH_PULL_DIGEST=0` the trace is the one 0.4 pinned,
+    // before n9 died. With `KINSHIP_PUSH_PULL_DIGEST=0` the trace was the one 0.4 pinned,
     // 0x3dfb_cb2f_34fe_aa03. Before that it changed when members got epochs (0.3), which made
     // every Alive, Suspect and Dead and every stream frame 8 bytes longer, and when nonces got
     // a ChaCha20 key of their own (KS-06), which changed every packet's bytes and nothing else.
@@ -555,9 +561,9 @@ fn swim_trace_is_pinned_across_platforms() {
         Observed::new(spec, log.clone(), |_| true)
     });
     let pinned = if config().push_pull_digest {
-        0x8b4a_8d9c_9a71_de4d
+        0xf9a7_2228_3681_b839
     } else {
-        0x3dfb_cb2f_34fe_aa03
+        0xe848_2637_7439_2a45
     };
     assert_eq!(sim.run().digest(), pinned, "trace digest changed");
 }

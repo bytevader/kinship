@@ -437,8 +437,7 @@ impl Node {
                     .update(name, State::Suspect, s.inc, now)
                     .member
                     .clone();
-                self.suspicions
-                    .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
+                self.start_suspicion(name, Suspicion::new(&self.cfg, n, now, from));
                 self.metrics.suspicions += 1;
                 self.events.push_back(Event::MemberSuspect(member));
                 self.broadcast(Gossip::suspect(s, proof));
@@ -448,8 +447,7 @@ impl Node {
                 // so this is a new one: a fresh timer and fresh confirmations.
                 let n = self.cluster_size();
                 self.table.update(name, State::Suspect, s.inc, now);
-                self.suspicions
-                    .insert(name.to_owned(), Suspicion::new(&self.cfg, n, now, from));
+                self.start_suspicion(name, Suspicion::new(&self.cfg, n, now, from));
                 self.broadcast(Gossip::suspect(s, proof));
             }
             State::Suspect if s.inc == inc => {
@@ -534,8 +532,7 @@ impl Node {
             .update(name, State::Suspect, inc, now)
             .member
             .clone();
-        self.suspicions
-            .insert(name.to_owned(), Suspicion::unreported(&self.cfg, n, now));
+        self.start_suspicion(name, Suspicion::unreported(&self.cfg, n, now));
         if state == State::Alive {
             self.metrics.suspicions += 1;
             self.events.push_back(Event::MemberSuspect(member));
@@ -559,6 +556,7 @@ impl Node {
             Life::Same if at_least(inc, self.local.member.incarnation) => {
                 // Others missed our Acks: likely this node is the slow one.
                 self.health_delta(1);
+                self.doubt();
                 self.refute(inc);
             }
             Life::Same | Life::Earlier => self.reassert(),
