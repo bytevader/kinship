@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(p) = Payload::parse(data, &limits) {
         let msgs: Vec<Message<'_>> = p.iter().collect();
         assert_eq!(msgs.len() + p.unknown(), p.count());
-        // Touch everything a consumer would: nested record lists and their metadata.
+        // Touch everything a consumer would: nested record, entry and name lists, and metadata.
         for m in &msgs {
             let _ = m.encoded_len();
             match m {
@@ -58,6 +58,14 @@ fuzz_target!(|data: &[u8]| {
                 Message::UserBroadcast(b) => {
                     assert!(b.data.len() < data.len());
                     assert!(!b.from.as_str().is_empty());
+                }
+                Message::PushPullDigest(d) => {
+                    assert_eq!(d.entries.iter().count(), d.entries.len());
+                    assert!(d.entries.len() < data.len());
+                }
+                Message::PushPullWants(w) => {
+                    assert_eq!(w.names.iter().count(), w.names.len());
+                    assert!(w.names.iter().all(|n| !n.as_str().is_empty()));
                 }
                 _ => {}
             }

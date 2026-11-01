@@ -206,7 +206,9 @@ fn capture(security: &Security, messages: bool) -> Vec<Op> {
     let recorded = Rc::clone(&ops);
     let security = security.clone();
     let mut sim = Sim::new(7, scenario, move |spec: &NodeSpec| {
-        let me = Identity::new(spec.name.clone(), spec.addr).unwrap();
+        let me = Identity::new(spec.name.clone(), spec.addr)
+            .unwrap()
+            .with_epoch(spec.epoch());
         let cfg = Config::lan(security.clone());
         let mut node = Node::new(cfg, me, spec.now, spec.seed, &spec.nonce_key()).unwrap();
         // A restarted node knows nobody until it joins.
