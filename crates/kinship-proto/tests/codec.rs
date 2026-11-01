@@ -3,9 +3,9 @@
 use core::net::SocketAddr;
 
 use kinship_proto::{
-    Alive, Codec, DecodeError, EncodeError, FrameReader, Key, KeyError, Limits, Message, NodeId,
-    PacketKind, Payload, Ping, PushPull, Record, Records, State, Suspect, UserBroadcast,
-    UserMessage, kind,
+    Alive, Codec, DecodeError, DigestEntries, DigestEntry, EncodeError, FrameReader, Key, KeyError,
+    Limits, Message, Names, NodeId, PacketKind, Payload, Ping, PushPull, PushPullDigest,
+    PushPullWants, Record, Records, State, Suspect, UserBroadcast, UserMessage, feature, kind,
 };
 
 const NONCE: [u8; 24] = [7; 24];
@@ -53,6 +53,7 @@ fn alive<'a>(name: &'a str, meta: &'a [u8]) -> Alive<'a> {
         vmin: 1,
         vmax: 1,
         epoch: 0,
+        features: 0,
     }
 }
 
@@ -748,6 +749,245 @@ fn an_epoch_is_read_when_present_and_zero_when_absent() {
     // its length and the version 1 body. The golden vectors pin those bytes.
     assert_eq!(suspect(0).encoded_len(), 2 + without.len());
     assert_eq!(suspect(1).encoded_len(), 2 + with.len());
+}
+
+/// An Alive's body as 0.4 sent it, with the epoch `epoch`.
+fn alive_body(epoch: u64) -> Vec<u8> {
+    let mut b = 3u32.to_be_bytes().to_vec();
+    b.extend_from_slice(&[1, b'n', 4, 1, 2, 3, 4, 0x1e, 0xea, 0, 1, 1]);
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b
+}
+
+#[test]
+fn features_are_read_after_the_epoch() {
+    let parse = |body: &[u8]| {
+        let inner = raw_payload(&[(kind::ALIVE, body)]);
+        parse_raw(&inner).map(|m| match m[..] {
+            [Message::Alive(a)] => (a.epoch, a.features),
+            _ => panic!("{m:?}"),
+        })
+    };
+    let epoch = 1_790_000_000_000;
+    // As 0.4 sent it: no features.
+    assert_eq!(parse(&alive_body(epoch)), Ok((epoch, 0)));
+    // Bit 0, then a field a later version appends after it.
+    let mut with = alive_body(epoch);
+    with.push(1);
+    assert_eq!(parse(&with), Ok((epoch, feature::DIGEST_PUSH_PULL)));
+    with.extend_from_slice(b"future");
+    assert_eq!(parse(&with), Ok((epoch, feature::DIGEST_PUSH_PULL)));
+    // A varint cut short, and one padded with a zero group, which is not minimal.
+    let mut cut = alive_body(epoch);
+    cut.push(0x81);
+    assert_eq!(parse(&cut), Err(DecodeError::BadVarint));
+    let mut padded = alive_body(epoch);
+    padded.extend_from_slice(&[0x81, 0x00]);
+    assert_eq!(parse(&padded), Err(DecodeError::BadVarint));
+    // One byte longer than without them, and nothing longer when they are 0.
+    let a = Alive {
+        epoch,
+        ..alive("n", b"")
+    };
+    let flagged = Alive {
+        features: feature::DIGEST_PUSH_PULL,
+        ..a
+    };
+    let len = |a| Message::Alive(a).encoded_len();
+    assert_eq!(len(flagged), len(a) + 1);
+    // Features need an epoch ahead of them, so epoch 0 is written for them, and both round-trip.
+    let no_epoch = Alive {
+        features: feature::DIGEST_PUSH_PULL,
+        ..alive("n", b"")
+    };
+    assert_eq!(len(no_epoch), len(alive("n", b"")) + 9);
+    for a in [flagged, no_epoch] {
+        let bytes = seal(&plain(b"c"), PacketKind::Datagram, &[Message::Alive(a)]);
+        let mut buf = bytes;
+        let got: Vec<_> = plain(b"c")
+            .open(PacketKind::Datagram, &mut buf)
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(got, [Message::Alive(a)]);
+    }
+}
+
+/// A digest entry's body: state, incarnation, the name `n`, epoch.
+fn digest_entry(state: u8) -> Vec<u8> {
+    let mut e = vec![state];
+    e.extend_from_slice(&7u32.to_be_bytes());
+    e.extend_from_slice(&[1, b'n']);
+    e.extend_from_slice(&42u64.to_be_bytes());
+    e
+}
+
+#[test]
+fn digest_entries_and_wants_are_checked_and_extensible() {
+    let digest = |entries: &[Vec<u8>]| {
+        let mut body = vec![0u8, entries.len() as u8];
+        for e in entries {
+            body.push(e.len() as u8);
+            body.extend_from_slice(e);
+        }
+        body
+    };
+    let entry = DigestEntry {
+        state: State::Suspect,
+        inc: 7,
+        node: id("n"),
+        epoch: 42,
+    };
+    let inner = raw_payload(&[(kind::PUSH_PULL_DIGEST, &digest(&[digest_entry(1)]))]);
+    let Message::PushPullDigest(d) = parse_raw(&inner).unwrap()[0] else {
+        panic!()
+    };
+    assert!(!d.join);
+    assert_eq!(d.entries.iter().collect::<Vec<_>>(), [entry]);
+    // A field appended to an entry, and one appended after the list, are skipped.
+    let mut longer = digest_entry(1);
+    longer.extend_from_slice(b"future");
+    let mut body = digest(&[longer, digest_entry(1)]);
+    body.extend_from_slice(b"later");
+    let inner = raw_payload(&[(kind::PUSH_PULL_DIGEST, &body)]);
+    let Message::PushPullDigest(d) = parse_raw(&inner).unwrap()[0] else {
+        panic!()
+    };
+    assert_eq!(d.entries.iter().collect::<Vec<_>>(), [entry, entry]);
+    // A bad state, an entry without its epoch, a join that is not a bool, and a count that
+    // the bytes cannot hold.
+    let checks: [(Vec<u8>, DecodeError); 4] = [
+        (digest(&[digest_entry(4)]), DecodeError::BadState),
+        (
+            digest(&[digest_entry(0)[..10].to_vec()]),
+            DecodeError::Truncated,
+        ),
+        (
+            [&[2u8][..], &digest(&[])[1..]].concat(),
+            DecodeError::BadBool,
+        ),
+        (
+            [&[0u8][..], &[0xff, 0xff, 0xff, 0xff, 0x0f], &[0; 8]].concat(),
+            DecodeError::BadLength,
+        ),
+    ];
+    for (body, err) in checks {
+        let inner = raw_payload(&[(kind::PUSH_PULL_DIGEST, &body)]);
+        assert_eq!(parse_raw(&inner).unwrap_err(), err, "{body:?}");
+    }
+
+    let inner = raw_payload(&[(kind::PUSH_PULL_WANTS, &[2, 1, b'a', 2, b'b', b'c', 9])]);
+    let Message::PushPullWants(w) = parse_raw(&inner).unwrap()[0] else {
+        panic!()
+    };
+    assert_eq!(w.names.iter().collect::<Vec<_>>(), [id("a"), id("bc")]);
+    for (body, err) in [
+        (&[1, 0][..], DecodeError::BadLength),
+        (&[1, 0, 0][..], DecodeError::BadNodeId),
+        (&[2, 1, b'a'][..], DecodeError::BadLength),
+        (
+            &[0xff, 0xff, 0xff, 0xff, 0x0f, 1, b'a'][..],
+            DecodeError::BadLength,
+        ),
+    ] {
+        let inner = raw_payload(&[(kind::PUSH_PULL_WANTS, body)]);
+        assert_eq!(parse_raw(&inner).unwrap_err(), err, "{body:?}");
+    }
+}
+
+#[test]
+fn released_0_4_reads_the_new_alive_and_skips_digest_messages() {
+    use kinship_proto_0_4 as old;
+
+    let epoch = 1_790_000_000_000;
+    let a = Alive {
+        epoch,
+        features: feature::DIGEST_PUSH_PULL,
+        ..alive("node-a", b"\x04role\x03api")
+    };
+    let old_alive = old::Alive {
+        inc: a.inc,
+        node: old::NodeId::new("node-a").unwrap(),
+        addr: a.addr,
+        meta: a.meta,
+        vmin: a.vmin,
+        vmax: a.vmax,
+        epoch,
+    };
+    let old_codec = old::Codec::insecure_plaintext(b"c", old::Limits::default()).unwrap();
+
+    // A datagram with the new Alive: 0.4 reads every field it knows and skips the features.
+    let mut packet = seal(&plain(b"c"), PacketKind::Datagram, &[Message::Alive(a)]);
+    let payload = old_codec
+        .open(old::PacketKind::Datagram, &mut packet)
+        .unwrap();
+    assert_eq!(payload.unknown(), 0);
+    assert_eq!(
+        payload.iter().collect::<Vec<_>>(),
+        [old::Message::Alive(old_alive)]
+    );
+
+    // The reply of a digest exchange, and the digest itself: 0.4 reads the records, features
+    // skipped in each, and skips both new types as types it does not know.
+    let recs = [Record {
+        state: State::Suspect,
+        alive: a,
+    }];
+    let entries = [DigestEntry {
+        state: State::Alive,
+        inc: 3,
+        node: id("node-a"),
+        epoch,
+    }];
+    let names = [id("node-a")];
+    let msgs = [
+        Message::PushPullDigest(PushPullDigest {
+            join: false,
+            entries: DigestEntries::Slice(&entries),
+        }),
+        Message::PushPull(PushPull {
+            join: false,
+            records: Records::Slice(&recs),
+        }),
+        Message::PushPullWants(PushPullWants {
+            names: Names::Slice(&names),
+        }),
+    ];
+    let mut frame = seal(&plain(b"c"), PacketKind::Stream, &msgs);
+    let payload = old_codec.open(old::PacketKind::Stream, &mut frame).unwrap();
+    assert_eq!((payload.count(), payload.unknown()), (3, 2));
+    let old_recs = [old::Record {
+        state: old::State::Suspect,
+        alive: old_alive,
+    }];
+    assert_eq!(
+        payload.iter().collect::<Vec<_>>(),
+        [old::Message::PushPull(old::PushPull {
+            join: false,
+            records: old::Records::Slice(&old_recs),
+        })]
+    );
+
+    // Without features, an Alive is the bytes 0.4 writes.
+    let plain_alive = Alive { features: 0, ..a };
+    let mut ours = seal(
+        &plain(b"c"),
+        PacketKind::Datagram,
+        &[Message::Alive(plain_alive)],
+    );
+    let mut theirs = Vec::new();
+    // Plaintext takes no nonce from it; any will do.
+    let nonce: [u8; 24] = std::array::from_fn(|i| i as u8);
+    old_codec
+        .seal(
+            old::PacketKind::Datagram,
+            &[old::Message::Alive(old_alive)],
+            &nonce,
+            &mut theirs,
+        )
+        .unwrap();
+    assert_eq!(ours, theirs);
+    assert!(plain(b"c").open(PacketKind::Datagram, &mut ours).is_ok());
 }
 
 #[test]

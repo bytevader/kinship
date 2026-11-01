@@ -3,8 +3,9 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use kinship_proto::{
-    Alive, Codec, Dead, FrameReader, Key, Limits, Message, NodeId, PacketKind, Payload, Ping,
-    PingReq, PushPull, Record, Records, State, Suspect, UserBroadcast, UserMessage, tags,
+    Alive, Codec, Dead, DigestEntries, DigestEntry, FrameReader, Key, Limits, Message, Names,
+    NodeId, PacketKind, Payload, Ping, PingReq, PushPull, PushPullDigest, PushPullWants, Record,
+    Records, State, Suspect, UserBroadcast, UserMessage, tags,
 };
 use proptest::prelude::*;
 
@@ -19,6 +20,7 @@ struct AliveM {
     vmin: u8,
     vmax: u8,
     epoch: u64,
+    features: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,11 @@ enum M {
         seq: u64,
         data: Vec<u8>,
     },
+    Digest {
+        join: bool,
+        entries: Vec<(u8, u32, String, u64)>,
+    },
+    Wants(Vec<String>),
 }
 
 fn name() -> impl Strategy<Value = String> {
@@ -102,17 +109,25 @@ fn alive_m() -> impl Strategy<Value = AliveM> {
         1u8..=255,
     )
         .prop_flat_map(|(inc, node, addr, meta, vmin)| {
-            (Just((inc, node, addr, meta, vmin)), vmin..=255, epoch())
+            (
+                Just((inc, node, addr, meta, vmin)),
+                vmin..=255,
+                epoch(),
+                prop_oneof![Just(0u32), any::<u32>()],
+            )
         })
-        .prop_map(|((inc, node, addr, meta, vmin), vmax, epoch)| AliveM {
-            inc,
-            node,
-            addr,
-            meta,
-            vmin,
-            vmax,
-            epoch,
-        })
+        .prop_map(
+            |((inc, node, addr, meta, vmin), vmax, epoch, features)| AliveM {
+                inc,
+                node,
+                addr,
+                meta,
+                vmin,
+                vmax,
+                epoch,
+                features,
+            },
+        )
 }
 
 /// No epoch half the time, as from nodes older than 0.3, and any other the rest.
@@ -174,6 +189,12 @@ fn msg() -> impl Strategy<Value = M> {
                 data,
             }
         }),
+        (
+            any::<bool>(),
+            prop::collection::vec((0u8..=3, any::<u32>(), name(), epoch()), 0..8)
+        )
+            .prop_map(|(join, entries)| M::Digest { join, entries }),
+        prop::collection::vec(name(), 0..8).prop_map(M::Wants),
     ]
 }
 
@@ -195,6 +216,7 @@ fn alive_of(a: &AliveM) -> Alive<'_> {
         vmin: a.vmin,
         vmax: a.vmax,
         epoch: a.epoch,
+        features: a.features,
     }
 }
 
@@ -217,10 +239,33 @@ fn with_messages<R>(ms: &[M], f: impl FnOnce(&[Message<'_>]) -> R) -> R {
             _ => Vec::new(),
         })
         .collect();
+    let entries: Vec<Vec<DigestEntry<'_>>> = ms
+        .iter()
+        .map(|m| match m {
+            M::Digest { entries, .. } => entries
+                .iter()
+                .map(|(s, inc, node, epoch)| DigestEntry {
+                    state: state(*s),
+                    inc: *inc,
+                    node: id(node),
+                    epoch: *epoch,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let names: Vec<Vec<NodeId<'_>>> = ms
+        .iter()
+        .map(|m| match m {
+            M::Wants(names) => names.iter().map(|n| id(n)).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
     let msgs: Vec<Message<'_>> = ms
         .iter()
         .zip(&records)
-        .map(|(m, recs)| match m {
+        .zip(entries.iter().zip(&names))
+        .map(|((m, recs), (entries, names))| match m {
             M::Ping {
                 seq,
                 target,
@@ -297,6 +342,13 @@ fn with_messages<R>(ms: &[M], f: impl FnOnce(&[Message<'_>]) -> R) -> R {
                 from_epoch: *from_epoch,
                 seq: *seq,
                 data,
+            }),
+            M::Digest { join, .. } => Message::PushPullDigest(PushPullDigest {
+                join: *join,
+                entries: DigestEntries::Slice(entries),
+            }),
+            M::Wants(_) => Message::PushPullWants(PushPullWants {
+                names: Names::Slice(names),
             }),
         })
         .collect();

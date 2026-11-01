@@ -23,6 +23,18 @@ pub mod kind {
     pub const USER_BROADCAST: u8 = 0x0A;
     pub const CERTIFICATE: u8 = 0x0B;
     pub const REVOCATION: u8 = 0x0C;
+    /// From 0.5, TCP only, and only to a member whose Alive advertises
+    /// [`feature::DIGEST_PUSH_PULL`](super::feature::DIGEST_PUSH_PULL).
+    pub const PUSH_PULL_DIGEST: u8 = 0x0D;
+    /// From 0.5, TCP only: the reply to a [`PUSH_PULL_DIGEST`], after a [`PUSH_PULL`].
+    pub const PUSH_PULL_WANTS: u8 = 0x0E;
+}
+
+/// Capability bits a node advertises in [`Alive::features`].
+pub mod feature {
+    /// The node answers a [`PushPullDigest`](super::PushPullDigest), so it may be sent one in
+    /// place of a full push-pull.
+    pub const DIGEST_PUSH_PULL: u32 = 1;
 }
 
 /// A node name: UTF-8, 1 to [`NodeId::MAX_LEN`] bytes. Borrowed, so decoding allocates nothing.
@@ -113,6 +125,10 @@ pub struct Alive<'a> {
     /// any earlier life the node hears of. Appended in 0.3: 0 is not sent, and a message
     /// without it, from an older node, reads as 0.
     pub epoch: u64,
+    /// The capabilities the node advertises, bits of [`feature`]. Appended in 0.5 after the
+    /// epoch, which is then written even when 0: 0 is not sent, and a message without it reads
+    /// as 0. Version 2 Alives do not carry it.
+    pub features: u32,
 }
 
 /// `Suspect`: `from` suspects `node` at incarnation `inc` of its life `epoch`.
@@ -286,6 +302,174 @@ pub struct PushPull<'a> {
     pub records: Records<'a>,
 }
 
+/// One member in a [`PushPullDigest`]: the state, incarnation and life a node holds it at,
+/// without the rest of its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DigestEntry<'a> {
+    pub state: State,
+    pub inc: u32,
+    pub node: NodeId<'a>,
+    /// Written even when 0, which means unknown, as in [`Alive::epoch`].
+    pub epoch: u64,
+}
+
+/// The entries of a [`PushPullDigest`], from a slice or from the frame, as [`Records`].
+#[derive(Clone, Copy)]
+pub enum DigestEntries<'a> {
+    /// Entries to encode.
+    Slice(&'a [DigestEntry<'a>]),
+    /// Entries validated by the decoder and still in wire form.
+    Wire { count: u32, bytes: &'a [u8] },
+}
+
+impl<'a> DigestEntries<'a> {
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Slice(s) => s.len(),
+            Self::Wire { count, .. } => *count as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> DigestIter<'a> {
+        match *self {
+            Self::Slice(s) => DigestIter::Slice(s.iter()),
+            Self::Wire { count, bytes } => DigestIter::Wire { left: count, bytes },
+        }
+    }
+}
+
+impl PartialEq for DigestEntries<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for DigestEntries<'_> {}
+
+impl fmt::Debug for DigestEntries<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Iterator over [`DigestEntries`].
+pub enum DigestIter<'a> {
+    Slice(core::slice::Iter<'a, DigestEntry<'a>>),
+    Wire { left: u32, bytes: &'a [u8] },
+}
+
+impl<'a> Iterator for DigestIter<'a> {
+    type Item = DigestEntry<'a>;
+
+    fn next(&mut self) -> Option<DigestEntry<'a>> {
+        match self {
+            Self::Slice(it) => it.next().copied(),
+            Self::Wire { left, bytes } => {
+                if *left == 0 {
+                    return None;
+                }
+                *left -= 1;
+                // The decoder walked these bytes once already, as for records.
+                let mut r = Reader::new(bytes);
+                let entry = read_digest_entry(r.bytes().ok()?).ok()?;
+                *bytes = r.rest();
+                Some(entry)
+            }
+        }
+    }
+}
+
+/// `PushPullDigest`: the first frame of a digest exchange, TCP only. The sender lists every
+/// member it holds, itself and tombstones included; the peer answers with a [`PushPull`] of the
+/// records it holds later and a [`PushPullWants`] of the names whose records it wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushPullDigest<'a> {
+    pub join: bool,
+    pub entries: DigestEntries<'a>,
+}
+
+/// A list of names, from a slice or from the frame, as [`Records`].
+#[derive(Clone, Copy)]
+pub enum Names<'a> {
+    /// Names to encode.
+    Slice(&'a [NodeId<'a>]),
+    /// Names validated by the decoder and still in wire form.
+    Wire { count: u32, bytes: &'a [u8] },
+}
+
+impl<'a> Names<'a> {
+    /// Number of names.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Slice(s) => s.len(),
+            Self::Wire { count, .. } => *count as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> NameIter<'a> {
+        match *self {
+            Self::Slice(s) => NameIter::Slice(s.iter()),
+            Self::Wire { count, bytes } => NameIter::Wire { left: count, bytes },
+        }
+    }
+}
+
+impl PartialEq for Names<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for Names<'_> {}
+
+impl fmt::Debug for Names<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Iterator over [`Names`].
+pub enum NameIter<'a> {
+    Slice(core::slice::Iter<'a, NodeId<'a>>),
+    Wire { left: u32, bytes: &'a [u8] },
+}
+
+impl<'a> Iterator for NameIter<'a> {
+    type Item = NodeId<'a>;
+
+    fn next(&mut self) -> Option<NodeId<'a>> {
+        match self {
+            Self::Slice(it) => it.next().copied(),
+            Self::Wire { left, bytes } => {
+                if *left == 0 {
+                    return None;
+                }
+                *left -= 1;
+                let mut r = Reader::new(bytes);
+                let node = read_node(&mut r).ok()?;
+                *bytes = r.rest();
+                Some(node)
+            }
+        }
+    }
+}
+
+/// `PushPullWants`: the names whose whole records the sender of a digest is to send back,
+/// TCP only, after the [`PushPull`] that answers the digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushPullWants<'a> {
+    pub names: Names<'a>,
+}
+
 /// A decoded or to-be-encoded message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message<'a> {
@@ -299,6 +483,8 @@ pub enum Message<'a> {
     PushPull(PushPull<'a>),
     UserMessage(UserMessage<'a>),
     UserBroadcast(UserBroadcast<'a>),
+    PushPullDigest(PushPullDigest<'a>),
+    PushPullWants(PushPullWants<'a>),
 }
 
 pub(crate) fn put_addr<S: Sink>(s: &mut S, addr: &SocketAddr) {
@@ -350,6 +536,17 @@ fn put_epoch<S: Sink>(s: &mut S, epoch: u64) {
     }
 }
 
+/// Appends an Alive's features after its epoch. Features 0 are not written, so a node that
+/// advertises none sends the bytes 0.4 did; any others need the epoch ahead of them, written
+/// even when it is 0, which no node that sets features has.
+fn put_epoch_and_features<S: Sink>(s: &mut S, epoch: u64, features: u32) {
+    if features == 0 {
+        return put_epoch(s, epoch);
+    }
+    s.put_u64(epoch);
+    s.put_varint(features);
+}
+
 /// Reads the epoch appended after a message's version 1 fields: 0 when the body ends there, as
 /// from a node older than 0.3. A body that ends part way into it is truncated. Bytes after it
 /// are fields appended by a newer version.
@@ -357,17 +554,39 @@ fn read_epoch(r: &mut Reader<'_>) -> Result<u64, DecodeError> {
     if r.is_empty() { Ok(0) } else { r.u64() }
 }
 
+/// Writes a version 1 Alive: its fields, then the epoch and features appended since.
 pub(crate) fn put_alive<S: Sink>(s: &mut S, a: &Alive<'_>) {
+    put_alive_fields(s, a);
+    put_epoch_and_features(s, a.epoch, a.features);
+}
+
+/// Writes an Alive's fields up to the version range, after which version 2 writes its own.
+pub(crate) fn put_alive_fields<S: Sink>(s: &mut S, a: &Alive<'_>) {
     s.put_u32(a.inc);
     put_node(s, &a.node);
     put_addr(s, &a.addr);
     s.put_bytes(a.meta);
     s.put_u8(a.vmin);
     s.put_u8(a.vmax);
-    put_epoch(s, a.epoch);
 }
 
+/// Reads a version 1 Alive: [`read_alive_fields`], then the features appended after the
+/// epoch, 0 when the body ends before them. Bytes after them are fields a newer version
+/// appended.
 pub(crate) fn read_alive<'a>(
+    r: &mut Reader<'a>,
+    limits: &Limits,
+) -> Result<Alive<'a>, DecodeError> {
+    let mut alive = read_alive_fields(r, limits)?;
+    if !r.is_empty() {
+        alive.features = r.varint()?;
+    }
+    Ok(alive)
+}
+
+/// Reads an Alive's fields and the epoch after them, with features 0: all that a version 2
+/// Alive holds ahead of its certificate id.
+pub(crate) fn read_alive_fields<'a>(
     r: &mut Reader<'a>,
     limits: &Limits,
 ) -> Result<Alive<'a>, DecodeError> {
@@ -392,6 +611,7 @@ pub(crate) fn read_alive<'a>(
         vmin,
         vmax,
         epoch,
+        features: 0,
     })
 }
 
@@ -412,6 +632,31 @@ fn read_record<'a>(body: &'a [u8], limits: &Limits) -> Result<Record<'a>, Decode
     Ok(Record { state, alive })
 }
 
+fn put_digest_entry<S: Sink>(s: &mut S, e: &DigestEntry<'_>) {
+    let mut c = Count::default();
+    put_digest_body(&mut c, e);
+    s.put_varint(c.0 as u32);
+    put_digest_body(s, e);
+}
+
+fn put_digest_body<S: Sink>(s: &mut S, e: &DigestEntry<'_>) {
+    s.put_u8(e.state as u8);
+    s.put_u32(e.inc);
+    put_node(s, &e.node);
+    s.put_u64(e.epoch);
+}
+
+fn read_digest_entry(body: &[u8]) -> Result<DigestEntry<'_>, DecodeError> {
+    let mut r = Reader::new(body);
+    // Bytes after the known fields are fields a newer version appended, as in a record.
+    Ok(DigestEntry {
+        state: State::from_wire(r.u8()?)?,
+        inc: r.u32()?,
+        node: read_node(&mut r)?,
+        epoch: r.u64()?,
+    })
+}
+
 impl<'a> Message<'a> {
     /// The wire type byte.
     pub fn kind(&self) -> u8 {
@@ -426,6 +671,8 @@ impl<'a> Message<'a> {
             Self::PushPull(_) => kind::PUSH_PULL,
             Self::UserMessage(_) => kind::USER_MESSAGE,
             Self::UserBroadcast(_) => kind::USER_BROADCAST,
+            Self::PushPullDigest(_) => kind::PUSH_PULL_DIGEST,
+            Self::PushPullWants(_) => kind::PUSH_PULL_WANTS,
         }
     }
 
@@ -496,6 +743,19 @@ impl<'a> Message<'a> {
                 s.put_u64(b.from_epoch);
                 s.put_u64(b.seq);
                 s.put_bytes(b.data);
+            }
+            Self::PushPullDigest(d) => {
+                s.put_u8(u8::from(d.join));
+                s.put_varint(d.entries.len() as u32);
+                for e in d.entries.iter() {
+                    put_digest_entry(s, &e);
+                }
+            }
+            Self::PushPullWants(w) => {
+                s.put_varint(w.names.len() as u32);
+                for n in w.names.iter() {
+                    put_node(s, &n);
+                }
             }
         }
     }
@@ -584,6 +844,38 @@ impl<'a> Message<'a> {
                 seq: r.u64()?,
                 data: r.bytes()?,
             }),
+            kind::PUSH_PULL_DIGEST => {
+                let join = read_bool(&mut r)?;
+                let count = r.varint()?;
+                let bytes = r.rest();
+                // Walked once here, as records are; each entry costs at least a byte.
+                if count as usize > bytes.len() {
+                    return Err(DecodeError::BadLength);
+                }
+                let mut walk = Reader::new(bytes);
+                for _ in 0..count {
+                    read_digest_entry(walk.bytes()?)?;
+                }
+                Self::PushPullDigest(PushPullDigest {
+                    join,
+                    entries: DigestEntries::Wire { count, bytes },
+                })
+            }
+            kind::PUSH_PULL_WANTS => {
+                let count = r.varint()?;
+                let bytes = r.rest();
+                // A name is at least its length and one byte.
+                if (count as usize).saturating_mul(2) > bytes.len() {
+                    return Err(DecodeError::BadLength);
+                }
+                let mut walk = Reader::new(bytes);
+                for _ in 0..count {
+                    read_node(&mut walk)?;
+                }
+                Self::PushPullWants(PushPullWants {
+                    names: Names::Wire { count, bytes },
+                })
+            }
             _ => return Ok(None),
         };
         Ok(Some(msg))

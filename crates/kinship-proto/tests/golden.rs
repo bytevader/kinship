@@ -9,8 +9,9 @@
 use core::net::SocketAddr;
 
 use kinship_proto::{
-    Alive, Codec, Dead, Key, Limits, Message, NodeId, PacketKind, Ping, PingReq, PushPull, Record,
-    Records, State, Suspect, UserBroadcast, UserMessage, tags,
+    Alive, Codec, Dead, DigestEntries, DigestEntry, Key, Limits, Message, Names, NodeId,
+    PacketKind, Ping, PingReq, PushPull, PushPullDigest, PushPullWants, Record, Records, State,
+    Suspect, UserBroadcast, UserMessage, feature, tags,
 };
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -44,6 +45,7 @@ fn alive_a() -> Alive<'static> {
         vmin: 1,
         vmax: 1,
         epoch: 0,
+        features: 0,
     }
 }
 
@@ -217,6 +219,88 @@ fn epochs_are_appended_to_alive_suspect_dead_and_records() {
 }
 
 #[test]
+fn features_are_appended_to_alive_after_the_epoch() {
+    // Appended in 0.5 as a varint after the epoch; features 0 add nothing, so the vectors
+    // above are what a node that advertises none still sends.
+    let alive = Alive {
+        epoch: EPOCH,
+        features: feature::DIGEST_PUSH_PULL,
+        ..alive_a()
+    };
+    check(
+        &[Message::Alive(alive)],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "01052700000003066e6f64652d61040a0000011f0a0904726f6c65036170690101000001a0c4506c00\
+         01",
+    );
+    // Features need the epoch ahead of them, so epoch 0 is written then.
+    check(
+        &[Message::Alive(Alive {
+            features: feature::DIGEST_PUSH_PULL,
+            ..alive_a()
+        })],
+        PacketKind::Datagram,
+        PLAIN_DGRAM,
+        "01052700000003066e6f64652d61040a0000011f0a0904726f6c6503617069010100000000000000\
+         0001",
+    );
+    let recs = [Record {
+        state: State::Alive,
+        alive,
+    }];
+    check(
+        &[Message::PushPull(PushPull {
+            join: false,
+            records: Records::Slice(&recs),
+        })],
+        PacketKind::Stream,
+        PLAIN_STREAM,
+        "01082b0001280000000003066e6f64652d61040a0000011f0a0904726f6c65036170690101\
+         000001a0c4506c0001",
+    );
+}
+
+#[test]
+fn push_pull_digest_and_wants() {
+    let entries = [
+        DigestEntry {
+            state: State::Alive,
+            inc: 3,
+            node: id("node-a"),
+            epoch: EPOCH,
+        },
+        DigestEntry {
+            state: State::Dead,
+            inc: 9,
+            node: id("b"),
+            epoch: 0,
+        },
+    ];
+    // join, count, then each entry as a varint length and state, incarnation, name and epoch,
+    // the epoch written even when 0.
+    check(
+        &[Message::PushPullDigest(PushPullDigest {
+            join: false,
+            entries: DigestEntries::Slice(&entries),
+        })],
+        PacketKind::Stream,
+        PLAIN_STREAM,
+        "010d270002140000000003066e6f64652d61000001a0c4506c000f02000000090162\
+         0000000000000000",
+    );
+    let names = [id("node-a"), id("b")];
+    check(
+        &[Message::PushPullWants(PushPullWants {
+            names: Names::Slice(&names),
+        })],
+        PacketKind::Stream,
+        PLAIN_STREAM,
+        "010e0a02066e6f64652d610162",
+    );
+}
+
+#[test]
 fn push_pull() {
     let recs = [
         Record {
@@ -233,6 +317,7 @@ fn push_pull() {
                 vmin: 1,
                 vmax: 2,
                 epoch: 0,
+                features: 0,
             },
         },
     ];
