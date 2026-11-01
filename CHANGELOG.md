@@ -22,6 +22,10 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 - **kinship-proto and kinship-core API.** `Alive` gains `features`, `Message` gains `PushPullDigest` and `PushPullWants`, and kinship-core's `Config` gains `push_pull_digest`: breaking for code that builds them without `..` or matches `Message` exhaustively, which these 0.x crates allow.
 - **Minimum Rust version 1.87**, from 1.85, for `ctutils` 0.4.5, which kinship-proto uses for constant-time comparisons. The Compose demo builds with Rust 1.87.0.
 
+### Fixed
+
+- **No false deaths after a partition heals (KP-06).** The node a partition cut off, or the nodes of a minority side, declared the members across it dead and, once the partition healed, gossiped those deaths and the ones whose suspicion ran out just after it, so members that never stopped went MemberDead and then MemberJoined on the other side, and `kinship.ring` moved their keys twice; the Compose demo's Partition showed it. A node now keeps a death to itself when it doubted its own view while it suspected the member, its local health above zero or no more than half of the members it knows held Alive: it applies the Dead, gossips nothing and sends only the member a Suspect to refute. Other nodes still declare a real failure through their own probes and suspicions. In the simulator, 429 of 1,000 seeds that cut off one node or a minority showed a false death, and none do now, in mode `off` or `sign`. The precedence rules and the wire are unchanged; the pinned SWIM trace of the simulator changes. See `docs/results/heal-flap.md`.
+
 ### Security
 
 - **RUSTSEC-2026-0385.** `ctutils` 0.4.2 generated masks and compared `u128` values in time that could depend on the data; updated to 0.4.5.
