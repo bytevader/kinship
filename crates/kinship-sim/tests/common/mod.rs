@@ -29,6 +29,7 @@ pub fn ms(m: u64) -> Duration {
 pub fn config() -> Config {
     let mut cfg = Config::lan(Security::Keys(vec![Key::from_bytes([7; 32])]));
     cfg.push_pull_scale = env("KINSHIP_PUSH_PULL_SCALE") == Some(1);
+    cfg.push_pull_digest = env("KINSHIP_PUSH_PULL_DIGEST") != Some(0);
     cfg
 }
 

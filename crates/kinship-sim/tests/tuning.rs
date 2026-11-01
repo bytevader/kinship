@@ -21,6 +21,9 @@
 //! - `pushpull`: `lan` and `epochs` again at 200 and 1,000 nodes with `push_pull_scale=1`, the
 //!   push-pull interval scaled with the cluster; `pushpull_verdict` compares them with the rows
 //!   above, and `docs/results/pushpull.md` has the result.
+//! - `digest`: `lan`, `epochs` and `epochs push_pull_scale=1` at 200 and 1,000 nodes with digest
+//!   push-pull, which `push_pull_digest` turns on by default; `digest_verdict` compares them
+//!   with the rows above, and `docs/results/digest.md` has the result.
 //!
 //! `cargo test --release -p kinship-sim --test tuning -- --ignored --nocapture --exact screen`,
 //! then `grid`, then `verdict`, which applies the rule in [`verdict_table`] to the CSV.
@@ -131,6 +134,7 @@ fn config(variant: &str) -> Config {
             "retransmit_mult" => cfg.retransmit_mult = int(),
             "gossip_nodes" => cfg.gossip_nodes = int() as usize,
             "push_pull_scale" => cfg.push_pull_scale = int() == 1,
+            "push_pull_digest" => cfg.push_pull_digest = int() == 1,
             _ => panic!("{variant}: unknown field {field}"),
         }
     }
@@ -836,6 +840,13 @@ fn pushpull_table(csv: &str) -> String {
             ))
         })
         .collect();
+    pairs_table(&pairs)
+}
+
+/// Rows against the rows they are compared with, as (after, before): per cluster size and
+/// variant, the bandwidth ratio, the change in detection p50 and p99, and false deaths and
+/// undetected crashes per run summed over the cells; then every cell.
+fn pairs_table(pairs: &[(&Row, &Row)]) -> String {
     let nodes = |r: &Row| -> usize { r.cell.split(',').next().unwrap().parse().unwrap() };
     let mut out = String::from(concat!(
         "| Nodes | Variant | Cells | Bandwidth, mean | Bandwidth, worst | p50 change (s) | ",
@@ -878,7 +889,7 @@ fn pushpull_table(csv: &str) -> String {
         "False deaths before | False deaths after |\n",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ));
-    for (a, b) in &pairs {
+    for (a, b) in pairs {
         writeln!(
             out,
             "| {} | {} | {:.0} | {:.0} | {:.3} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
@@ -905,6 +916,92 @@ fn pushpull_table(csv: &str) -> String {
 fn pushpull_verdict() {
     let csv = std::fs::read_to_string(csv_path()).expect("run the pushpull sweep first");
     print!("{}", pushpull_table(&csv));
+}
+
+/// Digest push-pull (`docs/results/digest.md`), on by default since `push_pull_digest`: `lan`,
+/// whose nodes have no epoch and so never use it, `epochs`, and `epochs push_pull_scale=1`, on
+/// the screen's cells and seeds at 200 and 1,000 nodes. `digest_verdict` compares them with
+/// the rows the full exchange left in stages `screen`, `signed` and `pushpull`.
+#[test]
+#[ignore = "several hours in release mode"]
+fn digest() {
+    let sizes: Vec<Size> = screen_sizes()
+        .into_iter()
+        .filter(|s| s.nodes >= 200)
+        .collect();
+    sweep(
+        "digest",
+        &sizes,
+        &variants(&["lan", EPOCHS, "epochs push_pull_scale=1"]),
+    );
+}
+
+/// The row a `digest` row is compared with: the same variant with the full exchange, `lan` in
+/// stage `screen`, `epochs` in stage `signed` and a scaled one in stage `pushpull`.
+fn full_exchange(variant: &str) -> (&'static str, String) {
+    let stage = if variant.split(' ').any(|c| c == SCALED) {
+        "pushpull"
+    } else if has_epochs(variant) {
+        "signed"
+    } else {
+        "screen"
+    };
+    (stage, variant.to_owned())
+}
+
+/// Every `digest` row against the same cell and variant with the full exchange; then, for
+/// whether the scaled interval still pays, `epochs push_pull_scale=1` against `epochs`, both
+/// with the digest.
+fn digest_table(csv: &str) -> String {
+    let rows: Vec<Row> = csv.lines().skip(1).map(Row::parse).collect();
+    let by_key: BTreeMap<(&str, &str, &str), &Row> = rows
+        .iter()
+        .map(|r| ((r.stage.as_str(), r.cell.as_str(), r.variant.as_str()), r))
+        .collect();
+    let digest: Vec<&Row> = rows.iter().filter(|r| r.stage == "digest").collect();
+    let pairs: Vec<(&Row, &Row)> = digest
+        .iter()
+        .filter_map(|r| {
+            let (stage, variant) = full_exchange(&r.variant);
+            Some((
+                *r,
+                *by_key.get(&(stage, r.cell.as_str(), variant.as_str()))?,
+            ))
+        })
+        .collect();
+    let scaled: Vec<(&Row, &Row)> = digest
+        .iter()
+        .filter(|r| r.variant.split(' ').any(|c| c == SCALED))
+        .filter_map(|r| {
+            let base = unscaled(&r.variant);
+            Some((
+                *r,
+                *by_key.get(&("digest", r.cell.as_str(), base.as_str()))?,
+            ))
+        })
+        .collect();
+    let mut out = String::from(
+        "Digest against the full exchange:
+
+",
+    );
+    out.push_str(&pairs_table(&pairs));
+    out.push_str(
+        "
+With the digest, the scaled interval against the fixed one:
+
+",
+    );
+    out.push_str(&pairs_table(&scaled));
+    out
+}
+
+/// Prints [`digest_table`] from `docs/results/tuning.csv`.
+#[test]
+#[ignore = "reads the CSV the sweeps write"]
+fn digest_verdict() {
+    let csv = std::fs::read_to_string(csv_path()).expect("run the digest sweep first");
+    print!("{}", digest_table(&csv));
 }
 
 /// `lan()` and the candidates, every cell at 50, 200 and 1,000 nodes.

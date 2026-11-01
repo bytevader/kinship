@@ -120,6 +120,7 @@ impl Peer {
                     vmin: 1,
                     vmax: 1,
                     epoch,
+                    features: 0,
                 }),
                 Rumour::Suspect { inc, epoch } => Message::Suspect(Suspect {
                     inc,
