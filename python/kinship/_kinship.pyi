@@ -67,6 +67,7 @@ class Config:
     retransmit_mult: int
     push_pull_interval: float
     push_pull_scale: bool
+    push_pull_digest: bool
     reconnect_interval: float
     rejoin_interval: float
     # Limits and runtime

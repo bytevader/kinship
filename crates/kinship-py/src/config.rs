@@ -233,6 +233,7 @@ impl Fields {
             dynamic_suspicion => dynamic_suspicion,
             buddy_system => buddy_system,
             push_pull_scale => push_pull_scale,
+            push_pull_digest => push_pull_digest,
         }
         let count = |v: &Bound<'_, PyAny>| {
             integer::<usize>(v).ok_or_else(|| bad("must be a non-negative integer"))
@@ -377,6 +378,7 @@ impl Fields {
             "retransmit_mult" => c.retransmit_mult.into_py_any(py),
             "push_pull_interval" => secs(c.push_pull_interval),
             "push_pull_scale" => c.push_pull_scale.into_py_any(py),
+            "push_pull_digest" => c.push_pull_digest.into_py_any(py),
             "reconnect_interval" => secs(c.reconnect_interval),
             "rejoin_interval" => secs(c.rejoin_interval),
             "udp_max_payload" => c.limits.udp_max_payload.into_py_any(py),
@@ -432,6 +434,7 @@ const FIELDS: &[&str] = &[
     "retransmit_mult",
     "push_pull_interval",
     "push_pull_scale",
+    "push_pull_digest",
     "reconnect_interval",
     "rejoin_interval",
     "udp_max_payload",

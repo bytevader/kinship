@@ -18,6 +18,8 @@ def test_presets_differ_only_in_timing() -> None:
     assert (wan.probe_interval, wan.probe_timeout, wan.push_pull_interval) == (5.0, 3.0, 60.0)
     assert not lan.push_pull_scale and not wan.push_pull_scale and not local.push_pull_scale
     assert lan.replace(push_pull_scale=True).push_pull_scale
+    assert lan.push_pull_digest and wan.push_pull_digest and local.push_pull_digest
+    assert not lan.replace(push_pull_digest=False).push_pull_digest
     assert local.probe_interval == pytest.approx(0.2)
     assert lan.tcp_fallback_ping and not local.tcp_fallback_ping
     assert lan.bind == "0.0.0.0:7946" and local.bind == "127.0.0.1:7946"
