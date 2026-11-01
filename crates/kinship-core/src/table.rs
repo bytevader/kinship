@@ -25,6 +25,10 @@ pub(crate) struct Entry {
     pub proof: Option<AliveProof>,
     /// The member's signed Left, kept with its tombstone.
     pub left: Option<LeftProof>,
+    /// The capabilities the member advertises in its Alive (`kinship_proto::feature`): those
+    /// of the Alive it is held at, and any a copy of that same Alive adds, since a node older
+    /// than 0.5 drops them when it passes the Alive on. 0 for a member from a static list.
+    pub features: u32,
 }
 
 impl Entry {
@@ -131,6 +135,13 @@ impl Table {
     pub fn set_proof(&mut self, name: &str, proof: Option<AliveProof>) {
         if let Some(entry) = self.entries.get_mut(name) {
             entry.proof = proof;
+        }
+    }
+
+    /// Adds to the capabilities a known member advertises; see [`Entry::features`].
+    pub fn add_features(&mut self, name: &str, features: u32) {
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.features |= features;
         }
     }
 
@@ -243,6 +254,7 @@ mod tests {
             vmax: 1,
             proof: None,
             left: None,
+            features: 0,
         }
     }
 

@@ -943,6 +943,7 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch,
+            features: 0,
         })
     }
 

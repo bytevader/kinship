@@ -159,7 +159,7 @@ impl Node {
 
     /// Takes one admission from `budget` if the table and the packet have room for a new
     /// member, and counts a refusal otherwise.
-    fn admit(&mut self, budget: &mut Admission) -> bool {
+    pub(crate) fn admit(&mut self, budget: &mut Admission) -> bool {
         if budget.left == 0 || !self.has_room() {
             self.metrics.members_refused += 1;
             return false;
@@ -216,6 +216,7 @@ impl Node {
                 vmax: a.vmax,
                 proof: signed.as_ref().map(|s| s.proof),
                 left: None,
+                features: a.features,
             });
             let gossip = self.alive_gossip(a, signed.as_ref(), true);
             self.broadcast(gossip);
@@ -254,6 +255,11 @@ impl Node {
                         self.announce_to(name);
                     }
                 }
+                // The member's own word on what it can do, which a 0.4 relay dropped when it
+                // passed the same Alive on.
+                if self.table.get(name).is_some_and(|e| e.holds(a)) {
+                    self.table.add_features(name, a.features);
+                }
                 // A signed copy of the Alive held without a proof, as a 0.4 relay passes it on.
                 let unsigned = self
                     .table
@@ -286,6 +292,7 @@ impl Node {
         entry.member.meta.extend_from_slice(a.meta);
         entry.vmin = a.vmin;
         entry.vmax = a.vmax;
+        entry.features = a.features;
         if a.epoch != 0 {
             // New if this node first heard of the member through a node older than 0.3.
             entry.member.epoch = a.epoch;
@@ -343,6 +350,7 @@ impl Node {
         entry.member.meta.extend_from_slice(a.meta);
         entry.vmin = a.vmin;
         entry.vmax = a.vmax;
+        entry.features = a.features;
         entry.proof = signed.as_ref().map(|s| s.proof);
         let member = entry.member.clone();
         if signed.is_none() {
@@ -545,7 +553,7 @@ impl Node {
 
     /// A Suspect or Dead about this node at `inc` of its life `epoch`. One about an earlier
     /// life is answered with this life's Alive, as a stale one is.
-    fn about_self(&mut self, inc: u32, epoch: u64) {
+    pub(crate) fn about_self(&mut self, inc: u32, epoch: u64) {
         match life(epoch, self.local.member.epoch) {
             Life::Later => self.outlive(epoch, inc),
             Life::Same if at_least(inc, self.local.member.incarnation) => {
@@ -571,6 +579,8 @@ impl Node {
         if at_least(inc, me.incarnation) {
             me.incarnation = inc.wrapping_add(1);
         }
+        // A node that had no epoch has one now.
+        self.local.features = self.own_features();
         self.metrics.refutations += 1;
         // A new life: its first Alive carries the certificate, as a node's first one does.
         self.resign_local();

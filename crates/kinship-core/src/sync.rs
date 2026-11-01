@@ -6,6 +6,12 @@
 //! accepting side keeps no state between the two, so a peer that opens many connections costs
 //! nothing beyond the frames it actually sends, and those are bounded by `max_stream_frame`
 //! before the driver buffers them and again before the core copies them.
+//!
+//! A digest exchange (`docs/pushpull-digest.md`) takes one frame more: the side that opened it
+//! sends a digest of every member it holds, the accepting side answers with the records it
+//! holds later and the names whose records it wants, and when it wants some it keeps the
+//! connection open, for at most `tcp_timeout` and at most [`MAX_AWAITING`] connections at once,
+//! until the opener sends those records and closes.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -16,15 +22,15 @@ use std::collections::BTreeSet;
 use kinship_proto::identity::CertificateId;
 use kinship_proto::v2;
 use kinship_proto::{
-    Alive, Dead, Message, PacketKind, Ping, PushPull, Record, Records, VersionedPayload,
-    WireVersion,
+    Alive, Dead, DigestEntries, DigestEntry, Message, Names, PacketKind, Ping, PushPull,
+    PushPullDigest, PushPullWants, Record, Records, VersionedPayload, WireVersion, feature,
 };
 
 use crate::broadcast::{Gossip, id};
 use crate::config::Config;
 use crate::event::{CommandError, CommandId, CommandOutput, Event};
 use crate::io::{StreamEvent, StreamId, Transmit};
-use crate::member::{Admission, State};
+use crate::member::{Admission, Life, State, life, newer};
 use crate::replay::stamp_of;
 use crate::signing::{Keys, LeftProof, packet_certs, signed_alive};
 use crate::table::Entry;
@@ -57,7 +63,14 @@ pub(crate) struct Outbound {
     /// The wire version its frames are sealed at: 2 for the exchange of signed records with a
     /// member that speaks it, 1 otherwise.
     version: WireVersion,
+    /// The exchange started with a digest, so the reply carries the names the peer wants.
+    digest: bool,
 }
+
+/// Most connections a peer opened that wait for the records their digest's answer asked for.
+/// Each holds only a deadline, and the driver bounds the connections it accepts far below
+/// this; a digest beyond it is answered without asking for any.
+pub(crate) const MAX_AWAITING: usize = 1024;
 
 /// A join in progress.
 #[derive(Debug, Clone)]
@@ -93,6 +106,9 @@ pub(crate) struct Sync {
     pub streams: BTreeMap<StreamId, Outbound>,
     next_stream: u64,
     pub joins: BTreeMap<CommandId, Join>,
+    /// Connections a peer opened whose digest this node answered with names it wants, each
+    /// with the instant it stops waiting for their records.
+    pub awaiting: BTreeMap<StreamId, Instant>,
     push_pull: Option<SyncTimer>,
     next_reconnect: Option<Instant>,
     /// The Leave command waiting for this node's Left rumour to finish spreading.
@@ -106,6 +122,7 @@ impl Sync {
             streams: BTreeMap::new(),
             next_stream: 0,
             joins: BTreeMap::new(),
+            awaiting: BTreeMap::new(),
             push_pull: first_push_pull.map(SyncTimer::First),
             next_reconnect: first_reconnect,
             leaving: None,
@@ -130,6 +147,69 @@ fn wire_state(state: State) -> kinship_proto::State {
         State::Suspect => kinship_proto::State::Suspect,
         State::Dead => kinship_proto::State::Dead,
         State::Left => kinship_proto::State::Left,
+    }
+}
+
+/// What a node holds about a member, as a digest lists it: state, incarnation and epoch.
+type Held = (kinship_proto::State, u32, u64);
+
+fn held(e: &Entry) -> Held {
+    (
+        wire_state(e.member.state),
+        e.member.incarnation,
+        e.member.epoch,
+    )
+}
+
+/// How a state ranks against another at the same incarnation: a Suspect wins over Alive, and
+/// Dead and Left over both, while neither of those two changes the other.
+fn rank(state: kinship_proto::State) -> u8 {
+    match state {
+        kinship_proto::State::Alive => 0,
+        kinship_proto::State::Suspect => 1,
+        kinship_proto::State::Dead | kinship_proto::State::Left => 2,
+    }
+}
+
+/// Whether a record held at `x` could change anything at a node that holds the same member at
+/// `y`, when merged as a push-pull merges it: it is a later life, or the same life at a newer
+/// incarnation, or the same incarnation in a state that wins. Where the two cannot be ordered,
+/// as when one side does not know the epoch, it says yes, so that both records cross and each
+/// side merges the other's as a full exchange would; equal entries send nothing, since an
+/// equal epoch, incarnation and state mean an equal record.
+fn teaches(x: Held, y: Held) -> bool {
+    let ((xs, xi, xe), (ys, yi, ye)) = (x, y);
+    if x == y {
+        return false;
+    }
+    if xe != ye {
+        // `Same` here means one of them is 0, unknown.
+        return life(xe, ye) != Life::Earlier;
+    }
+    if newer(xi, yi) {
+        true
+    } else if newer(yi, xi) {
+        false
+    } else {
+        // Equal, or exactly 2^31 apart and so unordered.
+        xi != yi || rank(xs) > rank(ys)
+    }
+}
+
+/// The push-pull record of `e`.
+fn record(e: &Entry) -> Record<'_> {
+    Record {
+        state: wire_state(e.member.state),
+        alive: Alive {
+            inc: e.member.incarnation,
+            node: id(&e.member.name),
+            addr: e.member.addr,
+            meta: &e.member.meta,
+            vmin: e.vmin,
+            vmax: e.vmax,
+            epoch: e.member.epoch,
+            features: e.features,
+        },
     }
 }
 
@@ -170,6 +250,8 @@ impl Node {
         match ev {
             StreamEvent::Frame(frame) => self.on_frame(conn, frame),
             StreamEvent::Closed | StreamEvent::Failed => {
+                // A peer that closes before sending the records it was asked for sends none.
+                self.sync.awaiting.remove(&conn);
                 if let Some(o) = self.sync.streams.remove(&conn) {
                     if o.purpose == Purpose::Message {
                         // The receiver closes once it has handled the messages.
@@ -189,6 +271,9 @@ impl Node {
             // A late frame on a connection this node already gave up on.
             return;
         }
+        // The records that this node's answer to a digest asked for, on the connection it kept
+        // open for them; whatever else the frame holds, it is the last.
+        let wanted = self.sync.awaiting.remove(&conn).is_some();
         // Checked before the copy below, as the driver's framer already did before buffering.
         if frame.len() > self.cfg.limits.max_stream_frame {
             self.metrics.decode_errors += 1;
@@ -220,14 +305,22 @@ impl Node {
                 .map(VersionedPayload::V1)
         };
         let answered = match opened {
+            Ok(_) if matches!(stamp, Stamp::Stale) && wanted => {
+                // The opener caught up with this node's answer before it sealed these.
+                self.metrics.replays_dropped += 1;
+                false
+            }
             Ok(payload) if matches!(stamp, Stamp::Stale) => {
                 // An authentic request from a node that has fallen behind cluster time: one that
-                // just started, or a recording. Merge nothing, and answer a push-pull with this
-                // node's own record only: a real joiner catches up from it and asks again.
+                // just started, or a recording. Merge nothing, and answer a push-pull or a
+                // digest with this node's own record only: a real joiner catches up from it and
+                // asks again.
                 self.metrics.replays_dropped += 1;
                 match payload {
                     VersionedPayload::V1(payload) => {
-                        let push_pull = payload.iter().any(|m| matches!(m, Message::PushPull(_)));
+                        let push_pull = payload.iter().any(|m| {
+                            matches!(m, Message::PushPull(_) | Message::PushPullDigest(_))
+                        });
                         push_pull && self.send_state(conn, false, false)
                     }
                     VersionedPayload::V2(payload) => {
@@ -249,9 +342,11 @@ impl Node {
                         _ => None,
                     };
                     match payload {
+                        VersionedPayload::V1(payload) if wanted => self.on_wanted(now, &payload),
                         VersionedPayload::V1(payload) => {
                             self.on_frame_v1(now, conn, &payload, reply_stamp)
                         }
+                        VersionedPayload::V2(_) if wanted => false,
                         VersionedPayload::V2(payload) => {
                             // Direct messages are signed over the frame's nonce.
                             let nonce = kinship_proto::sealed_nonce(frame);
@@ -268,6 +363,10 @@ impl Node {
             }
         };
         self.recv_buf = scratch;
+        if self.sync.awaiting.contains_key(&conn) {
+            // Answered a digest, and waits for the records it asked for.
+            return;
+        }
         self.end_stream(conn, answered);
     }
 
@@ -281,6 +380,9 @@ impl Node {
     ) -> bool {
         // Every record in the frame shares one admission budget for new members.
         let mut budget = self.admission();
+        if let Some(out) = self.sync.streams.get(&conn).filter(|o| o.digest).cloned() {
+            return self.on_digest_reply(now, conn, &out, payload, reply_stamp, &mut budget);
+        }
         let mut answered = false;
         // User messages wait for the rest, so that an Alive in the frame introduces their
         // sender; only a connection a peer opened carries them.
@@ -412,6 +514,11 @@ impl Node {
                 self.joined |= p.join;
                 true
             }
+            Message::PushPullDigest(d) => {
+                self.answer_digest(conn, d, budget);
+                self.joined |= d.join;
+                true
+            }
             Message::Ping(p) => {
                 if p.target.as_str() == self.local.member.name {
                     self.out.frame(conn, &[Message::Ack { seq: p.seq }]);
@@ -462,15 +569,150 @@ impl Node {
         }
     }
 
+    /// Answers a digest on `conn`: a push-pull of the records this node holds later than the
+    /// digest lists them, or holds where it lists none, and the names whose records it wants.
+    /// It wants a name the digest lists later than this node holds it, and one it does not
+    /// hold only if listed Alive, as a merge adds no other, and only while `budget` and the
+    /// table have room for it (KI-04); likewise it sends the record of a member the digest
+    /// does not list only if it holds the member Alive. When it wants any, it keeps the
+    /// connection open for their records.
+    ///
+    /// A Suspect, Dead or Left entry about this node needs nothing but what the digest says,
+    /// and is refuted before the answer, as a full exchange's merge would be, so that the
+    /// answer carries the refutation.
+    fn answer_digest(&mut self, conn: StreamId, d: &PushPullDigest<'_>, budget: &mut Admission) {
+        let theirs: BTreeMap<&str, DigestEntry<'_>> =
+            d.entries.iter().map(|e| (e.node.as_str(), e)).collect();
+        let me = theirs.get(self.local.member.name.as_str());
+        if let Some(t) = me.filter(|t| t.state != kinship_proto::State::Alive) {
+            self.about_self(t.inc, t.epoch);
+        }
+        let mut wants = Vec::new();
+        if self.sync.awaiting.len() < MAX_AWAITING {
+            for t in theirs.values() {
+                let name = t.node.as_str();
+                let mine = if name == self.local.member.name {
+                    Some(&self.local)
+                } else {
+                    self.table.get(name)
+                };
+                let want = match mine {
+                    Some(e) => teaches((t.state, t.inc, t.epoch), held(e)),
+                    None => t.state == kinship_proto::State::Alive && self.admit(budget),
+                };
+                if want {
+                    wants.push(t.node);
+                }
+            }
+        }
+        let records: Vec<Record<'_>> = std::iter::once(&self.local)
+            .chain(self.table.iter())
+            .filter(|e| match theirs.get(e.member.name.as_str()) {
+                Some(t) => teaches(held(e), (t.state, t.inc, t.epoch)),
+                None => e.member.state == State::Alive,
+            })
+            .map(record)
+            .collect();
+        let msgs = [
+            Message::PushPull(PushPull {
+                join: false,
+                records: Records::Slice(&records),
+            }),
+            Message::PushPullWants(PushPullWants {
+                names: Names::Slice(&wants),
+            }),
+        ];
+        let sent = self.out.frame(conn, &msgs);
+        drop(records);
+        if !sent {
+            self.metrics.state_too_large += 1;
+            return;
+        }
+        self.metrics.push_pulls_served += 1;
+        if !wants.is_empty() {
+            let deadline = self.now + self.cfg.tcp_timeout;
+            self.sync.awaiting.insert(conn, deadline);
+        }
+    }
+
+    /// Handles the reply to a digest this node sent on `conn`: merges its records, then sends
+    /// the whole records of the names the peer wants, which closes the exchange. True if it
+    /// was the reply.
+    fn on_digest_reply(
+        &mut self,
+        now: Instant,
+        conn: StreamId,
+        out: &Outbound,
+        payload: &kinship_proto::Payload<'_>,
+        stamp: Option<u64>,
+        budget: &mut Admission,
+    ) -> bool {
+        let Some(p) = payload.iter().find_map(|m| match m {
+            Message::PushPull(p) => Some(p),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.merge(now, p.records, budget);
+        // A stale answer holds the peer's own record and wants nothing; pulled() asks again.
+        let wants = payload.iter().find_map(|m| match m {
+            Message::PushPullWants(w) => Some(w.names),
+            _ => None,
+        });
+        if let Some(names) = wants.filter(|n| !n.is_empty() && !self.stale_reply(out, stamp)) {
+            self.send_wanted(conn, names);
+        }
+        self.pulled(out, stamp)
+    }
+
+    /// Writes to `conn` the whole records of the members in `names` that this node holds,
+    /// itself included, each once, as they stand after the merge of the peer's records.
+    fn send_wanted(&mut self, conn: StreamId, names: Names<'_>) {
+        let names: BTreeSet<&str> = names.iter().map(|n| n.as_str()).collect();
+        let records: Vec<Record<'_>> = std::iter::once(&self.local)
+            .chain(self.table.iter())
+            .filter(|e| names.contains(e.member.name.as_str()))
+            .map(record)
+            .collect();
+        let msg = Message::PushPull(PushPull {
+            join: false,
+            records: Records::Slice(&records),
+        });
+        let sent = self.out.frame(conn, &[msg]);
+        drop(records);
+        if !sent {
+            self.metrics.state_too_large += 1;
+        }
+    }
+
+    /// Merges the records that this node's answer to a digest asked for, which share one
+    /// admission budget, as a push-pull's do. True: the frame was the one awaited.
+    fn on_wanted(&mut self, now: Instant, payload: &kinship_proto::Payload<'_>) -> bool {
+        let Some(p) = payload.iter().find_map(|m| match m {
+            Message::PushPull(p) => Some(p),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let mut budget = self.admission();
+        self.merge(now, p.records, &mut budget);
+        true
+    }
+
+    /// Whether the peer found this node's request stale, judging by the cluster time `stamp`
+    /// it sealed its reply at, and the request was not already the second try.
+    fn stale_reply(&self, out: &Outbound, stamp: Option<u64>) -> bool {
+        let window = self.replay.window_ms();
+        !out.repeat && stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window)
+    }
+
     /// Finishes a push-pull this node opened, once the reply merged. `stamp` is the cluster
     /// time the reply was sealed at, when encrypted. True: the reply was the answer.
     fn pulled(&mut self, out: &Outbound, stamp: Option<u64>) -> bool {
-        let window = self.replay.window_ms();
-        let was_stale = stamp.is_some_and(|s| s.saturating_sub(out.stamp) > window);
-        if was_stale && !out.repeat {
+        if self.stale_reply(out, stamp) {
             // The peer found this node's request stale and sent only its own record.
             // This node has caught up from the reply, so it asks again at once.
-            self.push_pull_with(out.to, out.purpose, true, out.version);
+            self.push_pull_with(out.to, out.purpose, true, out.version, out.digest);
             return true;
         }
         self.metrics.push_pulls += 1;
@@ -483,6 +725,7 @@ impl Node {
     /// Closes `conn` after its frame was handled; an outbound exchange that got no usable
     /// reply has failed.
     fn end_stream(&mut self, conn: StreamId, answered: bool) {
+        self.sync.awaiting.remove(&conn);
         if let Some(o) = self.sync.streams.remove(&conn) {
             if o.purpose == Purpose::Message {
                 // Timed out, or answered with a frame the receiver never sends.
@@ -539,18 +782,7 @@ impl Node {
         let others = if full { self.table.len() } else { 0 };
         let records: Vec<Record<'_>> = std::iter::once(&self.local)
             .chain(self.table.iter().take(others))
-            .map(|e| Record {
-                state: wire_state(e.member.state),
-                alive: Alive {
-                    inc: e.member.incarnation,
-                    node: id(&e.member.name),
-                    addr: e.member.addr,
-                    meta: &e.member.meta,
-                    vmin: e.vmin,
-                    vmax: e.vmax,
-                    epoch: e.member.epoch,
-                },
-            })
+            .map(record)
             .collect();
         let msg = Message::PushPull(PushPull {
             join,
@@ -562,6 +794,55 @@ impl Node {
             self.metrics.state_too_large += 1;
         }
         sent
+    }
+
+    /// Writes the digest of this node's whole view, tombstones included, to `conn`: the state,
+    /// incarnation and epoch of every member. False if it does not fit.
+    fn send_digest(&mut self, conn: StreamId, join: bool) -> bool {
+        let entries: Vec<DigestEntry<'_>> = std::iter::once(&self.local)
+            .chain(self.table.iter())
+            .map(|e| DigestEntry {
+                state: wire_state(e.member.state),
+                inc: e.member.incarnation,
+                node: id(&e.member.name),
+                epoch: e.member.epoch,
+            })
+            .collect();
+        let msg = Message::PushPullDigest(PushPullDigest {
+            join,
+            entries: DigestEntries::Slice(&entries),
+        });
+        let sent = self.out.frame(conn, &[msg]);
+        drop(entries);
+        if !sent {
+            self.metrics.state_too_large += 1;
+        }
+        sent
+    }
+
+    /// The capabilities this node advertises in its Alive: digest push-pull with
+    /// `push_pull_digest` in mode `off`, once it has an epoch, without which it could not
+    /// write them.
+    pub(crate) fn own_features(&self) -> u32 {
+        let digest =
+            self.cfg.push_pull_digest && self.keys.is_none() && self.local.member.epoch != 0;
+        if digest { feature::DIGEST_PUSH_PULL } else { 0 }
+    }
+
+    /// Whether an exchange with the member `peer` at `to`, or with the member at `to` when no
+    /// name is known, as for a seed, starts with a digest: when this node advertises digest
+    /// push-pull and holds that member, at that address, advertising it too. A joiner holds
+    /// nobody, so a join is a full exchange, and so is one with a member that does not
+    /// advertise it, or that this node holds without it.
+    fn digest_to(&self, peer: Option<&str>, to: SocketAddr) -> bool {
+        let speaks = |e: &Entry| e.member.addr == to && e.features & feature::DIGEST_PUSH_PULL != 0;
+        if self.local.features & feature::DIGEST_PUSH_PULL == 0 {
+            return false;
+        }
+        match peer {
+            Some(name) => self.table.get(name).is_some_and(speaks),
+            None => self.table.iter().any(speaks),
+        }
     }
 
     /// Writes the version 2 push-pull of this node's signed records to `conn`, every member it
@@ -653,32 +934,42 @@ impl Node {
             stamp: self.out.stamp,
             repeat,
             version,
+            digest: false,
         };
         self.sync.streams.insert(conn, outbound);
         conn
     }
 
-    /// Exchanges state with the member at `to`, at `version`: version 1, the push-pull 0.4
-    /// sends; or with a member that speaks version 2, the push-pull of signed records, and
-    /// beside it, on a second connection, the version 1 one, whenever this node holds a record
-    /// the first cannot carry or is joining (`docs/ki01-stage2.md`, Unsigned statements).
-    fn exchange(&mut self, to: SocketAddr, purpose: Purpose, version: WireVersion) {
-        self.push_pull_with(to, purpose, false, version);
+    /// Exchanges state with the member `peer` at `to`, at `version`: version 1, the push-pull
+    /// 0.4 sends, or its digest with a member that advertises it ([`Node::digest_to`]); or with
+    /// a member that speaks version 2, the push-pull of signed records, and beside it, on a
+    /// second connection, the version 1 one, whenever this node holds a record the first
+    /// cannot carry or is joining (`docs/ki01-stage2.md`, Unsigned statements).
+    fn exchange(
+        &mut self,
+        peer: Option<&str>,
+        to: SocketAddr,
+        purpose: Purpose,
+        version: WireVersion,
+    ) {
+        let digest = version == WireVersion::V1 && self.digest_to(peer, to);
+        self.push_pull_with(to, purpose, false, version, digest);
         if version == WireVersion::V2
             && (matches!(purpose, Purpose::Join { .. }) || self.omits_records())
         {
-            self.push_pull_with(to, purpose, false, WireVersion::V1);
+            self.push_pull_with(to, purpose, false, WireVersion::V1, false);
         }
     }
 
-    /// Opens a push-pull exchange with `to` at `version`; `repeat` marks the second try after
-    /// a stale one.
+    /// Opens a push-pull exchange with `to` at `version`, starting with a digest if `digest`;
+    /// `repeat` marks the second try after a stale one.
     fn push_pull_with(
         &mut self,
         to: SocketAddr,
         purpose: Purpose,
         repeat: bool,
         version: WireVersion,
+        digest: bool,
     ) {
         if let (Purpose::Join { cmd, seed }, false) = (purpose, repeat) {
             if let Some(s) = self
@@ -691,9 +982,14 @@ impl Node {
             }
         }
         let conn = self.connect(to, purpose, repeat, version);
+        if let Some(o) = self.sync.streams.get_mut(&conn) {
+            o.digest = digest;
+        }
         let join = matches!(purpose, Purpose::Join { .. });
         let sent = if version == WireVersion::V2 {
             self.send_signed_state(conn, join, true, None)
+        } else if digest {
+            self.send_digest(conn, join)
         } else {
             self.send_state(conn, join, true)
         };
@@ -786,7 +1082,7 @@ impl Node {
         self.sync.joins.insert(id, Join { seeds, answered: 0 });
         let version = self.join_version(1);
         for (seed, addr) in addrs.into_iter().enumerate() {
-            self.exchange(addr, Purpose::Join { cmd: id, seed }, version);
+            self.exchange(None, addr, Purpose::Join { cmd: id, seed }, version);
         }
     }
 
@@ -899,7 +1195,14 @@ impl Node {
             .filter(|(_, o)| o.deadline <= now)
             .map(|(&conn, _)| conn)
             .collect();
-        for conn in expired {
+        let unanswered: Vec<StreamId> = self
+            .sync
+            .awaiting
+            .iter()
+            .filter(|&(_, &t)| t <= now)
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in expired.into_iter().chain(unanswered) {
             self.end_stream(conn, false);
         }
 
@@ -919,7 +1222,7 @@ impl Node {
         }
         for (addr, purpose, attempts) in retries {
             let version = self.join_version(attempts);
-            self.exchange(addr, purpose, version);
+            self.exchange(None, addr, purpose, version);
         }
 
         if let Some(t) = self.next_push_pull().filter(|&t| t <= now) {
@@ -933,7 +1236,7 @@ impl Node {
                     .map(|e| (e.member.addr, e.member.name.clone()));
                 if let Some((to, name)) = to {
                     let version = self.version_for(Some(&name), to);
-                    self.exchange(to, Purpose::Sync, version);
+                    self.exchange(Some(&name), to, Purpose::Sync, version);
                 }
             }
         }
@@ -950,7 +1253,7 @@ impl Node {
                     .map(|e| (e.member.addr, e.member.name.clone()));
                 if let Some((to, name)) = to {
                     let version = self.version_for(Some(&name), to);
-                    self.exchange(to, Purpose::Sync, version);
+                    self.exchange(Some(&name), to, Purpose::Sync, version);
                 }
             }
         }
@@ -971,7 +1274,12 @@ impl Node {
     }
 
     pub(crate) fn sync_deadline(&self) -> Option<Instant> {
-        let streams = self.sync.streams.values().map(|o| o.deadline);
+        let streams = self
+            .sync
+            .streams
+            .values()
+            .map(|o| o.deadline)
+            .chain(self.sync.awaiting.values().copied());
         let retries = self.sync.joins.values().flat_map(|j| {
             j.seeds.iter().filter_map(|s| match s.state {
                 SeedState::Waiting(t) if j.answered == 0 => Some(t),
@@ -1017,6 +1325,7 @@ fn signed_record<'a>(e: &'a Entry, keys: &Keys, me: &str, now: u64) -> Option<v2
         vmin: e.vmin,
         vmax: e.vmax,
         epoch: m.epoch,
+        features: 0,
     };
     match signed_alive(&alive, &proof) {
         v2::Message::Alive(alive) => Some(v2::Record { alive, state }),
@@ -1059,6 +1368,7 @@ mod tests {
                 vmax: 1,
                 proof: None,
                 left: None,
+                features: 0,
             });
         }
     }
@@ -1144,6 +1454,10 @@ mod tests {
         refuse: bool,
         /// How far each node's clock runs ahead of the time the test passes in.
         skew: [Duration; 2],
+        /// Every stream frame delivered, without its length prefix, and the node that sent it.
+        frames: Vec<(usize, Vec<u8>)>,
+        /// Datagrams are dropped.
+        streams_only: bool,
     }
 
     impl Pair {
@@ -1154,6 +1468,8 @@ mod tests {
                 accepted: 0,
                 refuse: false,
                 skew: [Duration::ZERO; 2],
+                frames: Vec::new(),
+                streams_only: false,
             }
         }
 
@@ -1166,7 +1482,9 @@ mod tests {
                         std::iter::from_fn(|| self.nodes[i].poll_transmit()).collect();
                     for t in out {
                         moved = true;
-                        self.deliver(now, i, t);
+                        if !(self.streams_only && matches!(t, Transmit::Datagram { .. })) {
+                            self.deliver(now, i, t);
+                        }
                     }
                 }
                 if !moved {
@@ -1197,6 +1515,7 @@ mod tests {
                 Transmit::Stream { conn, frame } => {
                     if let Some(&(j, peer)) = self.conns.get(&(i, conn)) {
                         // Every write is one frame; strip its length prefix.
+                        self.frames.push((i, frame[4..].to_vec()));
                         let ev = StreamEvent::Frame(&frame[4..]);
                         self.nodes[j].handle_stream(now, peer, ev);
                     }
@@ -1307,6 +1626,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
                 epoch: 0,
+                features: 0,
             },
         };
         let records = [alive("x", 8), alive("ghost", 9)];
@@ -1403,6 +1723,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
                 epoch: 0,
+                features: 0,
             },
         };
         // Five members b has never heard of, then news about one it knows.
@@ -1454,6 +1775,446 @@ mod tests {
         let ev: Vec<Event> = std::iter::from_fn(|| a.poll_event()).collect();
         assert_eq!(done(&ev, cmd), Some(Ok(CommandOutput::Joined { seeds: 0 })));
         assert_eq!(a.poll_transmit(), None);
+    }
+
+    /// The messages of a plaintext stream frame of cluster "default", each with the number of
+    /// records, entries or names it lists.
+    fn shape(frame: &[u8]) -> Vec<(&'static str, usize)> {
+        let codec =
+            kinship_proto::Codec::insecure_plaintext(b"default", kinship_proto::Limits::default())
+                .unwrap();
+        let mut buf = frame.to_vec();
+        let payload = codec.open(PacketKind::Stream, &mut buf).unwrap();
+        payload
+            .iter()
+            .map(|m| match m {
+                Message::PushPull(p) => ("push-pull", p.records.len()),
+                Message::PushPullDigest(d) => ("digest", d.entries.len()),
+                Message::PushPullWants(w) => ("wants", w.names.len()),
+                _ => ("other", 0),
+            })
+            .collect()
+    }
+
+    /// The shape of every frame `p` delivered since it last forgot them, by sender.
+    fn shapes(p: &mut Pair) -> Vec<(usize, Vec<(&'static str, usize)>)> {
+        std::mem::take(&mut p.frames)
+            .iter()
+            .map(|(i, f)| (*i, shape(f)))
+            .collect()
+    }
+
+    /// a and b, at epochs 100 and 200, after a joined through b: each holds the other, which
+    /// advertises digest push-pull. `b_cfg` adjusts b's config.
+    fn digest_pair_with(b_cfg: impl FnOnce(&mut Config)) -> Pair {
+        let t = Instant::ZERO;
+        let mut b = node_at("b", 2, 200);
+        b_cfg(&mut b.cfg);
+        b.local.features = b.own_features();
+        b.out.broadcasts.forget("b");
+        let mut p = Pair::new(node_at("a", 1, 100), b);
+        let cmd = p.nodes[0].command(
+            t,
+            Command::Join {
+                seeds: vec![addr(2)],
+            },
+        );
+        p.pump(t);
+        assert_eq!(
+            done(&p.events(0), cmd),
+            Some(Ok(CommandOutput::Joined { seeds: 1 }))
+        );
+        p.events(1);
+        assert_eq!(
+            shapes(&mut p)[0].1,
+            [("push-pull", 1)],
+            "a join is a full exchange"
+        );
+        p
+    }
+
+    fn digest_pair() -> Pair {
+        digest_pair_with(|_| {})
+    }
+
+    /// a starts an anti-entropy exchange with b.
+    fn sync_a_with_b(p: &mut Pair, t: Instant) {
+        p.nodes[0].exchange(Some("b"), addr(2), Purpose::Sync, WireVersion::V1);
+        p.pump(t);
+    }
+
+    #[test]
+    fn a_settled_pair_trades_a_digest_for_an_empty_answer() {
+        let mut p = digest_pair();
+        let t = Instant::ZERO;
+        for n in &p.nodes {
+            assert_eq!(n.local.features, feature::DIGEST_PUSH_PULL);
+            let other = n.table.iter().next().unwrap();
+            assert_eq!(other.features, feature::DIGEST_PUSH_PULL);
+        }
+        sync_a_with_b(&mut p, t);
+        // Nothing differs, so b wants nothing, sends nothing and closes: two frames.
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("digest", 2)]),
+                (1, vec![("push-pull", 0), ("wants", 0)])
+            ]
+        );
+        assert_eq!(p.nodes[0].metrics().push_pulls, 2, "the join and this one");
+        assert_eq!(p.nodes[1].metrics().push_pulls_served, 2);
+        assert!(p.conns.is_empty(), "both ends closed");
+        assert!(p.nodes[0].sync.streams.is_empty() && p.nodes[1].sync.awaiting.is_empty());
+    }
+
+    #[test]
+    fn a_digest_exchange_sends_only_the_records_that_differ() {
+        let mut p = digest_pair();
+        let t = Instant::ZERO;
+        // a alone holds c, b alone holds d, and b holds e at a later incarnation.
+        p.nodes[0].add_member(t, "c", addr(3)).unwrap();
+        p.nodes[1].add_member(t, "d", addr(4)).unwrap();
+        for n in &mut p.nodes {
+            n.add_member(t, "e", addr(5)).unwrap();
+        }
+        let e3 = Alive {
+            inc: 3,
+            node: id("e"),
+            addr: addr(5),
+            meta: b"m",
+            vmin: 1,
+            vmax: 1,
+            epoch: 0,
+            features: 0,
+        };
+        let b = &mut p.nodes[1];
+        b.on_alive(t, &e3, &mut b.admission(), None);
+        p.events(0);
+        p.events(1);
+        sync_a_with_b(&mut p, t);
+        // a lists itself, b, c and e; b sends d and its later e, and wants c, which a sends.
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("digest", 4)]),
+                (1, vec![("push-pull", 2), ("wants", 1)]),
+                (0, vec![("push-pull", 1)]),
+            ]
+        );
+        for n in &p.nodes {
+            let mut names: Vec<_> = n.all_members().map(|m| m.name.clone()).collect();
+            names.sort();
+            assert_eq!(names, ["a", "b", "c", "d", "e"]);
+            assert_eq!(n.member("e").unwrap().incarnation, 3);
+            assert_eq!(n.member("e").unwrap().meta, b"m");
+        }
+        let names = |ev: &[Event]| {
+            joined(ev)
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&p.events(0)), ["d"]);
+        assert_eq!(names(&p.events(1)), ["c"]);
+        assert!(p.conns.is_empty() && p.nodes[1].sync.awaiting.is_empty());
+        assert_eq!(p.nodes[0].metrics().push_pull_failures, 0);
+    }
+
+    #[test]
+    fn a_digest_entry_about_the_peer_is_refuted_in_the_answer() {
+        let mut p = digest_pair();
+        let t = Instant::ZERO;
+        // a holds b as Suspect at b's own incarnation.
+        let a = &mut p.nodes[0];
+        a.on_merged_suspicion(t, "b", 0, 200);
+        while a.poll_transmit().is_some() {}
+        sync_a_with_b(&mut p, t);
+        // b refutes before it answers, so the answer carries its Alive at incarnation 1.
+        assert_eq!(p.nodes[1].local().incarnation, 1);
+        let m = p.nodes[0].member("b").unwrap();
+        assert_eq!((m.state, m.incarnation), (State::Alive, 1));
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("digest", 2)]),
+                (1, vec![("push-pull", 1), ("wants", 0)])
+            ]
+        );
+    }
+
+    #[test]
+    fn members_that_do_not_advertise_it_get_the_full_exchange() {
+        // b turned it off, so it advertises nothing and starts full exchanges itself.
+        let mut p = digest_pair_with(|cfg| cfg.push_pull_digest = false);
+        let t = Instant::ZERO;
+        assert_eq!(p.nodes[1].local.features, 0);
+        assert_eq!(p.nodes[0].table.get("b").unwrap().features, 0);
+        sync_a_with_b(&mut p, t);
+        p.nodes[1].exchange(Some("a"), addr(1), Purpose::Sync, WireVersion::V1);
+        p.pump(t);
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("push-pull", 2)]),
+                (1, vec![("push-pull", 2)]),
+                (1, vec![("push-pull", 2)]),
+                (0, vec![("push-pull", 2)]),
+            ]
+        );
+        // Nor does a node without an epoch, which could not write them.
+        let mut n = node("c", 3);
+        assert_eq!(n.local.features, 0);
+        n.cfg.push_pull_digest = true;
+        assert_eq!(n.own_features(), 0);
+    }
+
+    #[test]
+    fn a_rejoin_with_a_seed_that_advertises_it_sends_a_digest() {
+        let mut p = digest_pair();
+        let t = Instant::ZERO;
+        let cmd = p.nodes[0].command(
+            t,
+            Command::Join {
+                seeds: vec![addr(2)],
+            },
+        );
+        p.pump(t);
+        assert_eq!(
+            done(&p.events(0), cmd),
+            Some(Ok(CommandOutput::Joined { seeds: 1 }))
+        );
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("digest", 2)]),
+                (1, vec![("push-pull", 0), ("wants", 0)])
+            ]
+        );
+    }
+
+    #[test]
+    fn wanted_names_share_one_admission_budget() {
+        let mut p = digest_pair_with(|cfg| cfg.max_new_members_per_packet = 2);
+        let t = Instant::ZERO;
+        for i in 0..5 {
+            p.nodes[0]
+                .add_member(t, &format!("n{i}"), addr(10 + i))
+                .unwrap();
+        }
+        p.events(1);
+        sync_a_with_b(&mut p, t);
+        assert_eq!(
+            shapes(&mut p),
+            [
+                (0, vec![("digest", 7)]),
+                (1, vec![("push-pull", 0), ("wants", 2)]),
+                (0, vec![("push-pull", 2)]),
+            ]
+        );
+        let names: Vec<String> = joined(&p.events(1))
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        assert_eq!(names, ["n0", "n1"]);
+        assert_eq!(p.nodes[1].metrics().members_refused, 3);
+    }
+
+    #[test]
+    fn a_peer_that_never_sends_the_wanted_records_is_closed_after_tcp_timeout() {
+        let mut p = digest_pair();
+        let t = Instant::ZERO;
+        p.nodes[0].add_member(t, "c", addr(3)).unwrap();
+        p.nodes[0].exchange(Some("b"), addr(2), Purpose::Sync, WireVersion::V1);
+        // The digest reaches b; b's answer never reaches a.
+        let out: Vec<Transmit> = std::iter::from_fn(|| p.nodes[0].poll_transmit()).collect();
+        for x in out {
+            p.deliver(t, 0, x);
+        }
+        let b = &mut p.nodes[1];
+        while b.poll_transmit().is_some() {}
+        assert_eq!(b.sync.awaiting.len(), 1);
+        let deadline = t + b.config().tcp_timeout;
+        assert!(b.poll_timeout().unwrap() <= deadline);
+        b.handle_timeout(deadline);
+        assert!(b.sync.awaiting.is_empty());
+        let closed = std::iter::from_fn(|| b.poll_transmit())
+            .any(|x| matches!(x, Transmit::Close { conn } if conn.is_inbound()));
+        assert!(closed);
+        assert!(b.member("c").is_none());
+    }
+
+    #[test]
+    fn records_cross_where_one_could_teach_the_other() {
+        use kinship_proto::State::{Alive, Dead, Left, Suspect};
+        // Equal entries teach nothing either way.
+        assert!(!teaches((Alive, 3, 100), (Alive, 3, 100)));
+        // A newer incarnation teaches an older one, in any state, but not the reverse.
+        assert!(teaches((Alive, 4, 100), (Dead, 3, 100)));
+        assert!(teaches((Dead, 4, 100), (Alive, 3, 100)));
+        assert!(!teaches((Suspect, 3, 100), (Alive, 4, 100)));
+        // Incarnations wrap: 0 is newer than u32::MAX.
+        assert!(teaches((Alive, 0, 100), (Alive, u32::MAX, 100)));
+        // A later life teaches an earlier one whatever the incarnations; an earlier one nothing.
+        assert!(teaches((Alive, 0, 200), (Alive, 9, 100)));
+        assert!(!teaches((Dead, 9, 100), (Alive, 0, 200)));
+        // At one incarnation a Suspect wins over Alive, and Dead and Left over both, but
+        // neither of those two over the other.
+        assert!(teaches((Suspect, 3, 100), (Alive, 3, 100)));
+        assert!(!teaches((Alive, 3, 100), (Suspect, 3, 100)));
+        assert!(teaches((Left, 3, 100), (Suspect, 3, 100)));
+        assert!(teaches((Dead, 3, 100), (Alive, 3, 100)));
+        assert!(!teaches((Dead, 3, 100), (Left, 3, 100)));
+        assert!(!teaches((Left, 3, 100), (Dead, 3, 100)));
+        // Unordered pairs cross both ways: an unknown epoch, and incarnations 2^31 apart.
+        assert!(teaches((Alive, 3, 0), (Alive, 3, 100)) && teaches((Alive, 3, 100), (Alive, 3, 0)));
+        let half = 1u32 << 31;
+        assert!(teaches((Alive, 0, 100), (Alive, half, 100)));
+        assert!(teaches((Alive, half, 100), (Alive, 0, 100)));
+    }
+
+    /// An entry for `name` at port `port`, held at `state`, `inc` and `epoch`.
+    fn entry(name: &str, port: u16, state: State, inc: u32, epoch: u64, features: u32) -> Entry {
+        Entry {
+            member: Member {
+                name: name.to_owned(),
+                addr: addr(port),
+                meta: name.as_bytes().to_vec(),
+                state,
+                incarnation: inc,
+                epoch,
+            },
+            since: Instant::ZERO,
+            vmin: 1,
+            vmax: 1,
+            proof: None,
+            left: None,
+            features,
+        }
+    }
+
+    /// a and b, at epochs 100 and 200, each holding the other and a random mix of the members
+    /// m0 to m11 in random states, incarnations and lives, drawn from `seed`; with `unknown`,
+    /// some of them held without an epoch, as from nodes older than 0.3.
+    fn mixed_pair(seed: u64, unknown: bool) -> Pair {
+        let mut rng = crate::Rng::new(seed);
+        let states = [State::Alive, State::Suspect, State::Dead, State::Left];
+        let mut nodes = [node_at("a", 1, 100), node_at("b", 2, 200)];
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let (other, port, epoch) = [("b", 2, 200), ("a", 1, 100)][i];
+            // The other node as it is, or a stale or wrong view of it, refuted on the way. Not
+            // Alive past its own incarnation: a digest says that much without the address an
+            // Alive's refutation depends on, so the node refutes when the record follows, and
+            // the opener hears of it by gossip rather than in the answer.
+            let state = states[rng.index(3)];
+            let inc = rng.below(2) as u32 * u32::from(state != State::Alive);
+            let epoch = [epoch, 150, epoch, 0][rng.index(if unknown { 4 } else { 3 })];
+            n.table.insert(entry(
+                other,
+                port,
+                state,
+                inc,
+                epoch,
+                feature::DIGEST_PUSH_PULL,
+            ));
+            for k in 0..12u16 {
+                if rng.chance(0.25) {
+                    continue;
+                }
+                let state = states[rng.index(4)];
+                let inc = rng.below(3) as u32;
+                let epoch = [50, 60, 0][rng.index(if unknown { 3 } else { 2 })];
+                n.table
+                    .insert(entry(&format!("m{k}"), 100 + k, state, inc, epoch, 0));
+            }
+            while n.poll_transmit().is_some() {}
+        }
+        let [a, b] = nodes;
+        let mut p = Pair::new(a, b);
+        p.streams_only = true;
+        p
+    }
+
+    /// Every member each node holds, itself included, as (name, state, incarnation, epoch).
+    fn views(p: &Pair) -> Vec<Vec<(String, State, u32, u64)>> {
+        p.nodes
+            .iter()
+            .map(|n| {
+                let mut v: Vec<_> = n
+                    .all_members()
+                    .map(|m| (m.name.clone(), m.state, m.incarnation, m.epoch))
+                    .collect();
+                v.sort_by(|x, y| x.0.cmp(&y.0));
+                v
+            })
+            .collect()
+    }
+
+    /// The views of `p` after a's exchange with b, a full one or a digest one, and the bytes
+    /// of the frames it took.
+    fn exchanged(mut p: Pair, digest: bool) -> (Vec<Vec<(String, State, u32, u64)>>, usize) {
+        let t = Instant::ZERO;
+        p.nodes[0].push_pull_with(addr(2), Purpose::Sync, false, WireVersion::V1, digest);
+        p.pump(t);
+        assert!(p.conns.is_empty());
+        assert_eq!(p.nodes[0].metrics().push_pulls, 1);
+        let bytes = p.frames.iter().map(|(_, f)| f.len()).sum();
+        (views(&p), bytes)
+    }
+
+    #[test]
+    fn a_digest_exchange_ends_where_a_full_one_does() {
+        let mut sent = [0, 0];
+        for seed in 0..500 {
+            let (full, full_bytes) = exchanged(mixed_pair(seed, false), false);
+            let (digest, digest_bytes) = exchanged(mixed_pair(seed, false), true);
+            assert_eq!(full, digest, "seed {seed}");
+            sent[0] += full_bytes;
+            sent[1] += digest_bytes;
+        }
+        assert!(sent[1] < sent[0], "{sent:?}");
+    }
+
+    /// Whether a view holds a member at `d` at least as late as at `f`, an unknown epoch in
+    /// `f` deferring to incarnations.
+    fn as_late(d: &(String, State, u32, u64), f: &(String, State, u32, u64)) -> bool {
+        let (ds, di, de) = (wire_state(d.1), d.2, d.3);
+        let (fs, fi, fe) = (wire_state(f.1), f.2, f.3);
+        if de != fe && fe != 0 {
+            return life(de, fe) == Life::Later;
+        }
+        newer(di, fi) || (di == fi && rank(ds) >= rank(fs))
+    }
+
+    #[test]
+    fn with_unknown_epochs_a_digest_exchange_differs_only_in_what_is_unordered() {
+        // Where one side holds a member without an epoch, the two entries cannot be ordered and
+        // both records cross. A full exchange's opener merges the peer's record as it stands
+        // after the peer merged its own; in a digest exchange the peer merges the opener's
+        // after the opener merged the peer's. So the states and incarnations agree, and an
+        // epoch only one side knew can end up known on one side or the other; and the opener
+        // itself, which refutes what the peer holds about it, sends the refutation along.
+        let mut differ = 0;
+        for seed in 0..500 {
+            let (full, _) = exchanged(mixed_pair(seed, true), false);
+            let (digest, _) = exchanged(mixed_pair(seed, true), true);
+            for (i, (f, d)) in full.iter().zip(&digest).enumerate() {
+                assert_eq!(f.len(), d.len(), "seed {seed}");
+                for (f, d) in f.iter().zip(d) {
+                    assert_eq!(f.0, d.0, "seed {seed}");
+                    differ += usize::from(f != d);
+                    if i == 1 && f.0 == "a" {
+                        assert!(as_late(d, f), "seed {seed}: {f:?} {d:?}");
+                        continue;
+                    }
+                    assert_eq!((f.1, f.2), (d.1, d.2), "seed {seed}: {f:?} {d:?}");
+                    assert!(
+                        f.3 == d.3 || f.3 == 0 || d.3 == 0,
+                        "seed {seed}: {f:?} {d:?}"
+                    );
+                }
+            }
+        }
+        assert!(differ > 0);
     }
 
     #[test]
@@ -1528,6 +2289,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
                 epoch: 0,
+                features: 0,
             },
             &mut b.admission(),
             None,
@@ -1583,6 +2345,7 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch,
+            features: 0,
         };
         b.on_alive(t, &a, &mut b.admission(), None);
         b
@@ -1624,6 +2387,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
                 epoch: 100,
+                features: 0,
             },
         };
         let records = [
@@ -1756,6 +2520,7 @@ mod tests {
                 vmin: 1,
                 vmax: 1,
                 epoch: 0,
+                features: 0,
             },
         };
         // A peer holds b as Suspect and c as Dead.

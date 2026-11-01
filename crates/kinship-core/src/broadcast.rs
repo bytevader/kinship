@@ -31,6 +31,7 @@ pub(crate) enum Gossip {
         vmin: u8,
         vmax: u8,
         epoch: u64,
+        features: u32,
         sig: Option<(CertificateId, Signature)>,
         cert: Option<Vec<u8>>,
     },
@@ -65,6 +66,7 @@ impl Gossip {
             vmin: a.vmin,
             vmax: a.vmax,
             epoch: a.epoch,
+            features: a.features,
             sig: None,
             cert: None,
         }
@@ -126,6 +128,7 @@ impl Gossip {
                 vmin,
                 vmax,
                 epoch,
+                features,
                 ..
             } => Message::Alive(Alive {
                 inc: *inc,
@@ -135,6 +138,7 @@ impl Gossip {
                 vmin: *vmin,
                 vmax: *vmax,
                 epoch: *epoch,
+                features: *features,
             }),
             Self::Suspect {
                 inc,
@@ -798,6 +802,7 @@ impl Node {
             vmin: me.vmin,
             vmax: me.vmax,
             epoch: me.member.epoch,
+            features: me.features,
             sig: me.proof.map(|p| (p.cert, p.sig)),
             cert: None,
         }
@@ -944,6 +949,7 @@ mod tests {
             epoch: 0,
             sig: None,
             cert: None,
+            features: 0,
         };
         n.broadcast(huge);
         assert_eq!(n.metrics().gossip_too_large, 1);
@@ -1045,6 +1051,7 @@ mod tests {
             epoch: 0,
             sig: None,
             cert: None,
+            features: 0,
         };
         let mut b = Broadcasts::default();
         b.push(suspect("old", 1));

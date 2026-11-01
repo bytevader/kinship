@@ -244,6 +244,7 @@ impl Node {
             },
             proof: None,
             left: None,
+            features: 0,
         };
         let mut node = Self {
             cfg,
@@ -272,6 +273,7 @@ impl Node {
             keys,
         };
         node.out.stamp = node.replay.stamp(now);
+        node.local.features = node.own_features();
         node.resign_local();
         node.broadcast(node.local_alive_announced());
         Ok(node)
@@ -325,6 +327,7 @@ impl Node {
             vmax: WIRE_VERSION,
             proof: None,
             left: None,
+            features: 0,
         });
         Ok(())
     }
@@ -694,7 +697,7 @@ impl Node {
                 Message::Suspect(s) => self.on_suspect(now, &s, None),
                 Message::Dead(d) => self.on_dead(now, &d, None),
                 // Push-pull runs over streams only.
-                Message::PushPull(_) => {}
+                Message::PushPull(_) | Message::PushPullDigest(_) | Message::PushPullWants(_) => {}
                 Message::UserMessage(_) | Message::UserBroadcast(_) => user.push(msg),
             }
         }
@@ -1004,6 +1007,7 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            features: 0,
         })
     }
 
@@ -1351,6 +1355,7 @@ mod tests {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            features: 0,
         });
         deliver(&mut n, t, &[a]);
         let ev = events(&mut n);
@@ -1477,7 +1482,10 @@ mod tests {
             addr(2),
             r#"Alive(Alive { inc: 5, node: "a""#
         ));
-        assert!(contains(&pkts, addr(2), "epoch: 151 })"), "{pkts:?}");
+        assert!(
+            contains(&pkts, addr(2), "epoch: 151, features: 1 })"),
+            "{pkts:?}"
+        );
         // Rumours about its earlier lives only queue its Alive again, as stale ones do.
         n.out.broadcasts.forget("a");
         deliver(
