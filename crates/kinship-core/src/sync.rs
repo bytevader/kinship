@@ -2134,8 +2134,11 @@ mod tests {
         p
     }
 
-    /// Every member each node holds, itself included, as (name, state, incarnation, epoch).
-    fn views(p: &Pair) -> Vec<Vec<(String, State, u32, u64)>> {
+    /// A member as a view holds it: name, state, incarnation, epoch.
+    type Seen = (String, State, u32, u64);
+
+    /// Every member each node holds, itself included.
+    fn views(p: &Pair) -> Vec<Vec<Seen>> {
         p.nodes
             .iter()
             .map(|n| {
@@ -2151,7 +2154,7 @@ mod tests {
 
     /// The views of `p` after a's exchange with b, a full one or a digest one, and the bytes
     /// of the frames it took.
-    fn exchanged(mut p: Pair, digest: bool) -> (Vec<Vec<(String, State, u32, u64)>>, usize) {
+    fn exchanged(mut p: Pair, digest: bool) -> (Vec<Vec<Seen>>, usize) {
         let t = Instant::ZERO;
         p.nodes[0].push_pull_with(addr(2), Purpose::Sync, false, WireVersion::V1, digest);
         p.pump(t);
@@ -2176,7 +2179,7 @@ mod tests {
 
     /// Whether a view holds a member at `d` at least as late as at `f`, an unknown epoch in
     /// `f` deferring to incarnations.
-    fn as_late(d: &(String, State, u32, u64), f: &(String, State, u32, u64)) -> bool {
+    fn as_late(d: &Seen, f: &Seen) -> bool {
         let (ds, di, de) = (wire_state(d.1), d.2, d.3);
         let (fs, fi, fe) = (wire_state(f.1), f.2, f.3);
         if de != fe && fe != 0 {
