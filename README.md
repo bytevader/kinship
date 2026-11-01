@@ -247,7 +247,7 @@ Durations are seconds as `float`, or a `datetime.timedelta`. Every field is vali
 
 A node holds at most `max_members` members (8,192, itself and recently departed members included) and learns at most `max_new_members_per_packet` new ones (1,024) from any one packet, so a member cannot flood the cluster with invented names. Names refused either way are counted in `cluster.stats().members_refused`. For a larger cluster, raise `max_members` on every node, and raise `max_new_members_per_packet` to the cluster's size if a node should learn all of it from its join rather than over its next few push-pulls.
 
-Each node exchanges its whole member table with a random member every `push_pull_interval` (30 s in `lan()`), which repairs what gossip missed. In a large cluster that is most of the bytes a node sends. `push_pull_scale=True` stretches the period beyond 32 live members as memberlist does, every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000, for fewer bytes per node but a slower repair of a missed update; it is off by default because in the simulator that slower repair let a few suspected members be declared dead at 200 nodes. See [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
+Each node exchanges its member table with a random member every `push_pull_interval` (30 s in `lan()`), which repairs what gossip missed. With members that advertise it, as every node on 0.5 or later does by default, the exchange is a digest: each side lists what it holds, and whole records cross only where the two differ, so a settled 1,000-node cluster sends 1.3 KB/s per node instead of 6.2. Exchanges with older nodes, and joins, send the whole table as before; `push_pull_digest=False` turns digests off, and the node then sends the bytes 0.4 did. See [docs/results/digest.md](https://github.com/bytevader/kinship/blob/main/docs/results/digest.md). `push_pull_scale=True` stretches the period beyond 32 live members as memberlist does, every 60 s up to 64 members, 90 s at 100, 120 s at 200 and 180 s at 1,000, for fewer bytes per node but a slower repair of a missed update; it is off by default because in the simulator that slower repair let a few suspected members be declared dead at 200 nodes. See [docs/results/pushpull.md](https://github.com/bytevader/kinship/blob/main/docs/results/pushpull.md).
 
 ## Encryption and keys
 
@@ -672,6 +672,8 @@ let wake_at: Option<Instant> = node.poll_timeout();
 ```
 
 The same seed, nonce key and inputs always give the same outputs, byte for byte, which is how `kinship-sim` replays any failure from its seed, from which it derives both. Encryption happens inside the core, so the bytes in `payload` and `frame` are already sealed.
+
+A connection the node opened carries one frame back. One you accepted can carry two: after the core answers a digest push-pull without closing, hand it the next frame the peer sends on that connection too, until the core closes it.
 
 ## Learn more
 

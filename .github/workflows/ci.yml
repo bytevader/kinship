@@ -268,6 +268,24 @@ jobs:
       # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
       - run: cargo test --release -p kinship-sim --test usermsg -- --ignored --nocapture --skip _signed
 
+  sim-digest:
+    name: digest push-pull beside 0.4.0, 1,000 seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main writes the cache, so a pull request cannot poison it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # A failure prints its seed; replay it with KINSHIP_SEED=<seed> and the same command.
+      - run: cargo test --release -p kinship-sim --test digest -- --ignored --nocapture
+
   # The same sweeps with every node in mode sign (KI-01 Stage 2c). Signing makes them about ten
   # times slower than in mode off, so pull requests run a quarter of the seeds; the full 1,000
   # run with KINSHIP_SEEDS unset, as docs/results/signed.md describes.

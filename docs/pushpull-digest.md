@@ -1,6 +1,14 @@
 # Digest push-pull (design note)
 
-**Status: design only, not implemented.** The next step after scaling the push-pull interval with the cluster ([results](results/pushpull.md)), as accepted on 2026-10-24 ([Stage 2c decisions](ki01-stage2.md#decisions-stage-2c)).
+**Status: built for mode `off`, on by default with `push_pull_digest`** ([design](design.md#digest-push-pull), [results](results/digest.md)). The next step after scaling the push-pull interval with the cluster ([results](results/pushpull.md)), as accepted on 2026-10-24 ([Stage 2c decisions](ki01-stage2.md#decisions-stage-2c)). What was built differs from this note in five places, each explained in the design section:
+
+- B sends the record of a member A does not list only if B holds it Alive, and wants a name it does not hold only if A lists it Alive: a merge adds no other.
+- B refutes a Suspect, Dead or Left entry about itself from the digest alone, before it answers, so the answer carries the refutation as a full exchange's does. An Alive entry about B at a later incarnation still waits for A's record, whose address a refutation needs.
+- When B wants nothing it closes after its answer, so a settled pair exchanges two frames.
+- Where two entries cannot be ordered, when one side does not know the epoch, both records cross.
+- The driver read one frame on a connection it accepted; it now reads at most two, so the third frame reaches B.
+
+The note as written follows.
 
 ## Why
 
