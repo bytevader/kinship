@@ -1,5 +1,5 @@
 # Merge with docker-compose.yml; the base demo remains usable without monitoring.
-# The nodes keep the demo's image, kinship 0.4 or later, and serve /cluster/metrics.
+# The nodes keep the demo's image, kinship 0.5 or later, and serve /cluster/metrics.
 x-metrics-node: &metrics-node
   environment:
     KINSHIP_METRICS: "1"

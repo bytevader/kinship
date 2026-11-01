@@ -24,9 +24,10 @@ Each worker builds its config inside `cluster_lifespan(config)`, with seeds
 `node-1:7946`, `node-2:7946` and `node-3:7946`; losing one seed is harmless.
 Metadata carries `role=cache`, a zone and `url=http://node-N:8000`.
 
-The default image installs `kinship[fastapi]>=0.4` from PyPI on
+The default image installs `kinship[fastapi]>=0.5` from PyPI on
 `python:3.13-slim`, with uvicorn and httpx; the demo uses member epochs and
-`Ring.fence()`, new in 0.3, and user messages and the metrics endpoint, new in 0.4. To try
+`Ring.fence()`, new in 0.3, and user messages and the metrics endpoint, new in 0.4,
+and since 0.5 healthy members no longer flap dead when a Partition heals. To try
 changes in this checkout, build a release wheel from source, with maturin and
 Rust 1.87.0 in a separate build stage:
 
@@ -202,7 +203,7 @@ four cards show its new id once each; `node-3`'s stale card retains the old id.
 Keep it cut off until the broadcast has finished spreading (about 15 seconds),
 then Reconnect and compare its live last flush id: it missed that command.
 Broadcasts have no history repair, so healing the partition does not replay it.
-The known brief membership flap on reconnect is unchanged. To film warm handoff,
+Since 0.5 no healthy member goes DEAD on reconnect. To film warm handoff,
 use Drain and Undrain before this scene, with Load paused after warming: watch
 ownership colours move and handoff counters rise while the moved keys stay warm.
 
