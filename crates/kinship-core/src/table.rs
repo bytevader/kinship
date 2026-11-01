@@ -56,6 +56,10 @@ pub(crate) struct Table {
     addrs: BTreeMap<SocketAddr, usize>,
     /// Members in Alive or Suspect.
     live: usize,
+    /// Members in Alive.
+    alive: usize,
+    /// Members that left, tombstones not yet reaped.
+    left: usize,
     /// Names to probe this pass, in shuffled order; `order[pos..]` are still to come.
     order: Vec<String>,
     pos: usize,
@@ -81,13 +85,34 @@ impl Table {
         self.live
     }
 
+    /// Members in Alive, not counting this node.
+    pub fn alive(&self) -> usize {
+        self.alive
+    }
+
+    /// Members that left whose tombstones are still kept.
+    pub fn left(&self) -> usize {
+        self.left
+    }
+
+    fn count(&mut self, state: State, by: isize) {
+        let n = match state {
+            State::Alive => &mut self.alive,
+            State::Left => &mut self.left,
+            State::Suspect | State::Dead => return,
+        };
+        *n = n.checked_add_signed(by).expect("counts match the entries");
+    }
+
     /// Adds a member that is not in the table.
     pub fn insert(&mut self, entry: Entry) {
         let live = entry.member.state.is_live();
+        self.count(entry.member.state, 1);
         *self.addrs.entry(entry.member.addr).or_default() += 1;
         let name = entry.member.name.clone();
         let was_live = match self.entries.insert(name.clone(), entry) {
             Some(old) => {
+                self.count(old.member.state, -1);
                 self.live -= usize::from(old.member.state.is_live());
                 unindex(&mut self.addrs, old.member.addr);
                 old.member.state.is_live()
@@ -113,6 +138,14 @@ impl Table {
     ///
     /// If `name` is not in the table; callers look it up first.
     pub fn update(&mut self, name: &str, state: State, inc: u32, now: Instant) -> &mut Entry {
+        let was = self
+            .entries
+            .get(name)
+            .expect("member was looked up")
+            .member
+            .state;
+        self.count(was, -1);
+        self.count(state, 1);
         let entry = self.entries.get_mut(name).expect("member was looked up");
         let m = &mut entry.member;
         match (m.state.is_live(), state.is_live()) {
@@ -157,13 +190,16 @@ impl Table {
     /// Deletes tombstones that have been Dead or Left for at least `keep`.
     pub fn reap(&mut self, now: Instant, keep: Duration) {
         let addrs = &mut self.addrs;
+        let mut left = 0;
         self.entries.retain(|_, e| {
             let kept = e.member.state.is_live() || now - e.since < keep;
             if !kept {
                 unindex(addrs, e.member.addr);
+                left += usize::from(e.member.state == State::Left);
             }
             kept
         });
+        self.left -= left;
     }
 
     /// The next member to probe: each live member once per pass, in an order reshuffled every
@@ -313,5 +349,31 @@ mod tests {
         assert!(t.has_addr(at(2)));
         t.reap(later, Duration::from_secs(1));
         assert!(!t.has_addr(at(2)) && t.has_addr(at(3)));
+    }
+
+    #[test]
+    fn alive_and_left_members_are_counted_through_changes_and_reaping() {
+        let mut t = Table::default();
+        let counts = |t: &Table| (t.live(), t.alive(), t.left());
+        for name in ["a", "b", "c", "d"] {
+            t.insert(entry(name, 1, State::Alive));
+        }
+        assert_eq!(counts(&t), (4, 4, 0));
+        t.update("a", State::Suspect, 0, Instant::ZERO);
+        t.update("b", State::Dead, 0, Instant::ZERO);
+        t.update("c", State::Left, 0, Instant::ZERO);
+        assert_eq!(counts(&t), (2, 1, 1));
+        // A replacement counts the state it brings, not the one it replaced.
+        t.insert(entry("c", 5, State::Alive));
+        t.insert(entry("d", 6, State::Left));
+        assert_eq!(counts(&t), (2, 1, 1));
+        t.update("a", State::Alive, 1, Instant::ZERO);
+        assert_eq!(counts(&t), (2, 2, 1));
+        t.reap(
+            Instant::ZERO + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(counts(&t), (2, 2, 0));
+        assert_eq!(t.len(), 2);
     }
 }

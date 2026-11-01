@@ -8,13 +8,20 @@
 //! member gets the long timeout to refute in, while a real failure that many members see is
 //! declared at the minimum. Without it the timeout is fixed at `T_min`, as in plain SWIM.
 //!
+//! A node that doubts its own view while a suspicion runs, because its local health is above
+//! zero or it holds no more than half of the members it knows as Alive, keeps the Dead the
+//! suspicion ends in to itself: it is likely the one cut off, and a Dead it gossiped would
+//! reach the member's peers, once the partition heals, before the member could refute. It
+//! tells only the member, which refutes if it is alive and can hear. The other nodes probe the
+//! member themselves and declare a real failure on their own.
+//!
 //! Logarithms are computed in fixed point from integer operations only. `f64::log10` goes to
 //! the platform's libm, whose last bit may differ between systems, and a timeout that differs
 //! by a nanosecond is enough to make a simulator seed replay differently on another machine.
 
 use core::time::Duration;
 
-use kinship_proto::Dead;
+use kinship_proto::{Dead, Message, Suspect};
 
 use crate::Node;
 use crate::broadcast::id;
@@ -35,6 +42,9 @@ pub(crate) struct Suspicion {
     /// counts too when its own probe of the member fails. Empty for a suspicion learned from a
     /// push-pull, which names no reporter.
     reporters: Vec<String>,
+    /// Whether this node doubted its own view at some point while the suspicion ran, see
+    /// [`Node::doubts_itself`]; its Dead then stays on this node.
+    pub doubted: bool,
 }
 
 impl Suspicion {
@@ -68,6 +78,7 @@ impl Suspicion {
             max,
             k,
             reporters: Vec::new(),
+            doubted: false,
         }
     }
 
@@ -109,6 +120,32 @@ impl Suspicion {
 }
 
 impl Node {
+    /// Starts suspecting `name` with `s`, doubted if this node doubts itself now.
+    pub(crate) fn start_suspicion(&mut self, name: &str, mut s: Suspicion) {
+        s.doubted = self.doubts_itself();
+        self.suspicions.insert(name.to_owned(), s);
+    }
+
+    /// Whether this node distrusts its own view, as one cut off from most of the cluster would:
+    /// its local health is above zero, or it holds no more than half of the members it knows
+    /// as Alive, itself included and members that left not. A node on the minority side of a
+    /// partition suspects and then declares dead the members across it, while Nacks from the
+    /// relays on its own side keep its local health at zero.
+    pub(crate) fn doubts_itself(&self) -> bool {
+        let known = self.table.len() - self.table.left() + 1;
+        self.health > 0 || 2 * (self.table.alive() + 1) <= known
+    }
+
+    /// Marks every running suspicion doubted if this node doubts itself now: at the end of
+    /// each probe round and when local health rises.
+    pub(crate) fn doubt(&mut self) {
+        if self.doubts_itself() {
+            for s in self.suspicions.values_mut() {
+                s.doubted = true;
+            }
+        }
+    }
+
     /// Declares dead every suspect whose timer ran out without a refutation.
     pub(crate) fn suspicion_timers(&mut self, now: Instant) {
         let due: Vec<String> = self
@@ -119,7 +156,7 @@ impl Node {
             .collect();
         let me = self.local.member.name.clone();
         for name in due {
-            self.suspicions.remove(&name);
+            let doubted = self.suspicions.remove(&name).is_some_and(|s| s.doubted);
             let Some(e) = self.table.get(&name) else {
                 continue;
             };
@@ -132,9 +169,35 @@ impl Node {
                 from: id(&me),
                 epoch: e.member.epoch,
             };
-            let proof = self.sign_dead(&dead);
-            self.on_dead(now, &dead, proof);
+            if doubted || self.doubts_itself() {
+                self.keep_dead(now, &dead);
+            } else {
+                let proof = self.sign_dead(&dead);
+                self.on_dead(now, &dead, proof);
+            }
         }
+    }
+
+    /// Declares a member dead on this node alone, which doubted its own view while it
+    /// suspected the member. Only the member is sent a Suspect, as a merged suspicion is, so
+    /// that it refutes if it is alive and can hear; no node gossips this node's word, and in
+    /// mode `sign` nothing is signed.
+    fn keep_dead(&mut self, now: Instant, dead: &Dead<'_>) {
+        let name = dead.node.as_str();
+        self.on_dead(now, dead, None);
+        // on_dead queued the Dead for gossip.
+        self.out.broadcasts.forget(name);
+        let Some(addr) = self.table.get(name).map(|e| e.member.addr) else {
+            return;
+        };
+        let suspect = Message::Suspect(Suspect {
+            inc: dead.inc,
+            node: dead.node,
+            from: dead.from,
+            epoch: dead.epoch,
+        });
+        let limit = self.retransmit_limit();
+        self.send_to(addr, false, Some(name), &[suspect], Some(limit));
     }
 
     pub(crate) fn suspicion_deadline(&self) -> Option<Instant> {

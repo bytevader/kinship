@@ -1586,13 +1586,15 @@ mod tests {
             suspicion::min_timeout(n.config(), 3) * n.config().suspicion_max_mult
         );
         assert!(contains(&pkts, relay, "Suspect("), "suspicion is gossiped");
+        assert!(!contains(&pkts, relay, "Dead("), "{pkts:?}");
         let mut pkts = Vec::new();
         let end = dead_at + n.config().probe_interval * 2;
         while let Some(t) = n.poll_timeout().filter(|&t| t <= end) {
             n.handle_timeout(t);
             pkts.extend(sent(&mut n));
         }
-        assert!(contains(&pkts, relay, "Dead("), "death is gossiped");
+        // Every round failed, so the node doubts itself: the death stays with it.
+        assert!(!contains(&pkts, relay, "Dead("), "{pkts:?}");
 
         // The tombstone is reaped after dead_reclaim, at the end of a probe round, which the
         // failed rounds have stretched.
@@ -1602,6 +1604,47 @@ mod tests {
             n.handle_timeout(t);
         }
         assert!(n.member(&m.name).is_none());
+    }
+
+    #[test]
+    fn a_node_that_doubts_itself_keeps_the_deaths_it_declares() {
+        let t = Instant::ZERO;
+        for case in ["sure", "health", "minority"] {
+            let mut n = node(Security::InsecurePlaintext);
+            for (name, port) in [("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+                n.add_member(t, name, addr(port)).unwrap();
+            }
+            deliver(&mut n, t, &[suspect("b", 0, "c")]);
+            match case {
+                // Health that rose while the suspicion ran counts, though it fell again.
+                "health" => {
+                    n.health_delta(1);
+                    n.doubt();
+                    n.health_delta(-1);
+                }
+                // b, c and d Suspect: n holds two of the five members it knows as Alive.
+                "minority" => deliver(&mut n, t, &[suspect("c", 0, "b"), suspect("d", 0, "b")]),
+                _ => {}
+            }
+            assert_eq!(n.local_health(), 0);
+            events(&mut n);
+            sent(&mut n);
+            let at = n.suspicions["b"].deadline;
+            n.suspicion_timers(at);
+            n.gossip(at);
+            let pkts = sent(&mut n);
+            let died = events(&mut n)
+                .iter()
+                .any(|e| matches!(e, Event::MemberDead(m) if m.name == "b"));
+            assert!(died, "{case}: b is dead on n either way");
+            let gossiped = pkts
+                .iter()
+                .any(|(to, p)| *to != addr(2) && String::from_utf8_lossy(p).contains("Dead("));
+            assert_eq!(gossiped, case == "sure", "{case}: {pkts:?}");
+            if case != "sure" {
+                assert!(contains(&pkts, addr(2), "Suspect("), "{case}: {pkts:?}");
+            }
+        }
     }
 
     #[test]
