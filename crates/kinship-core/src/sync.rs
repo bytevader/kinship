@@ -1962,7 +1962,7 @@ mod tests {
             ]
         );
         // Nor does a node without an epoch, which could not write them.
-        let mut n = node("c", 3);
+        let mut n = node_at("c", 3, 0);
         assert_eq!(n.local.features, 0);
         n.cfg.push_pull_digest = true;
         assert_eq!(n.own_features(), 0);
