@@ -152,6 +152,7 @@ fn alive(name: &str, port: u16, inc: u32) -> Alive<'_> {
         vmin: 1,
         vmax: 2,
         epoch: EPOCH - u64::from(port),
+        features: 0,
     }
 }
 

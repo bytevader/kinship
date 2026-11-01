@@ -6,7 +6,7 @@ use core::time::Duration;
 
 use kinship_proto::{
     Alive, Codec, Key, Limits, MAX_LABEL_LEN, Message, NodeId, PacketKind, Ping, PingReq,
-    UserBroadcast, UserMessage,
+    UserBroadcast, UserMessage, feature,
 };
 
 use kinship_proto::identity::{Certificate, IdentityError};
@@ -69,6 +69,14 @@ pub struct Config {
     /// 200 nodes that the fixed period does not have (`docs/results/pushpull.md`). Off by
     /// default; nodes in mode `sign` ignore it.
     pub push_pull_scale: bool,
+    /// Digest push-pull (`docs/pushpull-digest.md`): advertise it in this node's Alive, and run
+    /// anti-entropy, reconnects and rejoins with members that advertise it as a digest of
+    /// every member and then only the records where the two sides differ, rather than both
+    /// whole tables. Joins, and exchanges with members that do not advertise it, such as 0.4
+    /// nodes, stay full push-pulls. On by default; nodes in mode `sign`, and nodes without an
+    /// epoch, neither advertise nor send it, though every node answers one. Off, a node's
+    /// Alives are the bytes 0.4 sent.
+    pub push_pull_digest: bool,
     /// Zero disables reconnect attempts to recently dead members.
     pub reconnect_interval: Duration,
     pub rejoin_interval: Duration,
@@ -129,6 +137,7 @@ impl Config {
             retransmit_mult: 4,
             push_pull_interval: Duration::from_secs(30),
             push_pull_scale: false,
+            push_pull_digest: true,
             reconnect_interval: Duration::from_secs(30),
             rejoin_interval: Duration::from_secs(60),
             tcp_timeout: Duration::from_secs(10),
@@ -438,6 +447,7 @@ fn largest_alive(max_meta: usize, cap: usize) -> usize {
         vmin: u8::MAX,
         vmax: u8::MAX,
         epoch: u64::MAX,
+        features: feature::DIGEST_PUSH_PULL,
     })
     .encoded_len()
 }
@@ -456,6 +466,7 @@ fn largest_signed_alive(max_meta: usize, cap: usize) -> usize {
             vmin: u8::MAX,
             vmax: u8::MAX,
             epoch: u64::MAX,
+            features: 0,
         },
         certificate_id: [0; 8],
         signature: [0; 64],
@@ -707,30 +718,31 @@ mod tests {
     #[test]
     fn the_largest_alive_must_fit_a_datagram_beside_a_ping() {
         let key = Security::Keys(vec![Key::from_bytes([1; 32])]);
-        // An Alive with 512 bytes of metadata, a 64-byte name, an IPv6 address and an epoch is
-        // 615 bytes, the largest Ping 156; a sealed datagram adds 48 and the count reserve 2.
+        // An Alive with 512 bytes of metadata, a 64-byte name, an IPv6 address, an epoch and
+        // features is 616 bytes, the largest Ping 156; a sealed datagram adds 48 and the count
+        // reserve 2.
         let mut cfg = Config::lan(key.clone());
-        cfg.limits.udp_max_payload = 821;
+        cfg.limits.udp_max_payload = 822;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.udp_max_payload = 820;
+        cfg.limits.udp_max_payload = 821;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
         cfg.limits.udp_max_payload = 576;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
 
         // With the default datagram, metadata is the limit to blame.
         let mut cfg = Config::lan(key);
-        cfg.limits.max_meta_bytes = 1_091;
+        cfg.limits.max_meta_bytes = 1_090;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.max_meta_bytes = 1_092;
+        cfg.limits.max_meta_bytes = 1_091;
         assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
         cfg.limits.max_meta_bytes = usize::MAX;
         assert_eq!(cfg.validate().unwrap_err().field, "max_meta_bytes");
 
         // Plaintext packets carry 12 bytes of header instead of 48.
         let mut cfg = Config::lan(Security::InsecurePlaintext);
-        cfg.limits.udp_max_payload = 785;
+        cfg.limits.udp_max_payload = 786;
         assert_eq!(cfg.validate(), Ok(()));
-        cfg.limits.udp_max_payload = 784;
+        cfg.limits.udp_max_payload = 785;
         assert_eq!(cfg.validate().unwrap_err().field, "udp_max_payload");
     }
 
@@ -760,7 +772,7 @@ mod tests {
         assert_eq!(cfg.validate().unwrap_err().field, "max_user_broadcast");
         // Even at the smallest datagram accepted, the default fits.
         let mut cfg = Config::lan(key.clone());
-        cfg.limits.udp_max_payload = 821;
+        cfg.limits.udp_max_payload = 822;
         assert_eq!(cfg.validate(), Ok(()));
         // A direct message must fit a frame, 48 bytes of it for the seal, 2 for the count and
         // 155 for the message besides its data; the limit moved from its default is named.

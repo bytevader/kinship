@@ -2,11 +2,13 @@
 //!
 //! Connections are short-lived: the side that opened one writes a frame and waits for one frame
 //! back, and the side that accepted it reads one frame, writes the core's answer and closes. A
-//! task therefore hands the actor at most one frame and then only writes what the actor sends
-//! it. Every step is bounded by `tcp_timeout`: connecting, each write, and the wait for the
-//! frame, so a peer that trickles bytes cannot hold a connection open. The frame's length is
-//! checked against `max_stream_frame` as soon as its prefix arrives, before anything is set
-//! aside for it.
+//! digest push-pull takes one frame more: the side that accepted it answers the digest without
+//! closing, and reads the records its answer asked for in a second frame. So an outbound task
+//! hands the actor at most one frame, an inbound task at most two, and each then only writes
+//! what the actor sends it until the actor closes. Every step is bounded by `tcp_timeout`:
+//! connecting, each write, and the wait for each frame, so a peer that trickles bytes cannot
+//! hold a connection open. A frame's length is checked against `max_stream_frame` as soon as
+//! its prefix arrives, before anything is set aside for it.
 //!
 //! A frame can only be authenticated once it is complete, so the bytes of inbound frames are
 //! held on behalf of peers nobody has verified yet. All inbound connections draw them from one
@@ -19,7 +21,9 @@
 //!
 //! An inbound connection must also start like a frame for this node: its first 8 bytes after
 //! the length prefix are checked against the node's [`HeaderCheck`] as soon as they arrive, and
-//! a connection that has not sent them within `tcp_header_timeout` is dropped.
+//! a connection that has not sent them within `tcp_header_timeout` is dropped. A second frame
+//! is checked the same way, within `tcp_timeout`, since the peer sends it only once it has read
+//! the answer to the first.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -48,10 +52,14 @@ pub(crate) enum Write {
     Close,
 }
 
+/// Most frames an inbound connection hands the actor: the request, and after the answer to a
+/// digest the records it asked for.
+const INBOUND_FRAMES: usize = 2;
+
 /// What a connection task tells the actor.
 #[derive(Debug)]
 pub(crate) enum Report {
-    /// The one frame this connection carries, without its length prefix.
+    /// A frame this connection carries, without its length prefix.
     Frame {
         frame: Vec<u8>,
         /// For an inbound connection, its share of the budget, held until the actor is done.
@@ -91,12 +99,16 @@ struct Holdings {
     releases: u64,
     /// Bytes held per source address, those of evicted connections not counted.
     by_ip: HashMap<IpAddr, usize>,
-    shares: HashMap<StreamId, Share>,
+    /// Every share, by the number it was opened under.
+    shares: HashMap<u64, Share>,
+    next_share: u64,
 }
 
-/// One inbound connection's part of the budget.
+/// One inbound frame's part of the budget, the frame an inbound connection is reading or one it
+/// handed the actor.
 #[derive(Debug)]
 struct Share {
+    conn: StreamId,
     ip: IpAddr,
     bytes: usize,
     /// The frame is complete and waits for the actor, so it can no longer be taken back.
@@ -129,6 +141,7 @@ impl Budget {
                 releases: 0,
                 by_ip: HashMap::new(),
                 shares: HashMap::new(),
+                next_share: 0,
             }),
             freed: Notify::new(),
         })
@@ -140,20 +153,26 @@ impl Budget {
         Self::new(max_stream_frame.saturating_mul(2), per_ip)
     }
 
-    /// Opens the share of inbound connection `conn` from `ip`, holding nothing yet.
+    /// Opens a share for the next frame of inbound connection `conn` from `ip`, holding
+    /// nothing yet.
     pub fn open(self: &Arc<Self>, conn: StreamId, ip: IpAddr) -> Held {
         let kill = Arc::new(Notify::new());
         let share = Share {
+            conn,
             ip,
             bytes: 0,
             complete: false,
             evicted: false,
             kill: Arc::clone(&kill),
         };
-        self.lock().shares.insert(conn, share);
+        let mut h = self.lock();
+        let id = h.next_share;
+        h.next_share += 1;
+        h.shares.insert(id, share);
+        drop(h);
         Held {
             budget: Arc::clone(self),
-            conn,
+            share: id,
             kill,
         }
     }
@@ -200,10 +219,10 @@ impl Holdings {
             .shares
             .iter()
             .filter(|(_, s)| !s.evicted && !s.complete && s.bytes > 0 && s.ip != ip)
-            .map(|(&conn, s)| (self.held_by(s.ip), s.bytes, Reverse(conn)))
+            .map(|(&id, s)| (self.held_by(s.ip), s.bytes, Reverse((s.conn, id))))
             .max()
             .filter(|&(richest, _, _)| richest > mine);
-        let Some(share) = victim.and_then(|(_, _, Reverse(conn))| self.shares.get_mut(&conn))
+        let Some(share) = victim.and_then(|(_, _, Reverse((_, id)))| self.shares.get_mut(&id))
         else {
             return false;
         };
@@ -216,22 +235,33 @@ impl Holdings {
     }
 }
 
-/// An inbound connection's share of the [`Budget`], given back when dropped.
+/// An inbound frame's share of the [`Budget`], given back when dropped.
 #[derive(Debug)]
 pub(crate) struct Held {
     budget: Arc<Budget>,
-    conn: StreamId,
+    share: u64,
     kill: Arc<Notify>,
 }
 
 impl Held {
+    /// Opens a share for the connection's next frame, from the same address.
+    fn next(&self) -> Option<Held> {
+        let (conn, ip) = self
+            .budget
+            .lock()
+            .shares
+            .get(&self.share)
+            .map(|s| (s.conn, s.ip))?;
+        Some(self.budget.open(conn, ip))
+    }
+
     /// Takes `n` more bytes, or says why not.
     fn take(&self, n: usize) -> Take {
         let per_ip = self.budget.per_ip;
         let mut h = self.budget.lock();
         let Some(ip) = h
             .shares
-            .get(&self.conn)
+            .get(&self.share)
             .filter(|s| !s.evicted)
             .map(|s| s.ip)
         else {
@@ -243,7 +273,7 @@ impl Held {
         if h.left >= n {
             h.left -= n;
             *h.by_ip.entry(ip).or_default() += n;
-            if let Some(share) = h.shares.get_mut(&self.conn) {
+            if let Some(share) = h.shares.get_mut(&self.share) {
                 share.bytes += n;
             }
             return Take::Granted;
@@ -259,7 +289,7 @@ impl Held {
     /// The frame is complete: keeps only `n` of the bytes held, which can no longer be evicted.
     fn keep(&mut self, n: usize) {
         let mut h = self.budget.lock();
-        let Some(share) = h.shares.get_mut(&self.conn) else {
+        let Some(share) = h.shares.get_mut(&self.share) else {
             return;
         };
         share.complete = true;
@@ -281,7 +311,7 @@ impl Held {
 impl Drop for Held {
     fn drop(&mut self) {
         let mut h = self.budget.lock();
-        if let Some(share) = h.shares.remove(&self.conn) {
+        if let Some(share) = h.shares.remove(&self.share) {
             if share.evicted {
                 h.releasing -= share.bytes;
             } else {
@@ -380,8 +410,8 @@ pub(crate) async fn outbound<T: Transport>(
 }
 
 /// Runs the exchange on a connection a peer opened. Until its first frame arrives the core does
-/// not know the connection exists, so nothing but that frame is reported. The bytes it reads
-/// come out of its share of the budget, and its frame must start with a header for this node.
+/// not know the connection exists, so nothing but its frames is reported. The bytes it reads
+/// come out of its share of the budget, and each frame must start with a header for this node.
 pub(crate) async fn inbound<S>(
     stream: S,
     conn: StreamId,
@@ -412,7 +442,7 @@ fn finish(reports: &Reports, conn: StreamId, report: Option<Report>) {
     let _ = reports.send((conn, Report::Done));
 }
 
-/// How an exchange ended before its frame arrived.
+/// How an exchange ended before its first frame arrived.
 #[derive(Debug, Clone, Copy)]
 enum Outcome {
     Closed,
@@ -428,10 +458,10 @@ impl Outcome {
     }
 }
 
-/// Reads one frame and writes what the actor sends until it says to close. Returns how the
-/// connection ended if that happened before the frame arrived. With `inbound`, every byte read is
-/// taken from the connection's share of the budget first, and the frame's header is checked as
-/// soon as it arrives.
+/// Reads one frame, or with `inbound` up to [`INBOUND_FRAMES`], and writes what the actor sends
+/// until it says to close. Returns how the connection ended if that happened before the first
+/// frame arrived. With `inbound`, every byte read is taken from the share of the budget of the
+/// frame being read first, and each frame's header is checked as soon as it arrives.
 async fn exchange<S>(
     stream: S,
     limits: Limits,
@@ -455,23 +485,26 @@ where
         Some(i) => (Some(i.held), Some(i.header)),
         None => (None, None),
     };
-    let kill = held.as_ref().map(|h| Arc::clone(&h.kill));
+    let most = if header.is_some() { INBOUND_FRAMES } else { 1 };
+    let mut kill = held.as_ref().map(|h| Arc::clone(&h.kill));
     let mut reader = FrameReader::new(limits.max_stream_frame);
     let mut chunk = vec![0; READ_CHUNK];
-    let mut got_frame = false;
-    // Before the frame: the frame must be complete by then. After it: the actor must answer by
-    // then; it does at once, so this only guards against a stuck exchange.
+    let mut frames = 0;
+    // Before a frame: the frame must be complete by then. After the last: the actor must answer
+    // by then; it does at once, so this only guards against a stuck exchange.
     let mut deadline = Instant::now() + limits.tcp_timeout;
-    // An inbound frame's header is due sooner; `None` once it has passed the check.
+    // The first inbound frame's header is due sooner; `None` once it has passed the check.
     let mut header_due = header
         .as_ref()
         .map(|_| deadline.min(Instant::now() + limits.header_timeout));
+    // Whether the frame being read has passed the header check, which outbound ones skip.
+    let mut checked = header.is_none();
     loop {
         tokio::select! {
             w = writes.recv() => match w {
                 Some(Write::Bytes(b)) => {
                     if !matches!(timeout(t, wr.write_all(&b)).await, Ok(Ok(()))) {
-                        return (!got_frame).then_some(Outcome::Failed);
+                        return (frames == 0).then_some(Outcome::Failed);
                     }
                 }
                 Some(Write::Close) | None => {
@@ -479,60 +512,80 @@ where
                     return None;
                 }
             },
-            r = rd.read(&mut chunk), if !got_frame => match r {
+            r = rd.read(&mut chunk), if frames < most => match r {
                 Ok(0) => {
                     let outcome = if reader.finish().is_ok() { Outcome::Closed } else { Outcome::Failed };
-                    return Some(outcome);
+                    return (frames == 0).then_some(outcome);
                 }
                 Ok(n) => {
                     if let Some(h) = &held {
                         if !take(h, n, deadline).await {
                             tracing::debug!(?conn, "no room in the inbound buffer for this address; dropping connection");
-                            return Some(Outcome::Failed);
+                            return (frames == 0).then_some(Outcome::Failed);
                         }
                     }
                     reader.push(&chunk[..n]);
-                    if let (Some(check), Some(_)) = (&header, header_due) {
-                        if let Some(head) = reader.head(HeaderCheck::LEN) {
-                            if let Err(e) = check.load().check(PacketKind::Stream, head) {
-                                tracing::debug!(?conn, error = %e, "not a frame for this node; dropping connection");
-                                let _ = reports.send((conn, Report::Refused(e)));
-                                return Some(Outcome::Failed);
+                    // One read can finish a frame and start the next.
+                    loop {
+                        if let (Some(check), false) = (&header, checked) {
+                            if let Some(head) = reader.head(HeaderCheck::LEN) {
+                                if let Err(e) = check.load().check(PacketKind::Stream, head) {
+                                    tracing::debug!(?conn, error = %e, "not a frame for this node; dropping connection");
+                                    let _ = reports.send((conn, Report::Refused(e)));
+                                    return (frames == 0).then_some(Outcome::Failed);
+                                }
+                                checked = true;
+                                header_due = None;
                             }
-                            header_due = None;
                         }
-                    }
-                    match reader.next_frame() {
-                        Ok(Some(_)) if header_due.is_some() => {
-                            tracing::debug!(?conn, "frame too short to hold a header; dropping connection");
-                            let _ = reports.send((conn, Report::Refused(DecodeError::Truncated)));
-                            return Some(Outcome::Failed);
-                        }
-                        Ok(Some(frame)) => {
-                            got_frame = true;
-                            deadline = Instant::now() + limits.tcp_timeout;
-                            // The read side is done; release its buffers before waiting, and
-                            // hold only the frame against the budget until the actor is done.
-                            chunk = Vec::new();
-                            reader = FrameReader::new(0);
-                            let mut held = held.take();
-                            if let Some(h) = &mut held {
-                                h.keep(frame.len());
+                        match reader.next_frame() {
+                            Ok(Some(_)) if !checked => {
+                                tracing::debug!(?conn, "frame too short to hold a header; dropping connection");
+                                let _ = reports.send((conn, Report::Refused(DecodeError::Truncated)));
+                                return (frames == 0).then_some(Outcome::Failed);
                             }
-                            let _ = reports.send((conn, Report::Frame { frame, _held: held }));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::debug!(?conn, error = %e, "bad stream frame");
-                            return Some(Outcome::Failed);
+                            Ok(Some(frame)) => {
+                                frames += 1;
+                                deadline = Instant::now() + limits.tcp_timeout;
+                                // The next frame, if one may follow, is held against a share of
+                                // its own, from the bytes already read past this one.
+                                let next = held.as_ref().filter(|_| frames < most).and_then(Held::next);
+                                let mut done = held.take();
+                                if let Some(h) = &mut done {
+                                    h.keep(frame.len());
+                                }
+                                let _ = reports.send((conn, Report::Frame { frame, _held: done }));
+                                if frames == most {
+                                    // The read side is done; release its buffers before waiting,
+                                    // and hold only the frames against the budget until the
+                                    // actor is done with them.
+                                    chunk = Vec::new();
+                                    reader = FrameReader::new(0);
+                                    break;
+                                }
+                                if let Some(h) = &next {
+                                    if !take(h, reader.buffered(), deadline).await {
+                                        tracing::debug!(?conn, "no room in the inbound buffer for this address; dropping connection");
+                                        return None;
+                                    }
+                                }
+                                kill = next.as_ref().map(|h| Arc::clone(&h.kill));
+                                held = next;
+                                checked = header.is_none();
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::debug!(?conn, error = %e, "bad stream frame");
+                                return (frames == 0).then_some(Outcome::Failed);
+                            }
                         }
                     }
                 }
-                Err(_) => return Some(Outcome::Failed),
+                Err(_) => return (frames == 0).then_some(Outcome::Failed),
             },
-            () = killed(kill.as_deref()), if !got_frame => {
+            () = killed(kill.as_deref()), if frames < most => {
                 tracing::debug!(?conn, "evicted to make room for another address's frame");
-                return Some(Outcome::Failed);
+                return (frames == 0).then_some(Outcome::Failed);
             }
             () = sleep_until(header_due.unwrap_or(deadline)), if header_due.is_some() => {
                 tracing::debug!(?conn, "no frame header in time; dropping connection");
@@ -540,7 +593,7 @@ where
             }
             () = sleep_until(deadline) => {
                 tracing::debug!(?conn, "stream timed out");
-                return (!got_frame).then_some(Outcome::Failed);
+                return (frames == 0).then_some(Outcome::Failed);
             }
         }
     }
@@ -613,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_hands_over_one_frame_then_writes_the_answer_and_closes() {
+    async fn inbound_hands_over_at_most_two_frames_then_writes_the_answer_and_closes() {
         let (mut peer, ours) = duplex(1024);
         let (wtx, wrx) = mpsc::unbounded_channel();
         let (rtx, mut rrx) = mpsc::unbounded_channel();
@@ -627,13 +680,17 @@ mod tests {
             wrx,
             rtx,
         ));
-        let mut two = frame(&packet(20));
-        two.extend(frame(&packet(24)));
-        peer.write_all(&two).await.unwrap();
+        // Three frames in one write: the third is never read.
+        let mut three = frame(&packet(20));
+        three.extend(frame(&packet(24)));
+        three.extend(frame(&packet(12)));
+        peer.write_all(&three).await.unwrap();
         let (_, first) = rrx.recv().await.unwrap();
         assert!(matches!(&first, Report::Frame { frame, _held: Some(_) } if *frame == packet(20)));
-        assert_eq!(budget.left(), 128 - 20, "only the frame stays held");
-        drop(first);
+        let (_, second) = rrx.recv().await.unwrap();
+        assert!(matches!(&second, Report::Frame { frame, _held: Some(_) } if *frame == packet(24)));
+        assert_eq!(budget.left(), 128 - 20 - 24, "only the frames stay held");
+        drop((first, second));
         assert_eq!(budget.left(), 128);
         wtx.send(Write::Bytes(frame(b"ok"))).unwrap();
         wtx.send(Write::Close).unwrap();
@@ -642,6 +699,58 @@ mod tests {
         assert_eq!(answer, frame(b"ok"));
         assert_eq!(reports_of(&mut rrx).await, ["done"]);
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_inbound_second_frame_follows_the_answer_and_is_checked_too() {
+        let (mut peer, ours) = duplex(1024);
+        let (wtx, wrx) = mpsc::unbounded_channel();
+        let (rtx, mut rrx) = mpsc::unbounded_channel();
+        let budget = Budget::for_frames(LIMITS.max_stream_frame, 68);
+        let conn = StreamId::inbound(0);
+        let task = tokio::spawn(inbound(
+            ours,
+            conn,
+            LIMITS,
+            inbound_of(&budget, conn, 1),
+            wrx,
+            rtx,
+        ));
+        // The digest, then its answer, then the records the answer asked for, which arrive
+        // later than the first frame's header was due.
+        peer.write_all(&frame(&packet(20))).await.unwrap();
+        let (_, first) = rrx.recv().await.unwrap();
+        assert!(matches!(first, Report::Frame { .. }));
+        wtx.send(Write::Bytes(frame(b"answer"))).unwrap();
+        let mut answer = vec![0; frame(b"answer").len()];
+        peer.read_exact(&mut answer).await.unwrap();
+        tokio::time::sleep(LIMITS.header_timeout + Duration::from_millis(20)).await;
+        peer.write_all(&frame(&packet(30))).await.unwrap();
+        let (_, second) = rrx.recv().await.unwrap();
+        assert!(matches!(&second, Report::Frame { frame, .. } if *frame == packet(30)));
+        wtx.send(Write::Close).unwrap();
+        drop((first, second));
+        assert_eq!(reports_of(&mut rrx).await, ["done"]);
+        task.await.unwrap();
+
+        // A second frame that is not one for this node is refused.
+        let (mut peer, ours) = duplex(1024);
+        let (_wtx, wrx) = mpsc::unbounded_channel();
+        let (rtx, mut rrx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(inbound(
+            ours,
+            conn,
+            LIMITS,
+            inbound_of(&budget, conn, 1),
+            wrx,
+            rtx,
+        ));
+        let mut bytes = frame(&packet(20));
+        bytes.extend(frame(&[0x55; 20]));
+        peer.write_all(&bytes).await.unwrap();
+        assert_eq!(reports_of(&mut rrx).await, ["frame", "refused", "done"]);
+        task.await.unwrap();
+        assert_eq!(budget.left(), 128);
     }
 
     #[tokio::test]

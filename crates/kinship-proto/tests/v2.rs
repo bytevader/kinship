@@ -15,6 +15,7 @@ fn alive() -> v2::SignedAlive<'static> {
             vmin: 1,
             vmax: 2,
             epoch: 500,
+            features: 0,
         },
         certificate_id: [4; 8],
         signature: [5; 64],
@@ -619,8 +620,10 @@ fn released_0_4_reads_every_v1_field_of_extended_upgrade_packets() {
         let decoded: Vec<_> = old_payload.iter().collect();
         assert_eq!(decoded.len(), expected.len());
         // These distinct crate types cannot compare directly. Their complete derived Debug
-        // values include every v1 field and every nested record, so none is omitted here.
-        assert_eq!(format!("{decoded:?}"), format!("{expected:?}"));
+        // values include every v1 field and every nested record, so none is omitted here, but
+        // for the features 0.4 does not have, which a version 2 Alive never carries.
+        let expected_v1 = format!("{expected:?}").replace(", features: 0", "");
+        assert_eq!(format!("{decoded:?}"), expected_v1);
         let mut old_bytes = Vec::new();
         old_codec
             .seal(old::PacketKind::Stream, &decoded, &[8; 24], &mut old_bytes)
@@ -847,7 +850,7 @@ proptest::proptest! {
         let node = id(&name);
         let cert = Certificate::issue(&ca, b"c", node, ca.public_key(), 0, u64::MAX).unwrap();
         let rev = Revocation::issue(&ca, b"c", &cert).unwrap();
-        let original = v2::SignedAlive { alive: kinship_proto::Alive { node, inc, epoch, meta: &data, addr: std::net::SocketAddr::new(std::net::Ipv6Addr::from(ip).into(), seq as u16), vmin: 1, vmax: 2 }, certificate_id: cert_id, signature };
+        let original = v2::SignedAlive { alive: kinship_proto::Alive { node, inc, epoch, meta: &data, addr: std::net::SocketAddr::new(std::net::Ipv6Addr::from(ip).into(), seq as u16), vmin: 1, vmax: 2, features: 0 }, certificate_id: cert_id, signature };
         let records = [v2::RecordState::Alive, v2::RecordState::Suspect { inc }, v2::RecordState::Dead { inc }, v2::RecordState::Left { inc, at, certificate_id: cert_id, signature }].map(|state| v2::Record { alive: original, state });
         let ids = [cert_id];
         let mut msgs = messages(&records, &ids, cert, rev);

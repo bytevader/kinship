@@ -6,8 +6,9 @@
 //! Every node opens what it sends and files each message under its carrier: probe messages,
 //! rumours, the certificates ahead of Alives, of relayed Acks and of user messages, user
 //! messages, announcements and each packet's header and tag. Push-pull frames are filed by
-//! their version, and a version 1 exchange between two signing nodes is the second exchange of
-//! a mixed view. A version 1 datagram sent beside a version 2 one, to a member that speaks
+//! their version, a version 1 exchange between two signing nodes is the second exchange of a
+//! mixed view, and every frame of an exchange that started with a digest
+//! (`docs/pushpull-digest.md`) is filed as `push-pull digest v1`. A version 1 datagram sent beside a version 2 one, to a member that speaks
 //! version 2, is counted again on its own. Frames are counted at the node that opened the
 //! connection, both ways, so that a reply is filed with its request.
 //!
@@ -195,8 +196,24 @@ impl Shared {
     }
 
     /// Files a frame of `len` bytes, its length prefix included, on a connection `opener`
-    /// opened to `peer`.
-    fn frame(&self, opener: usize, peer: Option<usize>, frame: &[u8], len: usize, t: Instant) {
+    /// opened to `peer`; `digest` says whether the connection's exchange started with a digest,
+    /// and is set when this frame shows it did.
+    fn frame(
+        &self,
+        opener: usize,
+        peer: Option<usize>,
+        frame: &[u8],
+        len: usize,
+        t: Instant,
+        digest: &mut bool,
+    ) {
+        let mut buf = frame.to_vec();
+        let opened = self.codec.open_versioned(PacketKind::Stream, &mut buf);
+        if let Ok(VersionedPayload::V1(p)) = &opened {
+            *digest |= p
+                .iter()
+                .any(|m| matches!(m, Message::PushPullDigest(_) | Message::PushPullWants(_)));
+        }
         let Some(w) = self.window(t) else { return };
         let mut buf = frame.to_vec();
         let carrier = match self.codec.open_versioned(PacketKind::Stream, &mut buf) {
@@ -212,6 +229,7 @@ impl Shared {
                     "user frames"
                 }
             }
+            Ok(VersionedPayload::V1(_)) if *digest => "push-pull digest v1",
             Ok(VersionedPayload::V1(p)) => {
                 if p.iter().any(|m| matches!(m, Message::PushPull(_))) {
                     let both = self.signing[opener] && peer.is_some_and(|j| self.signing[j]);
@@ -332,6 +350,8 @@ struct Opened {
     /// Frames written before the connection showed it opened, with when.
     pending: Vec<(Vec<u8>, Instant)>,
     open: bool,
+    /// Its exchange started with a digest.
+    digest: bool,
 }
 
 impl Opened {
@@ -339,7 +359,14 @@ impl Opened {
     fn carried(&mut self, shared: &Shared, opener: usize) {
         self.open = true;
         for (frame, t) in self.pending.drain(..) {
-            shared.frame(opener, self.peer, &frame[4..], frame.len(), t);
+            shared.frame(
+                opener,
+                self.peer,
+                &frame[4..],
+                frame.len(),
+                t,
+                &mut self.digest,
+            );
         }
     }
 }
@@ -369,7 +396,9 @@ impl SimNode for Meter {
             match &ev {
                 StreamEvent::Frame(f) => {
                     o.carried(&self.shared, self.index);
-                    self.shared.frame(self.index, o.peer, f, f.len() + 4, now);
+                    let (peer, digest) = (o.peer, &mut o.digest);
+                    self.shared
+                        .frame(self.index, peer, f, f.len() + 4, now, digest);
                 }
                 StreamEvent::Closed => o.carried(&self.shared, self.index),
                 // A connection that failed carried nothing more than it had shown.
@@ -455,14 +484,22 @@ impl SimNode for Meter {
                     peer: index_at(*to),
                     pending: Vec::new(),
                     open: false,
+                    digest: false,
                 };
                 self.opened.insert(*conn, o);
             }
             Transmit::Stream { conn, frame } => {
                 if let Some(o) = self.opened.get_mut(conn) {
                     if o.open {
-                        self.shared
-                            .frame(self.index, o.peer, &frame[4..], frame.len(), self.now);
+                        let (peer, digest) = (o.peer, &mut o.digest);
+                        self.shared.frame(
+                            self.index,
+                            peer,
+                            &frame[4..],
+                            frame.len(),
+                            self.now,
+                            digest,
+                        );
                     } else {
                         o.pending.push((frame.clone(), self.now));
                     }
@@ -922,6 +959,7 @@ fn the_ledger_files_every_byte() {
             );
         }
         assert!(has("probes v1") && has("push-pull v1"), "{rows}");
+        assert_eq!(has("push-pull digest v1"), mode == Mode::Off, "{rows}");
     }
 }
 

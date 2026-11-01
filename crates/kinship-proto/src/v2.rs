@@ -6,7 +6,9 @@ use core::fmt;
 use core::net::SocketAddr;
 
 use crate::identity::{self, Certificate, CertificateId, Revocation, Signature};
-use crate::message::{put_node, read_addr, read_alive, read_bool, read_node};
+use crate::message::{
+    put_alive_fields, put_node, read_addr, read_alive_fields, read_bool, read_node,
+};
 use crate::wire::{Reader, Sink, varint_len};
 use crate::{Alive, Dead, DecodeError, EncodeError, Limits, NodeId, State};
 
@@ -343,11 +345,11 @@ pub enum Message<'a> {
     Revocation(Revocation),
 }
 
+/// The version 1 fields and always the epoch, without the features a version 1 Alive appends
+/// after it: a version 2 Alive goes on with its certificate id.
 fn put_alive<S: Sink>(out: &mut S, a: &Alive<'_>) {
-    crate::message::put_alive(out, a);
-    if a.epoch == 0 {
-        out.put_u64(0);
-    }
+    put_alive_fields(out, a);
+    out.put_u64(a.epoch);
 }
 
 fn put_signed_alive<S: Sink>(out: &mut S, a: &SignedAlive<'_>) {
@@ -361,7 +363,7 @@ fn read_signed_alive<'a>(
     limits: &Limits,
 ) -> Result<SignedAlive<'a>, DecodeError> {
     Ok(SignedAlive {
-        alive: read_alive(r, limits)?,
+        alive: read_alive_fields(r, limits)?,
         certificate_id: r.array()?,
         signature: r.array()?,
     })

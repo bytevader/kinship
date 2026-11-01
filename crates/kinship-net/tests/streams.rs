@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use kinship_net::mem::{MemNetwork, MemTransport};
 use kinship_net::{Config, Key, Memberlist, Security, Settings, Transport};
-use kinship_proto::{Codec, Limits, Message, PacketKind};
+use kinship_proto::{
+    Alive, Codec, DigestEntries, DigestEntry, FrameReader, Limits, Message, NodeId, PacketKind,
+    PushPull, PushPullDigest, Record, Records, State,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
@@ -275,5 +278,92 @@ async fn a_peer_that_fills_the_inbound_budget_cannot_refuse_a_real_join() {
     assert_eq!(closed, 1, "one partial frame was evicted to make room");
     assert!(closed_by_node(&mut held[2].0).await, "the largest one");
     a.close().await;
+    b.close().await;
+}
+
+/// Reads one frame from `stream` and returns the packet in it.
+async fn read_frame(stream: &mut DuplexStream) -> Vec<u8> {
+    let mut reader = FrameReader::new(1 << 20);
+    let mut buf = [0; 4096];
+    loop {
+        if let Some(frame) = reader.next_frame().unwrap() {
+            return frame;
+        }
+        let n = timeout(WAIT, stream.read(&mut buf)).await.unwrap().unwrap();
+        assert!(n > 0, "closed before a frame");
+        reader.push(&buf[..n]);
+    }
+}
+
+#[tokio::test]
+async fn an_accepted_digest_exchange_reads_the_records_its_answer_asked_for() {
+    let net = MemNetwork::new();
+    let b = node(&net, 1, WAIT).await;
+    let peer = net.bind(addr(9)).unwrap();
+    let mut s = connect(&peer, addr(1)).await;
+    let codec = plaintext();
+    // Plaintext packets carry no nonce; any will do.
+    let nonce: [u8; 24] = std::array::from_fn(|i| i as u8);
+    let ghost = NodeId::new("ghost").unwrap();
+    let entries = [DigestEntry {
+        state: State::Alive,
+        inc: 0,
+        node: ghost,
+        epoch: 1,
+    }];
+    let digest = Message::PushPullDigest(PushPullDigest {
+        join: false,
+        entries: DigestEntries::Slice(&entries),
+    });
+    let mut wire = Vec::new();
+    codec
+        .seal_stream_frame(&[digest], &nonce, &mut wire)
+        .unwrap();
+    s.write_all(&wire).await.unwrap();
+    // b answers with its own record, which the digest does not list, and wants the ghost.
+    let mut answer = read_frame(&mut s).await;
+    let kinds: Vec<String> = codec
+        .open(PacketKind::Stream, &mut answer)
+        .unwrap()
+        .iter()
+        .map(|m| match m {
+            Message::PushPull(p) => format!("push-pull {}", p.records.len()),
+            Message::PushPullWants(w) => format!("wants {:?}", w.names),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, ["push-pull 1", r#"wants ["ghost"]"#]);
+    assert!(!closed_by_node(&mut s).await, "b waits for the records");
+    // The second frame on the connection b accepted.
+    let records = [Record {
+        state: State::Alive,
+        alive: Alive {
+            inc: 0,
+            node: ghost,
+            addr: addr(9),
+            meta: b"",
+            vmin: 1,
+            vmax: 1,
+            epoch: 1,
+            features: 0,
+        },
+    }];
+    let push_pull = Message::PushPull(PushPull {
+        join: false,
+        records: Records::Slice(&records),
+    });
+    let mut wire = Vec::new();
+    codec
+        .seal_stream_frame(&[push_pull], &nonce, &mut wire)
+        .unwrap();
+    s.write_all(&wire).await.unwrap();
+    timeout(WAIT, async {
+        while b.member("ghost").is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(closed_by_node(&mut s).await, "and closes once it has them");
     b.close().await;
 }

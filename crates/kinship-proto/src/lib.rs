@@ -24,8 +24,9 @@ mod wire;
 pub use error::{ConfigError, DecodeError, EncodeError, KeyError, KeyringError};
 pub use limits::Limits;
 pub use message::{
-    Alive, Dead, Message, Messages, NodeId, Payload, Ping, PingReq, PushPull, Record, RecordIter,
-    Records, State, Suspect, UserBroadcast, UserMessage, kind,
+    Alive, Dead, DigestEntries, DigestEntry, DigestIter, Message, Messages, NameIter, Names,
+    NodeId, Payload, Ping, PingReq, PushPull, PushPullDigest, PushPullWants, Record, RecordIter,
+    Records, State, Suspect, UserBroadcast, UserMessage, feature, kind,
 };
 pub use packet::{
     Codec, ENCRYPTED_HEADER_LEN, ENCRYPTED_OVERHEAD, HeaderCheck, Key, KeyId, MAGIC, MAX_LABEL_LEN,

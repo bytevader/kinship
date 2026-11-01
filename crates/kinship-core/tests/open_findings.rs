@@ -186,6 +186,7 @@ fn ki03_a_member_cannot_move_a_dead_node_to_another_address() {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            features: 0,
         })
     };
     o.handle_datagram(Instant::ZERO, addr(3), &sealed(&[dead, alive(1, evil)], 1));
@@ -274,6 +275,7 @@ fn push_pull_of(n: usize) -> Vec<u8> {
                 vmin: 1,
                 vmax: 1,
                 epoch: 0,
+                features: 0,
             },
         })
         .collect();
@@ -315,6 +317,7 @@ fn ks04_plaintext_sends_nothing_to_an_address_that_is_not_a_member() {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            features: 0,
         });
         o.handle_datagram(Instant::ZERO, addr(200), &seal(&[alive]));
     }

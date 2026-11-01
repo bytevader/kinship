@@ -18,6 +18,8 @@
 //!
 //! Stream s is the node's inbound connection s for s below 16, else its outbound connection
 //! s - 16; the node opens outbound 0 and 1 when it joins its first two members at the start.
+//! It has the epoch node n0 has in the simulator, so it advertises digest push-pull and starts
+//! digest exchanges with members whose Alives advertise it.
 //! The seed corpus is real traffic node n0 received in the simulator, captured with
 //! `cargo run -p kinship-sim --example node_corpus`, so it opens under the same key and label.
 #![no_main]
@@ -80,7 +82,10 @@ fuzz_target!(|data: &[u8]| {
         Security::InsecurePlaintext
     };
     let mut now = Instant::ZERO;
-    let me = Identity::new("n0", addr(0)).unwrap();
+    // `kinship_sim::WALL_CLOCK_AT_ZERO_MS`, the epoch of a node that starts with the run.
+    let me = Identity::new("n0", addr(0))
+        .unwrap()
+        .with_epoch(1_790_000_000_000);
     let mut node = Node::new(Config::lan(security), me, now, 0, &[0; 32]).unwrap();
     for i in 1..=3 {
         node.add_member(now, &format!("n{i}"), addr(i)).unwrap();

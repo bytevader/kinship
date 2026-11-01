@@ -302,6 +302,7 @@ impl PendingRecord {
                     vmin: self.vmin,
                     vmax: self.vmax,
                     epoch: self.epoch,
+                    features: 0,
                 },
                 certificate_id: self.cert,
                 signature: self.sig,
@@ -430,6 +431,7 @@ impl Node {
             vmin: me.vmin,
             vmax: me.vmax,
             epoch: me.member.epoch,
+            features: 0,
         };
         self.local.proof = self.sign_alive(&a);
     }

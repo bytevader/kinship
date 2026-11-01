@@ -56,6 +56,7 @@ async fn serve_join<T: Transport>(b: &T) {
             vmin: 1,
             vmax: 1,
             epoch: 0,
+            features: 0,
         },
     }];
     let reply = Message::PushPull(PushPull {

@@ -538,10 +538,15 @@ fn same_seed_gives_identical_swim_traces() {
 fn swim_trace_is_pinned_across_platforms() {
     // CI runs this on Linux, macOS and Windows, so a SWIM seed that fails anywhere replays
     // everywhere, encrypted bytes included. Update the value only when the protocol, the codec
-    // or the simulator changes on purpose. It last changed when members got epochs (0.3):
-    // every Alive, Suspect and Dead carries its member's epoch, 8 bytes, so the 416 of 1,345
-    // datagrams that hold one and every stream frame grew, and events name the epoch; every
-    // other record, timing included, stayed the same. Before that it changed when nonces got
+    // or the simulator changes on purpose. It last changed with digest push-pull: every Alive
+    // carries its member's features, one byte, so the 80 of the first 362 datagrams that hold
+    // one grew by a byte and the rest stayed the same, until the first push-pull at 8.5 s,
+    // which became a digest exchange of 228, 166 and 169 bytes in place of 304 and 320. Its
+    // third frame draws one more latency from the simulator's RNG, so every later record
+    // moved; the run has the same 34 events, but for which of n0 and n3 learned n9's epoch
+    // before n9 died. With `KINSHIP_PUSH_PULL_DIGEST=0` the trace is the one 0.4 pinned,
+    // 0x3dfb_cb2f_34fe_aa03. Before that it changed when members got epochs (0.3), which made
+    // every Alive, Suspect and Dead and every stream frame 8 bytes longer, and when nonces got
     // a ChaCha20 key of their own (KS-06), which changed every packet's bytes and nothing else.
     let plan = Plan::random(1, 10);
     let scenario = plan.scenario().trace(TraceConfig::ALL).duration(secs(30));
@@ -549,9 +554,10 @@ fn swim_trace_is_pinned_across_platforms() {
     let mut sim = Sim::new(1, scenario, move |spec| {
         Observed::new(spec, log.clone(), |_| true)
     });
-    assert_eq!(
-        sim.run().digest(),
-        0x3dfb_cb2f_34fe_aa03,
-        "trace digest changed"
-    );
+    let pinned = if config().push_pull_digest {
+        0x8b4a_8d9c_9a71_de4d
+    } else {
+        0x3dfb_cb2f_34fe_aa03
+    };
+    assert_eq!(sim.run().digest(), pinned, "trace digest changed");
 }
