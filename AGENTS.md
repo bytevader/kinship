@@ -21,7 +21,7 @@
 - `docs/ki01-per-member-keys.md`: the staged plan for per-member keys (KI-01), with its threat model, wire changes and measured cost.
 - `crates/kinship-proto`: wire types, codec, AEAD framing.
 - `crates/kinship-core`: sans-IO protocol state machine (`Node`). It never touches a clock, socket or RNG. User messages live in `user.rs`, their broadcast queue beside the membership queue in `broadcast.rs`.
-- `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version, its `signatures` tests the released 0.4.0 (`kinship-core-0-4`) beside nodes in mode `sign`, and its `digest` tests 0.4.0 beside digest push-pull.
+- `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version, its `signatures` tests the released 0.4.0 (`kinship-core-0-4`) beside nodes in mode `sign`, its `digest` tests 0.4.0 beside digest push-pull, and its `interop_0_5` tests the released 0.5.0 (`kinship-core-0-5`) through digest exchanges both ways, joins through either version, and a partition and its heal with no false deaths (KP-06).
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
