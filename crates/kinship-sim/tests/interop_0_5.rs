@@ -15,7 +15,12 @@
 //! 5. digest exchanges, with a third frame of wanted records, open in both directions between
 //!    the versions and within each.
 //!
-//! A quick test runs a few seeds; the ignored sweep runs 1,000, which CI runs with
+//! A second scenario does the upgrade itself: a cluster on 0.5.0 moves to this version one node
+//! at a time, each crashing, restarting on the other version and joining through a node that has
+//! not moved or has, and then rolls back the same way. After every step each node holds every
+//! node at its current run, and no node has declared a member other than the one that moved dead.
+//!
+//! Quick tests run a few seeds; the ignored sweeps run 1,000, which CI runs with
 //! `cargo test --release -p kinship-sim --test interop_0_5 -- --ignored --nocapture`.
 
 mod common;
@@ -76,14 +81,15 @@ impl Tally {
 /// what has been counted, and each death as (observer, member).
 struct Shared {
     codec: Codec,
-    on_0_5: BTreeSet<usize>,
+    /// Read when an instance starts, so a restart can bring a node up on the other version.
+    on_0_5: RefCell<BTreeSet<usize>>,
     seen: RefCell<Tally>,
     deaths: RefCell<Vec<(usize, usize)>>,
 }
 
 impl Shared {
     fn version(&self, node: usize) -> usize {
-        if self.on_0_5.contains(&node) {
+        if self.on_0_5.borrow().contains(&node) {
             OLD
         } else {
             NEW
@@ -132,7 +138,8 @@ fn to_old(t: Instant) -> old::Instant {
 
 impl Peer {
     fn new(spec: &NodeSpec, shared: &Rc<Shared>) -> Self {
-        let inner = if shared.on_0_5.contains(&spec.index) {
+        let on_0_5 = shared.on_0_5.borrow().contains(&spec.index);
+        let inner = if on_0_5 {
             let Security::Keys(keys) = config().security else {
                 unreachable!("the sweeps seal")
             };
@@ -192,6 +199,14 @@ impl Peer {
         match &self.inner {
             Inner::New(n) => n.members().map(|m| index_of(&m.name)).collect(),
             Inner::Old(n) => n.members().map(|m| index_of(&m.name)).collect(),
+        }
+    }
+
+    /// The live members this node holds, itself included, each with the epoch it holds it at.
+    fn lives(&self) -> BTreeMap<usize, u64> {
+        match &self.inner {
+            Inner::New(n) => n.members().map(|m| (index_of(&m.name), m.epoch)).collect(),
+            Inner::Old(n) => n.members().map(|m| (index_of(&m.name), m.epoch)).collect(),
         }
     }
 
@@ -434,7 +449,7 @@ fn mixed(seed: u64, nodes: usize, on_0_5: usize) -> Result<Tally, String> {
     }
     let shared = Rc::new(Shared {
         codec: codec(),
-        on_0_5: (nodes - on_0_5..nodes).collect(),
+        on_0_5: RefCell::new((nodes - on_0_5..nodes).collect()),
         seen: RefCell::default(),
         deaths: RefCell::default(),
     });
@@ -511,6 +526,119 @@ fn mixed(seed: u64, nodes: usize, on_0_5: usize) -> Result<Tally, String> {
     Ok(seen)
 }
 
+/// Steps `sim` until every node holds every node at the run that node itself is in, or `until`
+/// passes; returns whether they did.
+fn settle(sim: &mut Sim<Peer>, nodes: usize, until: Instant) -> bool {
+    loop {
+        let views: Vec<BTreeMap<usize, u64>> = (0..nodes)
+            .map(|o| sim.node(o).map(Peer::lives).unwrap_or_default())
+            .collect();
+        let own: BTreeMap<usize, u64> = (0..nodes)
+            .filter_map(|o| views[o].get(&o).map(|&epoch| (o, epoch)))
+            .collect();
+        if own.len() == nodes && views.iter().all(|view| *view == own) {
+            return true;
+        }
+        if sim.now() >= until {
+            return false;
+        }
+        let next = (sim.now() + ms(250)).min(until);
+        sim.run_until(next);
+    }
+}
+
+/// A rolling upgrade of `nodes` from 0.5.0 to this version and a rollback, as the module describes.
+fn rolling(seed: u64, nodes: usize) -> Result<(), String> {
+    let cfg = config();
+    // "rolling" in ASCII, so that the draws are not those of `mixed`.
+    let mut rng = Rng::new(seed ^ 0x0072_6f6c_6c69_6e67);
+    let (link, loss) = random_link(&mut rng);
+    let mut scenario = Scenario::new(nodes)
+        .duration(secs(24 * 3600))
+        .link(link)
+        .trace(TraceConfig::OFF);
+    for j in 1..nodes {
+        let seeds = vec![addr_of(0)];
+        let at = ms(rng.below(3_000));
+        scenario = scenario.at(
+            at,
+            Action::Command {
+                node: j,
+                cmd: Command::Join { seeds },
+            },
+        );
+    }
+    let shared = Rc::new(Shared {
+        codec: codec(),
+        on_0_5: RefCell::new((0..nodes).collect()),
+        seen: RefCell::default(),
+        deaths: RefCell::default(),
+    });
+    let factory = shared.clone();
+    let mut sim = Sim::new(seed, scenario, move |spec| Peer::new(spec, &factory));
+    let fail = |msg: String| Err(format!("seed {seed}, {nodes} nodes, loss {loss:.4}: {msg}"));
+
+    let bound = heal_bound(&cfg, nodes);
+    let start = Instant::ZERO + cfg.push_pull_interval_for(nodes) + secs(10);
+    sim.run_until(start);
+    if !settle(&mut sim, nodes, start + bound) {
+        return fail(format!("0.5.0 did not converge: {}", missing(&sim, nodes)));
+    }
+    for upgrade in [true, false] {
+        let mut order: Vec<usize> = (0..nodes).collect();
+        rng.shuffle(&mut order);
+        for node in order {
+            let errors = sim.node(node).map_or(0, Peer::decode_errors);
+            if errors > 0 {
+                return fail(format!("n{node} counted {errors} decode errors"));
+            }
+            {
+                let mut on_0_5 = shared.on_0_5.borrow_mut();
+                if upgrade {
+                    on_0_5.remove(&node);
+                } else {
+                    on_0_5.insert(node);
+                }
+            }
+            let deaths = shared.deaths.borrow().len();
+            sim.apply(Action::Crash(node));
+            sim.run_for(ms(200 + rng.below(800)));
+            sim.apply(Action::Restart(node));
+            let via = (node + 1 + rng.index(nodes - 1)) % nodes;
+            sim.apply(Action::Command {
+                node,
+                cmd: Command::Join {
+                    seeds: vec![addr_of(via)],
+                },
+            });
+            let until = sim.now() + bound;
+            if !settle(&mut sim, nodes, until) {
+                return fail(format!(
+                    "upgrade {upgrade}: not settled {bound:?} after n{node} moved through n{via}: \
+                     {}",
+                    missing(&sim, nodes)
+                ));
+            }
+            if let Some((o, m)) = shared.deaths.borrow()[deaths..]
+                .iter()
+                .find(|(_, m)| *m != node)
+            {
+                return fail(format!(
+                    "upgrade {upgrade}: n{o} declared n{m} dead while n{node} moved"
+                ));
+            }
+            sim.run_for(ms(rng.below(2_000)));
+        }
+    }
+    for o in 0..nodes {
+        let errors = sim.node(o).map_or(0, Peer::decode_errors);
+        if errors > 0 {
+            return fail(format!("n{o} counted {errors} decode errors"));
+        }
+    }
+    Ok(())
+}
+
 /// The tallies of `runs`, summed, with one line that gives them, after checking that the runs
 /// covered every pairing of versions.
 fn summary(runs: &[Tally]) -> String {
@@ -548,6 +676,25 @@ fn summary(runs: &[Tally]) -> String {
 fn clusters_with_0_5_exchange_digests_and_heal_without_false_deaths() {
     let runs = check_all(0..12, |seed| mixed(seed, 16, 4 + 4 * (seed as usize % 2)));
     println!("{}", summary(&runs));
+}
+
+#[test]
+fn a_cluster_upgrades_from_0_5_and_rolls_back_one_node_at_a_time() {
+    check_all(0..6, |seed| rolling(seed, 8));
+}
+
+/// 1,000 seeds of 10 nodes, each moved to this version and back.
+#[test]
+#[ignore = "slow in debug builds; CI runs it with --release"]
+fn thousand_seeds_upgrade_from_0_5_and_roll_back() {
+    let seeds = seeds(1000);
+    let started = std::time::Instant::now();
+    check_all(seeds.clone(), |seed| rolling(seed, 10));
+    println!(
+        "{} seeds x 10 nodes upgraded from 0.5.0 and rolled back in {:?}",
+        seeds.end - seeds.start,
+        started.elapsed()
+    );
 }
 
 /// 1,000 seeds of 20 nodes, 5, 10 or 15 of them on 0.5.0.
