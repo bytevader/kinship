@@ -1,8 +1,8 @@
 # Stability
 
-What kinship 1.0 will promise, what it leaves free to change, and how it retires what it promised. This is the policy proposed for 1.0; until then a 0.x minor release may still break the API. Where this file and a release's CHANGELOG entry disagree, the CHANGELOG records what actually happened and this file is corrected.
+What kinship promises, what it leaves free to change, and how it retires what it promised. This policy has been in force since 1.0.0. `tests/test_stability.py` and `crates/kinship/tests/stability.rs` hold the Python API and the Rust facade to it. Where this file and a release's CHANGELOG entry disagree, the CHANGELOG records what actually happened and this file is corrected.
 
-## What 1.0 promises
+## What 1.x promises
 
 Every 1.x release keeps the promises below. A change that breaks one waits for 2.0, apart from the security exception under [Deprecation policy](#deprecation-policy).
 
@@ -12,7 +12,7 @@ The promise covers every name in `__all__` of these modules, with the signatures
 
 | Module | Public names |
 | --- | --- |
-| `kinship` | `Cluster`, `Config`, `EventStream`, `Keyring`, `Member`, `State`, `Stats`, the events, the errors, `blocking`, `rendezvous`, `log_to_python`, `wire_version`, `__version__` |
+| `kinship` | `Cluster`, `Config`, `EventStream`, `Keyring`, `Member`, `State`, `Stats`, `Event` and the events, the errors, `blocking`, `rendezvous`, `log_to_python`, `wire_version`, `__version__` |
 | `kinship.blocking` | `Cluster`, `EventStream`, `Keyring` |
 | `kinship.ring` | `Ring`, `RingChanged` |
 | `kinship.rendezvous` | `owner`, `owners`, `weight` |
@@ -33,7 +33,7 @@ In particular:
 
 ### Rust facade
 
-The `kinship` crate follows Semantic Versioning as Rust reads it. The promise covers what the crate's root exports: `Cluster` and its methods, `Config` and its `with_*` setters, `DEFAULT_PORT`, `Event`, `Events`, `Member`, `State`, `Stats`, `Metrics`, `Error`, `ConfigError`, `Key`, `KeyError`, `KeyId`, `Keyring`, `Seed`, `SeedError`, `generate_key` and `WIRE_VERSION`.
+The `kinship` crate follows Semantic Versioning as Rust reads it. The promise covers what the crate's root exports: `Cluster` and its methods but for `start_with`, `Config` with its presets, its `with_*` setters, `without_lifeguard` and its getters but for `core`, `DEFAULT_PORT`, `Event`, `Events`, `Member`, `State`, `Stats`, `Metrics`, `Error`, `ConfigError`, `Key`, `KeyError`, `KeyId`, `Keyring`, `Seed`, `SeedError`, `generate_key` and `WIRE_VERSION`.
 
 - `Event`, `Error`, `Seed`, `Stats` and `Metrics` are `#[non_exhaustive]`, so new variants and fields arrive in minor releases. Match with a wildcard arm.
 - `Config` gains fields only through new `with_*` setters, whose defaults keep today's behaviour, and it is validated by `Cluster::start` as now.
@@ -43,13 +43,13 @@ The `kinship` crate follows Semantic Versioning as Rust reads it. The promise co
 ### Wire format
 
 - 1.0 speaks wire version 1 as `docs/design.md` specifies it under Wire format: the outer header, the AEAD and its associated data, cluster time in the nonce and the replay window, the inner payload grammar, every message type from 0x01 to 0x0A and 0x0D and 0x0E with its fields, the features appended to Alive and what each bit means, the metadata tag encoding in `kinship_proto::tags`, and the default port 7946.
-- Every 1.x release interoperates with every other 1.x release, and with 0.3, 0.4 and 0.5, in one cluster: a rolling upgrade, or a rollback, one node at a time, never needs the cluster to stop. An opt-in setting can narrow this on purpose, as requiring signatures would shut out nodes that cannot sign; with every opt-in off, it holds. The simulator tests that run a released kinship-core beside the current one hold each release to this: `crates/kinship-sim/tests/usermsg.rs` for 0.3, `digest.rs` for 0.4 and `interop_0_5.rs` for 0.5.
+- Every 1.x release interoperates with every other 1.x release, and with 0.3, 0.4 and 0.5, in one cluster: a rolling upgrade, or a rollback, one node at a time, never needs the cluster to stop. An opt-in setting can narrow this on purpose, as requiring signatures would shut out nodes that cannot sign; with every opt-in off, it holds. The simulator tests that run a released kinship-core beside the current one hold each release to this: `crates/kinship-sim/tests/usermsg.rs` for 0.3, `digest.rs` for 0.4 and `interop_0_5.rs` for 0.5, which also moves a cluster from 0.5 to the current version and back one node at a time.
 - Version 1 changes only as it always has: new fields appended to a message, which older nodes skip, and new message types from the reserved range, which older nodes skip as types they do not know. A node that uses no new feature sends the bytes the previous release did.
 - A new wire version, such as version 2 for per-member keys (`docs/ki01-per-member-keys.md`), may arrive in a 1.x minor release only as an opt-in that negotiates down to version 1 with nodes that do not speak it. Dropping version 1 takes a major release, and the last 1.x minor release before it speaks both, so that a cluster can always upgrade one node at a time.
 
 ### Configuration
 
-- Every field keeps its name in Python and Rust, its unit (seconds as `float` or `timedelta` in Python, `Duration` in Rust, bytes for sizes) and its meaning.
+- Every field keeps its name in Python and Rust, its unit (seconds as `float` or `timedelta` in Python, `Duration` in Rust, bytes for sizes) and its meaning. `docs/design.md`, Configuration surface, lists them. `runtime_threads` exists only in Python, since a Rust node runs on the application's runtime, and `with_seed_hosts` only in Rust, since Python's `seeds` takes names as well as addresses.
 - The presets `lan()`, `wan()` and `local()` keep the values in `docs/design.md`, Configuration surface, and so does every default. A default changes only in a minor release, with a CHANGELOG entry under Changed that says why, and a timing default only with the evidence `docs/results/tuning.md` asks for: lower detection latency at every cluster size, with no more false deaths and at most 10% more bandwidth.
 - `push_pull_scale` stretches the anti-entropy period beyond 32 live members as `docs/design.md` (Join and push-pull) specifies, after memberlist's pushPullScale. It is off by default; turning it on by default, or changing how it scales, is a change of a timing default.
 - `push_pull_digest` is on by default: a node advertises digest push-pull and uses it with members that advertise it (`docs/design.md`, Digest push-pull). Off, it advertises nothing and sends the bytes 0.4 did, the opt-out the rule above for nodes that use no new feature asks for.
@@ -67,15 +67,17 @@ The `kinship` crate follows Semantic Versioning as Rust reads it. The promise co
 These may change in any release, minor or patch, with a CHANGELOG entry but without deprecation:
 
 - **kinship-core**, the sans-IO `Node`: its `Command`, `Event`, `Transmit`, `Config` and `Metrics` types and every other item. The README section on kinship-core shows how to drive it, and it will keep working that way where it can, but a protocol change may need a new input or output, and the core is where it lands first.
-- **kinship-net**: `Memberlist`, the actor, the `Transport` trait, the in-memory transport in `mem` and the `CoreConfig` that `kinship` re-exports for advanced use. A custom transport is an experiment, not a promise.
+- **kinship-net**: `Memberlist`, the actor, the `Transport` trait, `TokioTransport`, the in-memory transport in `mem` and the `CoreConfig` that `kinship` re-exports for advanced use, along with the two facade methods that name them, `Cluster::start_with` and `Config::core`. A custom transport is an experiment, not a promise.
 - **kinship-proto**: the codec, `Codec`, `FrameReader`, the message structs and error types. The bytes on the wire are promised above; the Rust API that produces them is not.
 - **kinship-sim** and **tools/chaos**: the simulator, its scenarios and trace format, the pinned SWIM trace digest, and every result and seed in `docs/results`. They are not published, and a fix to the core may change any number they report.
 - **Python internals**: every module and name that starts with an underscore, including `kinship._kinship`, the reprs of objects, and log messages, their levels and their targets.
 - **The test-hooks feature**, the fuzz targets and their corpora, the examples, and the Compose demo in `deploy/compose`.
 - **Performance**: detection latency, bandwidth, memory and CPU are measured and published, not promised. A release may trade one for another within the rule in `docs/results/tuning.md`.
-- **Opt-in features marked experimental** in the CHANGELOG when they ship, such as per-member keys while their plan is in progress.
+- **Opt-in features marked experimental** in the CHANGELOG when they ship, such as per-member keys while their plan is in progress, and their counters in `Metrics`: `signatures_made`, `signatures_checked`, `signatures_invalid`, `certificates_refused` and `unsigned_members`.
 
-The published crates have one version today. **Decision accepted by Nikola on 2026-10-16:** for 1.0, the internal crates keep 0.x versions of their own and `kinship` 1.x pins the exact ones it was built with. The stable facade remains responsible for preserving its public contract when it updates those dependencies.
+## Versions
+
+`kinship` and the Python package carry the 1.x version. kinship-proto, kinship-core and kinship-net keep 0.x versions of their own, 0.6.0 at kinship 1.0.0, as Nikola decided on 2026-10-16. Each published crate pins the exact versions of the others that it was built with, so a `kinship` release always runs the internal crates it was tested with, and an application that uses one of them beside `kinship` must ask for the same version. A 1.x release may move to a new version of an internal crate, including one that breaks that crate's own API, and the facade remains responsible for keeping its public contract when it does.
 
 ## Deprecation policy
 

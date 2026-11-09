@@ -4,7 +4,7 @@
 
 ## Status
 
-0.1.0 shipped on 2026-10-12, 0.1.1 and 0.2.0 on 2026-10-13, 0.3.0 on 2026-10-14, and 0.4.0, which adds user messages and broadcasts, Prometheus metrics with an optional Prometheus and Grafana stack for the Compose demo, and armv7 wheels, on 2026-10-15. 0.5.0, which turns digest push-pull on by default, adds the opt-in `push_pull_scale`, fixes the false deaths after a partition heals (KP-06) and brings the experimental KI-01 mode `sign` to kinship-core, is ready to release: versions are 0.5.0 and `CHANGELOG.md` dates it 2026-11-01. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
+0.1.0 shipped on 2026-10-12, 0.1.1 and 0.2.0 on 2026-10-13, 0.3.0 on 2026-10-14, and 0.4.0, which adds user messages and broadcasts, Prometheus metrics with an optional Prometheus and Grafana stack for the Compose demo, and armv7 wheels, on 2026-10-15. 0.5.0, which turns digest push-pull on by default, adds the opt-in `push_pull_scale`, fixes the false deaths after a partition heals (KP-06) and brings the experimental KI-01 mode `sign` to kinship-core, shipped on 2026-11-01. 1.0.0 is ready to release: `kinship` and the Python package are 1.0.0, kinship-proto, kinship-core and kinship-net keep 0.x versions of their own, 0.6.0, pinned exactly, `CHANGELOG.md` dates it 2026-11-05, and `docs/stability.md` is the policy in force. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the wheels (manylinux, musllinux, macOS, Windows) and sdist to PyPI, smoke-tests the PyPI release on Linux, macOS and Windows, and publishes the crates to crates.io.
 
 - Done: core protocol, join/leave/push-pull, tokio driver, Python bindings, keyring rotation, failure-mode tests.
 - At 100 nodes, kill -9 detection matches memberlist at the median (9.73 s vs 9.81 s on 2026-10-11) and nearly at the tail (13.3 s vs 12.2 s at most), since members that join mid-pass are probed in that pass; the `Detection latency` workflow on a GitHub runner (20 runs, 2026-10-11) agrees, 12.3 s vs 12.2 s at most. See `docs/results/detection.md`.
@@ -17,11 +17,11 @@
 
 ## Where to look
 
-- `docs/design.md`: architecture and design decisions. `README.md`: the public API contract. `docs/stability.md`: what 1.0 promises, what stays unstable, and the deprecation policy; check a public change against it.
+- `docs/design.md`: architecture and design decisions. `README.md`: the public API contract. `docs/stability.md`: what every 1.x release promises, what stays unstable, and the deprecation policy; check a public change against it. `tests/test_stability.py` and `crates/kinship/tests/stability.rs` hold the Python API and the facade to it.
 - `docs/ki01-per-member-keys.md`: the staged plan for per-member keys (KI-01), with its threat model, wire changes and measured cost.
 - `crates/kinship-proto`: wire types, codec, AEAD framing.
 - `crates/kinship-core`: sans-IO protocol state machine (`Node`). It never touches a clock, socket or RNG. User messages live in `user.rs`, their broadcast queue beside the membership queue in `broadcast.rs`.
-- `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version, its `signatures` tests the released 0.4.0 (`kinship-core-0-4`) beside nodes in mode `sign`, its `digest` tests 0.4.0 beside digest push-pull, and its `interop_0_5` tests the released 0.5.0 (`kinship-core-0-5`) through digest exchanges both ways, joins through either version, and a partition and its heal with no false deaths (KP-06).
+- `crates/kinship-sim`: deterministic simulator. Its `usermsg` tests run the released kinship-core 0.3.0, a dev-dependency renamed `kinship-core-0-3`, beside this version, its `signatures` tests the released 0.4.0 (`kinship-core-0-4`) beside nodes in mode `sign`, its `digest` tests 0.4.0 beside digest push-pull, and its `interop_0_5` tests the released 0.5.0 (`kinship-core-0-5`) through digest exchanges both ways, joins through either version, a partition and its heal with no false deaths (KP-06), and a rolling upgrade and rollback one node at a time.
 - `crates/kinship-net`: tokio UDP and TCP driver.
 - `crates/kinship-py`: PyO3 bindings, module `kinship._kinship`. `crates/kinship`: public Rust facade.
 - `python/kinship`: Python package. `tests/`: pytest. `examples/`: runnable Python examples, run by `tests/test_examples.py`.
@@ -32,13 +32,13 @@
 - Fuzz targets: `crates/kinship-proto/fuzz` (`decode_datagram`, `decode_payload`, `decode_stream_frame`, `decode_certificate`) and `crates/kinship-core/fuzz` (`node_input`).
 - Seeds may be DNS names (`kinship_net::Seed`); kinship-net looks them up at every join and rejoin (`crates/kinship-net/src/seed.rs`), never the core.
 - CI (`.github/workflows/ci.yml`): lint, cargo test, coverage (Rust with the bindings under pytest, plus Python; `coverage-badge` publishes `coverage.json` for the README badge to the `badges` branch on pushes to main), `sim-*` jobs (1,000 seeds each), chaos, cargo deny, MSRV, `fuzz smoke (<target>)`, wheels, musllinux wheels tested in Alpine. `detection.yml`: the weekly memberlist bench. `release.yml`: runs on `v*` tags only.
-- Released by `release.yml`: the `kinship` package to PyPI, then the crates `kinship-proto`, `kinship-core`, `kinship-net` and `kinship` to crates.io, in that order. `kinship-sim`, `kinship-py`, `kinship-chaos` and the fuzz crates have `publish = false`.
+- Released by `release.yml`: the `kinship` package to PyPI, then the crates `kinship-proto`, `kinship-core`, `kinship-net` and `kinship` to crates.io, in that order, each at its own version. The tag names the version of `kinship` and the Python package. When an internal crate changes, raise its own version in its `Cargo.toml` and its pin in the root `Cargo.toml`. `kinship-sim`, `kinship-py`, `kinship-chaos` and the fuzz crates have `publish = false`.
 
 ## Commands
 
 ```bash
 cargo test --workspace --exclude kinship-py   # kinship-py needs a Python to link; pytest covers it
-cargo test --manifest-path crates/kinship-core/Cargo.toml   # -p kinship-core is ambiguous: kinship-sim also pulls the released 0.4.0 core
+cargo test --manifest-path crates/kinship-core/Cargo.toml   # -p kinship-core is ambiguous: kinship-sim also pulls released cores
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 uv sync && uv run maturin develop && uv run pytest

@@ -2,7 +2,7 @@
 
 The release workflow runs it on each OS against kinship installed from PyPI, after the upload:
 
-    python tools/smoke_quickstart.py 0.5.0
+    python tools/smoke_quickstart.py 1.0.0
 
 The argument, if given, is the version kinship must report.
 """

@@ -4,7 +4,8 @@ name: Release
 # wheels, the musllinux abi3 wheels and the sdist to PyPI through trusted publishing, then the
 # Rust crates to crates.io in dependency order. Both publish steps skip what is already up, so a
 # failed run can be re-run. Once PyPI has the release, a smoke test installs it from there on
-# Linux, macOS and Windows and runs the quickstart.
+# Linux, macOS and Windows and runs the quickstart. The tag names the version of kinship and the
+# Python package; kinship-proto, kinship-core and kinship-net keep 0.x versions of their own.
 on:
   push:
     tags: ["v*"]
@@ -43,6 +44,20 @@ jobs:
           echo "tag $tag, crates $crates, Python package $python"
           test "$tag" = "$crates"
           test "$tag" = "$python"
+      - name: Check that each crate pins the internal crates it was built with
+        run: |
+          meta=$(cargo metadata --no-deps --format-version 1)
+          pinned() {
+            version=$(jq -r --arg c "$2" '.packages[] | select(.name == $c) | .version' <<<"$meta")
+            req=$(jq -r --arg c "$1" --arg d "$2" '.packages[] | select(.name == $c)
+              | .dependencies[] | select(.name == $d and .kind == null) | .req' <<<"$meta")
+            echo "$1 asks for $2 $req, which is at $version"
+            test "$req" = "=$version"
+          }
+          pinned kinship kinship-net
+          pinned kinship-net kinship-core
+          pinned kinship-net kinship-proto
+          pinned kinship-core kinship-proto
       # Packages and builds every published crate against the others before anything is uploaded.
       - run: cargo publish --workspace --dry-run --locked
 
@@ -275,8 +290,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          meta=$(cargo metadata --no-deps --format-version 1)
           for crate in kinship-proto kinship-core kinship-net kinship; do
+            version=$(jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version' <<<"$meta")
             index="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
             if curl -fsS "$index" 2>/dev/null | grep -q "\"vers\":\"${version}\""; then
               echo "${crate} ${version} is already on crates.io"
