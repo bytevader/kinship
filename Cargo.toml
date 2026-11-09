@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0 OR MIT"
@@ -21,10 +21,12 @@ authors = ["Nikola Stankovic"]
 keywords = ["swim", "gossip", "membership", "failure-detection", "cluster"]
 
 [workspace.dependencies]
-kinship-proto = { path = "crates/kinship-proto", version = "0.5.0" }
-kinship-core = { path = "crates/kinship-core", version = "0.5.0" }
-kinship-sim = { path = "crates/kinship-sim", version = "0.5.0" }
-kinship-net = { path = "crates/kinship-net", version = "0.5.0" }
+# The internal crates keep 0.x versions of their own, and each is pinned exactly, so a `kinship`
+# release always runs the ones it was built with (docs/stability.md).
+kinship-proto = { path = "crates/kinship-proto", version = "=0.6.0" }
+kinship-core = { path = "crates/kinship-core", version = "=0.6.0" }
+kinship-sim = { path = "crates/kinship-sim" }
+kinship-net = { path = "crates/kinship-net", version = "=0.6.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

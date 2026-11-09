@@ -6,4 +6,6 @@ The sans-IO SWIM and Lifeguard protocol state machine behind [kinship](https://c
 
 Use this crate to drive the protocol from your own runtime or event loop. For a tokio cluster handle, use [`kinship`](https://crates.io/crates/kinship). The design is described in [docs/design.md](https://github.com/bytevader/kinship/blob/main/docs/design.md).
 
+This crate stays on 0.x and can change in any release; `docs/stability.md` says what the `kinship` crate promises instead.
+
 Licensed under Apache-2.0 or MIT, at your option.

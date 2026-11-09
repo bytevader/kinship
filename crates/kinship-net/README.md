@@ -6,4 +6,6 @@ One actor task owns the protocol node and feeds it every datagram, stream frame,
 
 Most users want the [`kinship`](https://crates.io/crates/kinship) crate, which wraps this driver as `Cluster` with a builder for the configuration.
 
+This crate stays on 0.x and can change in any release; `docs/stability.md` says what the `kinship` crate promises instead.
+
 Licensed under Apache-2.0 or MIT, at your option.

@@ -104,7 +104,8 @@ class MemberDead:
 
 @dataclass(frozen=True, slots=True)
 class MemberLeft:
-    """A node left on purpose."""
+    """A node left on purpose, or restarted: its old run left, and ``MemberJoined`` follows with
+    the new ``epoch``."""
 
     member: Member
 
@@ -125,7 +126,8 @@ class MemberUpdated:
 
 @dataclass(frozen=True, slots=True)
 class NameConflict:
-    """Two live nodes claim the same name; the newer one, at ``other_addr``, is ignored."""
+    """Two nodes claim the same name, a live one or one that recently died or left; the one at
+    ``other_addr`` is ignored."""
 
     member: Member
     other_addr: str

@@ -4,6 +4,35 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-05
+
+The first stable release. The protocol and the code are those of 0.5.0; what changes is what kinship promises. [docs/stability.md](docs/stability.md) is now the policy in force: what every 1.x release keeps, what stays unstable, and how anything promised is deprecated.
+
+**Upgrading from 0.5.0.** Upgrade one node at a time: 0.5.0 and 1.0.0 nodes work in one cluster, and you can roll back the same way. The wire format, every default and the Python API do not change, so Python applications only change the version they ask for. The simulator holds this: kinship-sim's `interop_0_5::thousand_seeds_upgrade_from_0_5_and_roll_back` (CI job `sim-interop-0-5`) moves 1,000 clusters of 10 nodes from the released kinship-core 0.5.0 to this version and back, one node at a time, with no false death and no decode error, and `thousand_seeds_mixed_with_0_5` runs mixed clusters through a partition and its heal. Rust applications should check three things:
+
+- **The crates' versions split.** `kinship` is 1.0.0, and kinship-proto, kinship-core and kinship-net are 0.6.0. Change `kinship = "0.5"` to `kinship = "1"`. Their APIs have not changed since 0.5.0, so a direct dependency on them only needs the new version.
+- **Exact pins.** Each published crate now asks for the exact versions of the others, so a project that uses kinship-core, kinship-net or kinship-proto beside `kinship` must ask for the versions that `kinship` release pins, `=0.6.0` for 1.0.0, or Cargo will not resolve it.
+- **What is unstable.** kinship-proto, kinship-core and kinship-net can change in any release. So can what the `kinship` crate re-exports from them for advanced use: `CoreConfig`, `Transport`, `TokioTransport`, `mem`, `Cluster::start_with` and `Config::core`. The counters of the experimental mode `sign` in `Metrics` can too.
+
+### Added
+
+- **Tests of the promises.** `tests/test_stability.py` and `crates/kinship/tests/stability.rs` hold the Python API and the Rust facade to `docs/stability.md`: public names, parameters, error hierarchy, fields, metrics series, stubs and every preset value. `interop_0_5` gains the rolling upgrade and rollback above.
+- **API reference.** README.md lists every `Stats` counter, `rendezvous.owners` and `rendezvous.weight`, `cluster.config`, `ring.matches`, `ring.cluster`, `__version__` and `wire_version()`, and `docs/design.md` lists `rejoin_interval`, each of which the promise covers.
+
+### Changed
+
+- **Versions, as above.** `release.yml` publishes each crate at its own version, and refuses a tag whose crates do not pin each other exactly.
+- The Python package's classifier moves from Alpha to `Development Status :: 5 - Production/Stable`.
+- `ctutils` 0.4.7 in `Cargo.lock`.
+
+### Fixed
+
+- **Docs that had fallen behind the code.** `docs/design.md` said the core had no signing yet, and left `tcp_fallback_ping` and the bind address out of `local()`. `with_udp_max_payload` gave the old 813-byte floor, now 822. README's event loop examples now show the wildcard arm the promise asks for. The docstrings of `MemberLeft` and `NameConflict` now say what the README says. SECURITY.md's command for the open findings used `-p kinship-core`, which Cargo calls ambiguous.
+
+### Security
+
+- No finding changes. KI-01, that any member holding the key can declare any node dead, stays **Accepted**: per-member keys are planned as an opt-in in a 1.x minor release, which `docs/stability.md` allows. See SECURITY.md.
+
 ## [0.5.0] - 2026-11-01
 
 **Upgrading from 0.4.0.** Upgrade one node at a time: 0.4.0 and 0.5.0 nodes work in one cluster. A 0.5 node sends a digest only to members that advertise it, so it keeps the full push-pull with 0.4 nodes, and 0.4 nodes skip the byte 0.5 appends to Alive. The simulator holds this: kinship-sim's `digest::thousand_seeds_mixed_with_0_4` (CI job `sim-digest`) runs 1,000 clusters of 20 nodes, 5, 10 or 15 of them on the released kinship-core 0.4.0, through joins, a partition and its heal, and every node ends holding every node, neither version counts a decode error, and no digest reaches a 0.4 node; `digest::digest_and_full_exchanges_meet_in_mixed_clusters` runs a few of those seeds in `cargo test`, and kinship-proto's `released_0_4_reads_the_new_alive_and_skips_digest_messages` decodes the new bytes with the released kinship-proto 0.4.0. The Python API and the `kinship` facade only gain settings. Check a config set at the old limits (one byte less room, below), code that uses kinship-proto or kinship-core directly, and a driver of kinship-core of your own. The KP-06 fix works on 0.5 nodes: a 0.4 node that a partition cut off still gossips its deaths when the partition heals.
@@ -139,7 +168,8 @@ From the audit of 2026-10-07 and the protocol review of the same day. Each findi
 - **KI-05:** names and metadata are strings members choose; treat them as untrusted input.
 - **KS-09:** an observer without the key still sees packet sizes, timing, addresses, key ids and cluster time.
 
-[Unreleased]: https://github.com/bytevader/kinship/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bytevader/kinship/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/bytevader/kinship/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/bytevader/kinship/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bytevader/kinship/releases/tag/v0.4.0
 [0.3.0]: https://github.com/bytevader/kinship/releases/tag/v0.3.0

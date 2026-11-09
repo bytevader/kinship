@@ -1,7 +1,8 @@
 //! Reproductions of the findings in SECURITY.md. A finding that is documented rather than fixed
 //! has an ignored test that shows the behaviour as it is today and passes, ignored so that the
 //! suite does not read as a guarantee; run them with
-//! `cargo test -p kinship-core --test open_findings -- --ignored --nocapture`. A finding fixed
+//! `cargo test --manifest-path crates/kinship-core/Cargo.toml --test open_findings -- --ignored
+//! --nocapture`. A finding fixed
 //! since keeps its test here, turned into one that asserts the fixed behaviour and runs with
 //! the rest of the suite.
 

@@ -24,7 +24,8 @@ pub enum Event {
     MemberRecovered(Member),
     /// A suspicion expired without a refutation.
     MemberDead(Member),
-    /// A node left on purpose.
+    /// A node left on purpose, or restarted: its old run left, and
+    /// [`MemberJoined`](Self::MemberJoined) follows with the new epoch.
     MemberLeft(Member),
     /// A node changed its metadata.
     MemberUpdated {

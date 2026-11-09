@@ -323,7 +323,7 @@ impl Config {
         /// one nearest to done is dropped and counted.
         with_user_broadcast_queue => user_broadcast_queue: usize;
         /// Largest datagram sent, header and tag included. Must fit an Alive with
-        /// `max_meta_bytes` of metadata beside a Ping: 813 bytes encrypted with the default 512.
+        /// `max_meta_bytes` of metadata beside a Ping: 822 bytes encrypted with the default 512.
         with_udp_max_payload => limits.udp_max_payload: usize;
         /// Largest TCP frame accepted.
         with_max_stream_frame => limits.max_stream_frame: usize;

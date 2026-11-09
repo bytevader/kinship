@@ -6,6 +6,8 @@ This crate is the only place kinship turns bytes into protocol messages and back
 
 Most users want the [`kinship`](https://crates.io/crates/kinship) crate instead. The format is specified in [docs/design.md](https://github.com/bytevader/kinship/blob/main/docs/design.md#wire-format).
 
+This crate stays on 0.x and can change in any release: the bytes on the wire are promised, and the Rust API that produces them is not. See `docs/stability.md`.
+
 Licensed under Apache-2.0 or MIT, at your option.
 
 Experimental Stage 1 identity support lives in `identity` and `v2`. It provides
