@@ -60,7 +60,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KI-05 | Low | member | Names and metadata are attacker-controlled strings | Open |
 | KI-06 | Medium | member | A stamp far ahead stretches the replay window | Fixed |
 
-Reproductions of open findings are ignored tests that pass while the finding stands: `cargo test --release -p kinship-core --test open_findings -- --ignored --nocapture`. A finding fixed since keeps its test, turned into one that asserts the fix and runs with the rest of the suite.
+Reproductions of open findings are ignored tests that pass while the finding stands: `cargo test --release --manifest-path crates/kinship-core/Cargo.toml --test open_findings -- --ignored --nocapture`. A finding fixed since keeps its test, turned into one that asserts the fix and runs with the rest of the suite.
 
 ### KS-01 Recorded datagrams and push-pull frames were accepted again
 

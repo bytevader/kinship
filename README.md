@@ -41,14 +41,14 @@ Use it when you are building your own distributed piece (a sharded cache, a job 
 pip install kinship
 ```
 
-Wheels cover CPython 3.11 and later (abi3) plus free-threaded 3.14t, on Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64). Linux armv7 has abi3 wheels for glibc 2.28+ and musl 1.2+. No Rust toolchain is needed.
+Wheels cover CPython 3.11 and later (abi3) plus free-threaded 3.14t, on Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64). The Linux abi3 wheels are built for glibc 2.28+ and musl 1.2+, and armv7 has both. No Rust toolchain is needed. The package ships `py.typed` and its stubs.
 
 ```bash
 cargo add kinship        # tokio runtime and Cluster handle
 cargo add kinship-core   # the sans-IO protocol state machine only
 ```
 
-The Rust crates need Rust 1.87 or later.
+The Rust crates need Rust 1.87 or later. `kinship` follows Semantic Versioning. `kinship-core`, `kinship-net` and `kinship-proto` stay on 0.x versions of their own and can change in any release, and each `kinship` release pins the exact ones it was built with, so a project that uses one of them beside `kinship` must ask for the same version. [docs/stability.md](https://github.com/bytevader/kinship/blob/main/docs/stability.md) says what is promised.
 
 ## Quickstart
 
@@ -121,17 +121,20 @@ async with kinship.Cluster(cfg) as cluster:   # binds, then joins cfg.seeds
 | `cluster.members()` | `list[Member]` | Alive and suspect members, the local node included. Never waits on the network. |
 | `cluster.member(name)` | `Member \| None` | One member by name, including dead and left tombstones. |
 | `cluster.local` | `Member` | This node as the cluster sees it. |
+| `cluster.config` | `Config` | The config this cluster was created with. |
 | `cluster.events()` | `EventStream` | A new async iterator of events; see below. |
 | `await cluster.set_meta(meta)` | `None` | Replace this node's metadata and gossip it. |
 | `await cluster.update_meta(**changes)` | `None` | Change some metadata keys; a value of `None` deletes the key. |
 | `await cluster.send(member, data)` | `None` | Send bytes to one member; see Messages. |
 | `await cluster.broadcast(data)` | `None` | Send bytes to every other member; see Messages. |
 | `cluster.keyring` | `Keyring` | Runtime key rotation on this node; see Encryption. |
-| `cluster.stats()` | `Stats` | Counters: local health score, probes, suspicions raised and refuted, restarts seen, `decrypt_failures`, `decode_errors`, `replays_dropped`, and the user messages sent, received and dropped. |
+| `cluster.stats()` | `Stats` | Protocol counters and the local health score; see Stats. |
 | `await cluster.leave(timeout=5.0)` | `None` | Tell the cluster this node is leaving and wait for it to spread. |
 | `await cluster.close()` | `None` | Stop the node and close sockets. Without `leave()` first, peers see a crash. |
 
 If you cannot use `async with`, call `await cluster.start()` yourself and `await cluster.close()` in a `finally`.
+
+`kinship.__version__` is the installed version, and `kinship.wire_version()` the wire version this node speaks, 1.
 
 A `Member` is frozen and hashable by name:
 
@@ -163,6 +166,8 @@ async for event in cluster.events():
             await handle(m, data)
         case kinship.EventsLost(count=n):
             ring.rebuild(cluster.members())
+        case _:
+            pass   # a later minor release may add event types
 ```
 
 | Event | Fields | When |
@@ -180,6 +185,39 @@ async for event in cluster.events():
 Events never describe the local node, except `NameConflict`. Each call to `events()` is an independent subscription that starts at the moment of the call, not at the first `await`, so nothing is missed between `events()` and the loop. Every subscription buffers up to `event_buffer` events (1,024). When a slow consumer fills it, kinship drops the oldest events and your next read is `EventsLost(n)`; call `cluster.members()` and resync. The protocol never waits for you.
 
 The iterator ends when the cluster closes. If the node stopped because of an internal error, it raises `KinshipClosed` instead.
+
+## Stats
+
+`cluster.stats()` returns a frozen `kinship.Stats`. `local_health` is this node's Lifeguard health score, 0 when healthy and higher when its own probes are failing. Every other field is an `int` that counts from 0 since the node started:
+
+| Field | Counts |
+| --- | --- |
+| `packets_received` | Datagrams and stream frames that opened and parsed |
+| `decode_errors` | Datagrams and stream frames that were malformed, oversized or for another cluster |
+| `decrypt_failures` | Packets that did not authenticate, or that carry a key id this node does not hold |
+| `replays_dropped` | Packets refused as replays, or stamped too far ahead of cluster time |
+| `probes_sent` | Probe rounds started |
+| `probes_failed` | Probe rounds that ended without an Ack, direct or indirect |
+| `indirect_probes` | Requests sent to relays to probe a member that did not answer |
+| `missed_nacks` | Relays of failed probe rounds that sent no Nack in time; each raised `local_health` |
+| `suspicions` | Members this node moved to suspect |
+| `refutations` | Rumours about this node that it refuted |
+| `misdirected` | Pings for another name that reached this node's address |
+| `name_conflicts` | Claims on a name another address holds |
+| `restarts` | Members that came back in a later run, which replaced the run this node held |
+| `members_refused` | New members not admitted, because of `max_members` or `max_new_members_per_packet` |
+| `push_pulls` | Push-pull exchanges this node started that completed: joins, anti-entropy and reconnects |
+| `push_pull_failures` | Push-pull exchanges this node started that failed or timed out |
+| `push_pulls_served` | Push-pull exchanges other nodes started that this node answered |
+| `state_too_large` | Push-pull replies refused because this node's state does not fit `max_stream_frame` |
+| `gossip_too_large` | Rumours dropped because they do not fit a datagram even alone; stays 0 unless something is wrong |
+| `tcp_pings` | Fallback pings sent over TCP after a UDP probe went unanswered |
+| `tcp_ping_acks` | Probe rounds saved by a TCP Ack: UDP to that member is failing while TCP works |
+| `user_messages_sent` | Direct messages sent, and broadcasts this node started |
+| `user_messages_received` | Messages delivered to `events()`, direct and broadcast |
+| `user_messages_dropped` | Messages for another node or run, from an unknown sender, or whose connection failed |
+| `user_messages_too_large` | Sends refused over the limits, and received messages over them |
+| `user_queue_overflow` | Messages dropped from a full queue |
 
 ## Metadata
 
@@ -329,6 +367,8 @@ class ShardedCache:
 | `ring.fence(key, *, new_work=False)` | `tuple[str, int]` | `(owner_name, epoch)` of the member that owns `key`, as `owner()` picks it: a fencing token for writes, below. Raises `LookupError` if no member matches. |
 | `ring.changes()` | iterator of `RingChanged` | A new subscription to changes in the ring, built on `events()`. |
 | `ring.moved(keys, before, after)` | `dict` | `{key: (old_owner, new_owner)}` for the keys whose owner differs between two `members()` snapshots, a restarted owner included; keys that stayed put are left out. |
+| `ring.matches(member)` | `bool` | Whether `member` belongs on this ring: alive or suspect, and matching `where`. |
+| `ring.cluster` | `Cluster` | The cluster this ring reads. |
 
 Suspect members keep their keys, so a node that only stalls causes no reshuffle; dead and departed members own nothing. To route new work, such as a new session or a write, pass `new_work=True`: a suspect owner is skipped, and the work goes to the member that would take over its keys if it died. A member that restarts leaves the ring and joins it again under the same name, and its keys count as moved, since the new run has none of the old one's state.
 
@@ -478,6 +518,12 @@ node-c crashes
 
 The patterns below show the same building blocks inside real services. Three of the four decide which node owns a key with `kinship.rendezvous.owner(key, members)`. It uses rendezvous (highest random weight) hashing with a stable hash, so every process agrees on the owner, and only the keys of a node that joins or leaves move. Never use Python's built-in `hash()` for this: it differs between processes.
 
+| Call | Returns | What it does |
+| --- | --- | --- |
+| `rendezvous.owner(key, members)` | a member | The member with the highest weight for `key`. `members` holds `Member` objects, anything else with a `name`, or names. Raises `ValueError` if it is empty. |
+| `rendezvous.owners(key, members, n)` | `list` | The `n` members with the highest weight for `key`, owner first; fewer if there are fewer members. |
+| `rendezvous.weight(key, name)` | `int` | The 64-bit weight of the member called `name` for `key`: BLAKE2b with the person string `kinship-hrw-v1`. A `str` hashes as its UTF-8 bytes. |
+
 ### Sharded cache
 
 Every node holds the keys it owns and fetches the rest from their owner over HTTP. The owner's HTTP address travels in metadata.
@@ -585,10 +631,10 @@ async def track(cluster: kinship.Cluster) -> None:
                 status.update({m.name: m.state for m in cluster.members()})
             case kinship.NameConflict(member=m, other_addr=addr):
                 alert(f"two boxes claim {m.name}: {m.addr} and {addr}")
-            case kinship.UserMessage():
-                pass
-            case _:
-                status[event.member.name] = event.member.state   # SUSPECT shows as degraded
+            case kinship.MemberJoined(member=m) | kinship.MemberRecovered(member=m) \
+                    | kinship.MemberSuspect(member=m) | kinship.MemberDead(member=m) \
+                    | kinship.MemberLeft(member=m):
+                status[m.name] = m.state                   # SUSPECT shows as degraded
 ```
 
 `wan()` probes less often and waits longer before declaring a store dead, and Lifeguard keeps a store whose CPU is pegged from being reported dead. A store that drops off for an hour shows as dead; when its link returns it keeps retrying its seeds in the background and rejoins without a restart. Every node must reach every other node's advertised address over UDP and TCP, so stores behind NAT should run on an overlay network such as WireGuard or Tailscale and bind to that address.
@@ -681,7 +727,7 @@ A connection the node opened carries one frame back. One you accepted can carry 
 - [Benchmarks](https://github.com/bytevader/kinship/blob/main/docs/results/detection.md): detection latency against memberlist, and the [timing preset sweep](https://github.com/bytevader/kinship/blob/main/docs/results/tuning.md).
 - [Security](https://github.com/bytevader/kinship/blob/main/SECURITY.md): the threat model, the audit findings and how to report a vulnerability.
 - [Per-member keys](https://github.com/bytevader/kinship/blob/main/docs/ki01-per-member-keys.md): the plan for KI-01, so that a member holding the cluster key can no longer speak for the others.
-- [Stability](https://github.com/bytevader/kinship/blob/main/docs/stability.md): what 1.0 will promise, what stays unstable, and how deprecations work.
+- [Stability](https://github.com/bytevader/kinship/blob/main/docs/stability.md): what every 1.x release promises, what stays unstable, and how deprecations work.
 - [Changelog](https://github.com/bytevader/kinship/blob/main/CHANGELOG.md).
 
 ## License

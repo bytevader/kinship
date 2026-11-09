@@ -213,7 +213,7 @@ sequenceDiagram
 
 ## Wire format
 
-The runtime continues to speak version 1. Experimental identity primitives and an explicitly selected version 2 codec exist in kinship-proto only; [the Stage 1 notes](ki01-stage1.md) specify that grammar and its signature domains. Core signing, negotiation, replay enforcement for signed statements, Python APIs and tools remain planned for an opt-in release after 1.0. The version 1 format and default bytes below are unchanged, and KI-01 remains Accepted.
+A node in mode `off`, the default and the only mode the `kinship` crate and the Python package expose, speaks version 1. kinship-proto holds experimental identity primitives and a version 2 codec, whose grammar and signature domains [the Stage 1 notes](ki01-stage1.md) specify, and kinship-core an experimental mode `sign` that uses them ([the Stage 2 notes](ki01-stage2.md)). Enforcement, the facade and Python APIs and tools remain planned for an opt-in release after 1.0. The version 1 format and default bytes below are what `docs/stability.md` promises, and KI-01 remains Accepted.
 
 kinship uses its own versioned binary format: a fixed outer header, an AEAD-sealed body, and inside it a list of length-prefixed messages that old nodes can skip when they do not recognise the type. It is deliberately not compatible with memberlist.
 
@@ -607,7 +607,7 @@ Users pick a preset and override a few fields; the timing defaults are memberlis
 | --- | --- | --- |
 | lan() | one datacenter or VPC, the default | baseline |
 | wan() | nodes across regions or flaky links | probe_interval 5 s, probe_timeout 3 s, suspicion_mult 6, push_pull_interval 60 s, gossip_interval 500 ms |
-| local() | one host, tests and demos | probe_interval 200 ms, probe_timeout 100 ms, suspicion_mult 3, push_pull_interval 15 s |
+| local() | one host, tests and demos | bind 127.0.0.1:7946, probe_interval 200 ms, probe_timeout 100 ms, suspicion_mult 3, push_pull_interval 15 s, tcp_fallback_ping False; needs no keys while it binds loopback |
 
 ### Identity and network
 
@@ -662,6 +662,7 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 | push_pull_scale | False | stretch the anti-entropy period beyond 32 live members as memberlist does (90 s at 100, 180 s at 1,000; Join and push-pull): fewer bytes, slower repair |
 | push_pull_digest | True | advertise digest push-pull and use it with members that do (Digest push-pull): only the records that differ cross; off, Alives are the bytes 0.4 sent |
 | reconnect_interval | 30 s | period of push-pull attempts to recently dead members, 0 disables |
+| rejoin_interval | 60 s | period of push-pull attempts to each seed that is not a live member, which finds the cluster again after a node was cut off or a partition outlasted the tombstones, 0 disables |
 
 ### Limits and runtime
 
@@ -681,8 +682,8 @@ Key generation is not part of the keyring, which only takes keys it is given. A 
 | max_user_message | 64 KiB | data in one direct message; one too large for a datagram goes over TCP, so it must fit one max_stream_frame frame |
 | max_user_broadcast | 256 bytes | data in one broadcast; must fit a datagram beside the largest Ping, at most 1,108 bytes encrypted with the default datagram |
 | user_broadcast_queue | 256 | broadcasts a node holds to send, its own and those it relays; beyond it the one nearest to done is dropped |
-| event_buffer | 1,024 | events held for Python before the oldest drop |
-| runtime_threads | 1 | tokio worker threads, set once per process |
+| event_buffer | 1,024 | events each `events()` subscription holds before the oldest drop |
+| runtime_threads | 1 | Python only: tokio worker threads, set once per process. A Rust node runs on the application's runtime |
 
 Timing fields are validated together: probe_timeout must be below probe_interval, and gossip_interval must be at most probe_interval. Limits are too: udp_max_payload must fit an Alive with max_meta_bytes of metadata, a 64-byte name and an IPv6 address beside the largest Ping, and the error names udp_max_payload when it is below its default, max_meta_bytes otherwise. A direct message of max_user_message bytes between 64-byte names must fit one max_stream_frame frame, naming max_stream_frame when it is below its default and max_user_message otherwise; a broadcast of max_user_broadcast bytes from a 64-byte name must fit a datagram beside the largest Ping, naming max_user_broadcast; and user_broadcast_queue must be at least 1. Invalid combinations fail construction with the field names in the message.
 
