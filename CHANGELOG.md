@@ -4,6 +4,10 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **Interop tests against 1.0.0.** kinship-sim's `interop_0_6` runs the released kinship-core 0.6.0, the core of kinship 1.0.0, beside the current one: mixed clusters through a partition and its heal, and a rolling upgrade and rollback one node at a time, 1,000 seeds each in the CI job `sim-interop-0-6`.
+
 ## [1.0.0] - 2026-11-10
 
 The first stable release. The protocol and the code are those of 0.5.0; what changes is what kinship promises. [docs/stability.md](docs/stability.md) is now the policy in force: what every 1.x release keeps, what stays unstable, and how anything promised is deprecated.
