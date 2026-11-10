@@ -153,18 +153,14 @@ async fn sends_to_strangers_old_runs_and_oversized_data_are_refused() {
         let node = &nodes[0];
         async move { node.send(&m, data).await }
     };
-    let stranger = Member {
-        name: "nobody".to_owned(),
-        ..n1.clone()
-    };
+    let mut stranger = n1.clone();
+    stranger.name = "nobody".to_owned();
     assert!(matches!(
         send(stranger, vec![1]).await,
         Err(Error::NotAMember)
     ));
-    let earlier = Member {
-        epoch: n1.epoch - 1,
-        ..n1.clone()
-    };
+    let mut earlier = n1.clone();
+    earlier.epoch -= 1;
     assert!(matches!(
         send(earlier, vec![1]).await,
         Err(Error::NotAMember)
