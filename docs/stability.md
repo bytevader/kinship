@@ -36,6 +36,7 @@ In particular:
 The `kinship` crate follows Semantic Versioning as Rust reads it. The promise covers what the crate's root exports: `Cluster` and its methods but for `start_with`, `Config` with its presets, its `with_*` setters, `without_lifeguard` and its getters but for `core`, `DEFAULT_PORT`, `Event`, `Events`, `Member`, `State`, `Stats`, `Metrics`, `Error`, `ConfigError`, `Key`, `KeyError`, `KeyId`, `Keyring`, `Seed`, `SeedError`, `generate_key` and `WIRE_VERSION`.
 
 - `Event`, `Error`, `Seed`, `Stats` and `Metrics` are `#[non_exhaustive]`, so new variants and fields arrive in minor releases. Match with a wildcard arm.
+- `Member` is `#[non_exhaustive]` too, so it may gain fields in a minor release. Its fields stay public: read them, clone a member and change the clone, but build one only by taking it from the cluster, not with a struct expression or `..` update.
 - `Config` gains fields only through new `with_*` setters, whose defaults keep today's behaviour, and it is validated by `Cluster::start` as now.
 - These types are defined in kinship-net and kinship-core and re-exported. The promise is about the types as `kinship` exports them; see [What stays unstable](#what-stays-unstable) for the crates themselves.
 - The minimum supported Rust version can rise in a minor release, never in a patch release, and never to a Rust release less than six months old. The CHANGELOG names every rise.

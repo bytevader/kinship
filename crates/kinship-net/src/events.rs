@@ -244,17 +244,14 @@ enum Next {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kinship_core::State;
+    use kinship_core::{Config, Identity, Instant, Node, Security};
 
+    /// `Member` is `#[non_exhaustive]`, so a test outside kinship-core takes one from a node.
     fn member(name: &str) -> Member {
-        Member {
-            name: name.to_owned(),
-            addr: SocketAddr::from(([127, 0, 0, 1], 1)),
-            meta: Vec::new(),
-            state: State::Alive,
-            incarnation: 0,
-            epoch: 0,
-        }
+        let me = Identity::new(name, SocketAddr::from(([127, 0, 0, 1], 1))).unwrap();
+        let cfg = Config::lan(Security::InsecurePlaintext);
+        let node = Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap();
+        node.local().clone()
     }
 
     fn joined(i: usize) -> Event {

@@ -50,8 +50,25 @@ impl State {
 }
 
 /// One member as this node sees it.
+///
+/// A later release may add fields, so code outside kinship-core reads and clones members but
+/// cannot build one from its fields (`docs/stability.md`):
+///
+/// ```compile_fail,E0639
+/// use kinship_core::{Member, State};
+///
+/// let _ = Member {
+///     name: "a".to_owned(),
+///     addr: "127.0.0.1:7946".parse().unwrap(),
+///     meta: Vec::new(),
+///     state: State::Alive,
+///     incarnation: 0,
+///     epoch: 0,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
 pub struct Member {
     pub name: String,
     pub addr: SocketAddr,

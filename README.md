@@ -671,7 +671,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `send()`, `broadcast()`, `keyring()`, `leave()`, `close()`. Rust's `send` takes a `&Member` and `send_to` a name. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`. `with_seeds` takes addresses and `with_seed_hosts` takes `Seed`s, parsed from `host:port` with a DNS name or an IP address; `join_seeds` is `join` for them.
+The Rust and Python APIs share names: `Cluster`, `Config::lan()`, `members()`, `events()`, `set_meta()`, `send()`, `broadcast()`, `keyring()`, `leave()`, `close()`. Rust's `send` takes a `&Member` and `send_to` a name. The Rust keyring has `install`, `use_key` (`use` is a keyword), `remove` and `key_ids`. `Config` is built with `with_*` setters so new fields can be added without a breaking release, and it is validated by `Cluster::start`. `Event` is `#[non_exhaustive]`, and so is `Member`, which may gain fields: read and clone members, but do not build them. `with_seeds` takes addresses and `with_seed_hosts` takes `Seed`s, parsed from `host:port` with a DNS name or an IP address; `join_seeds` is `join` for them.
 
 The `kinship-agent` example joins a cluster from seeds on the command line and logs every event until Ctrl-C, when it leaves:
 

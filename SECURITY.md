@@ -2,6 +2,16 @@
 
 Report a vulnerability privately, through a GitHub security advisory on this repository, rather than in a public issue.
 
+## Supported versions
+
+Security fixes go to the latest 1.x minor release, as a patch release of it, for the `kinship` crate and the Python package together, with the internal crates it pins. Upgrade to that minor release to receive them: every 1.x release interoperates with every other in one cluster, so this can be done one node at a time (`docs/stability.md`). Releases before 1.0 get no fixes.
+
+| Version | Security fixes |
+| --- | --- |
+| Latest 1.x minor release | Yes |
+| Earlier 1.x minor releases | No |
+| 0.x | No |
+
 This file holds kinship's threat model and the findings of the security audit of 2026-10-07, which looked at kinship first as an attacker on the network who holds no key, then as a compromised member that does. Findings marked Fixed were fixed in the same change or since, each with a Fix paragraph and what remains; the rest are documented here with a reproduction and the fix we recommend. The architecture is in `docs/design.md` and the public API in `README.md`.
 
 ## Threat model
@@ -57,7 +67,7 @@ A compromised member is outside these guarantees: see "What kinship does not pro
 | KI-02 | Medium | member | Incarnation u32::MAX evicts a name past the attacker's eviction | Fixed |
 | KI-03 | Medium | member | Names of dead or future members can be taken over | Mitigated |
 | KI-04 | Medium | member | Member table flooding: memory, quadratic CPU, redirected probes | Fixed |
-| KI-05 | Low | member | Names and metadata are attacker-controlled strings | Open |
+| KI-05 | Low | member | Names and metadata are attacker-controlled strings | Accepted |
 | KI-06 | Medium | member | A stamp far ahead stretches the replay window | Fixed |
 
 Reproductions of open findings are ignored tests that pass while the finding stands: `cargo test --release --manifest-path crates/kinship-core/Cargo.toml --test open_findings -- --ignored --nocapture`. A finding fixed since keeps its test, turned into one that asserts the fix and runs with the rest of the suite.
@@ -278,7 +288,7 @@ With the defaults a full table, with 512 bytes of metadata, 64-byte names and IP
 
 ### KI-05 Names and metadata are attacker-controlled strings
 
-**Severity:** Low. **Status:** Open; application guidance.
+**Severity:** Low. **Status:** Accepted (application guidance): kinship carries names and metadata as members send them, and applications treat them as untrusted input.
 
 Names are any 1 to 64 bytes of UTF-8 and metadata any 512 bytes, so a member can use control characters, look-alike names and arbitrary values. The README's examples build URLs from `meta["http"]` and `meta["ws"]`, which a member can point anywhere. Tag lists that do not parse read as no tags in Python, so they cannot crash a reader.
 

@@ -113,6 +113,9 @@ fn read_state(state: State) -> u8 {
     }
 }
 
+/// Every field of `Member`. It is `#[non_exhaustive]` and may gain fields in a minor release, so
+/// an application reads members, clones them and changes a clone, but cannot build one with a
+/// struct expression or `..` update; kinship-core's `Member` docs hold a test that it cannot.
 #[allow(dead_code)]
 fn read_member(member: &Member) -> (&str, SocketAddr, &[u8], State, u32, u64) {
     (
@@ -123,6 +126,14 @@ fn read_member(member: &Member) -> (&str, SocketAddr, &[u8], State, u32, u64) {
         member.incarnation,
         member.epoch,
     )
+}
+
+#[allow(dead_code)]
+fn edit_a_clone(member: &Member) -> Member {
+    let mut other = member.clone();
+    other.name = "b".to_owned();
+    other.epoch += 1;
+    other
 }
 
 #[allow(dead_code)]

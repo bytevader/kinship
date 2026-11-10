@@ -4,13 +4,14 @@ All notable changes to kinship are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-11-05
+## [1.0.0] - 2026-11-10
 
 The first stable release. The protocol and the code are those of 0.5.0; what changes is what kinship promises. [docs/stability.md](docs/stability.md) is now the policy in force: what every 1.x release keeps, what stays unstable, and how anything promised is deprecated.
 
-**Upgrading from 0.5.0.** Upgrade one node at a time: 0.5.0 and 1.0.0 nodes work in one cluster, and you can roll back the same way. The wire format, every default and the Python API do not change, so Python applications only change the version they ask for. The simulator holds this: kinship-sim's `interop_0_5::thousand_seeds_upgrade_from_0_5_and_roll_back` (CI job `sim-interop-0-5`) moves 1,000 clusters of 10 nodes from the released kinship-core 0.5.0 to this version and back, one node at a time, with no false death and no decode error, and `thousand_seeds_mixed_with_0_5` runs mixed clusters through a partition and its heal. Rust applications should check three things:
+**Upgrading from 0.5.0.** Upgrade one node at a time: 0.5.0 and 1.0.0 nodes work in one cluster, and you can roll back the same way. The wire format, every default and the Python API do not change, so Python applications only change the version they ask for. The simulator holds this: kinship-sim's `interop_0_5::thousand_seeds_upgrade_from_0_5_and_roll_back` (CI job `sim-interop-0-5`) moves 1,000 clusters of 10 nodes from the released kinship-core 0.5.0 to this version and back, one node at a time, with no false death and no decode error, and `thousand_seeds_mixed_with_0_5` runs mixed clusters through a partition and its heal. Rust applications should check four things:
 
-- **The crates' versions split.** `kinship` is 1.0.0, and kinship-proto, kinship-core and kinship-net are 0.6.0. Change `kinship = "0.5"` to `kinship = "1"`. Their APIs have not changed since 0.5.0, so a direct dependency on them only needs the new version.
+- **The crates' versions split.** `kinship` is 1.0.0, and kinship-proto, kinship-core and kinship-net are 0.6.0. Change `kinship = "0.5"` to `kinship = "1"`. Their APIs have not changed since 0.5.0 but for `Member`, below, so a direct dependency on them only needs the new version.
+- **`Member` may gain fields.** It is now `#[non_exhaustive]`, in the facade and in kinship-core, so a 1.x minor release can add a field. Its fields stay public: read them, or clone a member and change the clone, but code that built a `Member` with a struct expression or `..` update no longer compiles.
 - **Exact pins.** Each published crate now asks for the exact versions of the others, so a project that uses kinship-core, kinship-net or kinship-proto beside `kinship` must ask for the versions that `kinship` release pins, `=0.6.0` for 1.0.0, or Cargo will not resolve it.
 - **What is unstable.** kinship-proto, kinship-core and kinship-net can change in any release. So can what the `kinship` crate re-exports from them for advanced use: `CoreConfig`, `Transport`, `TokioTransport`, `mem`, `Cluster::start_with` and `Config::core`. The counters of the experimental mode `sign` in `Metrics` can too.
 
@@ -22,6 +23,7 @@ The first stable release. The protocol and the code are those of 0.5.0; what cha
 ### Changed
 
 - **Versions, as above.** `release.yml` publishes each crate at its own version, and refuses a tag whose crates do not pin each other exactly.
+- **`Member` is `#[non_exhaustive]`**, as above, so that `docs/stability.md` can let it gain fields in a minor release, as the Python `Member` already may.
 - The Python package's classifier moves from Alpha to `Development Status :: 5 - Production/Stable`.
 - `ctutils` 0.4.7 in `Cargo.lock`.
 
@@ -31,7 +33,8 @@ The first stable release. The protocol and the code are those of 0.5.0; what cha
 
 ### Security
 
-- No finding changes. KI-01, that any member holding the key can declare any node dead, stays **Accepted**: per-member keys are planned as an opt-in in a 1.x minor release, which `docs/stability.md` allows. See SECURITY.md.
+- No code changes for a finding. KI-01, that any member holding the key can declare any node dead, stays **Accepted**: per-member keys are planned as an opt-in in a 1.x minor release, which `docs/stability.md` allows. KI-05, that names and metadata are strings a member controls, moves from Open to **Accepted**, as application guidance: applications treat them as untrusted input, as README.md says. See SECURITY.md.
+- **Supported versions.** SECURITY.md now says which releases get security fixes: the latest 1.x minor release.
 
 ## [0.5.0] - 2026-11-01
 
