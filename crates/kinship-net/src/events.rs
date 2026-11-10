@@ -250,7 +250,8 @@ mod tests {
     fn member(name: &str) -> Member {
         let me = Identity::new(name, SocketAddr::from(([127, 0, 0, 1], 1))).unwrap();
         let cfg = Config::lan(Security::InsecurePlaintext);
-        let node = Node::new(cfg, me, Instant::ZERO, 1, &[1; 32]).unwrap();
+        let nonce_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let node = Node::new(cfg, me, Instant::ZERO, 1, &nonce_key).unwrap();
         node.local().clone()
     }
 
