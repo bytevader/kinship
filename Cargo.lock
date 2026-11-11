@@ -436,6 +436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinship-core"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7af43f6fc8ad0a7624b9836dbd081a2c203e80355501da50dfe71ba7b412d2c8"
+dependencies = [
+ "chacha20",
+ "kinship-proto 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+]
+
+[[package]]
 name = "kinship-net"
 version = "0.6.0"
 dependencies = [
@@ -500,6 +511,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinship-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92bc60807331ebda60b0175428908a3e08c5ff5805a39869ad2bf5104039add8"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "ctutils",
+ "ed25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "kinship-py"
 version = "1.0.0"
 dependencies = [
@@ -519,6 +543,7 @@ dependencies = [
  "kinship-core 0.4.0",
  "kinship-core 0.5.0",
  "kinship-core 0.6.0",
+ "kinship-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "kinship-proto 0.6.0",
  "serde",
  "serde_json",

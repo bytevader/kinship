@@ -22,3 +22,6 @@ workspace = true
 kinship-core-0-3 = { package = "kinship-core", version = "=0.3.0", features = ["serde"] }
 kinship-core-0-4 = { package = "kinship-core", version = "=0.4.0", features = ["serde"] }
 kinship-core-0-5 = { package = "kinship-core", version = "=0.5.0", features = ["serde"] }
+# The core of kinship 1.0.0, from crates.io. It shares its version with the path crate until the
+# core moves on, and Cargo keeps the two apart by their source.
+kinship-core-0-6 = { package = "kinship-core", version = "=0.6.0", features = ["serde"] }
